@@ -13,6 +13,7 @@ import torchmetrics
 import transformers
 from torch import Tensor
 
+import crf_utils
 import dataloader
 import models
 import noise_schedule
@@ -102,6 +103,9 @@ class Diffusion(L.LightningModule):
         self.config,
         vocab_size=self.vocab_size,
         mask_index=self.mask_index)
+    elif self.config.backbone == 'crf_dit':
+      self.backbone = models.crf_decoder.CRFDiT(
+        self.config, vocab_size=self.vocab_size)
     elif self.config.backbone == 'hf_dit':
       self.backbone = transformers.AutoModelForMaskedLM.from_pretrained(
         config.eval.checkpoint_path, trust_remote_code=True)
@@ -164,6 +168,11 @@ class Diffusion(L.LightningModule):
       assert self.parameterization in {'d3pm', 'subs'}
     if self.subs_masking:
       assert self.parameterization == 'd3pm'
+    if self.config.backbone == 'crf_dit':
+      assert self.parameterization == 'subs', \
+        'CRF backbone only supports subs parameterization'
+      assert self.T == 0, \
+        'CRF backbone only supports continuous time (T=0)'
 
   def on_load_checkpoint(self, checkpoint):
     if self.ema:
@@ -599,7 +608,11 @@ class Diffusion(L.LightningModule):
     move_chance_s = (t - dt)[:, None, None]
     assert move_chance_t.ndim == 3, move_chance_t.shape
     if p_x0 is None:
-      p_x0 = self.forward(x, sigma_t).exp()
+      if self.config.backbone == 'crf_dit':
+        sigma_1d = self._process_sigma(sigma_t)
+        p_x0 = self._compute_crf_marginals(x, sigma_1d)
+      else:
+        p_x0 = self.forward(x, sigma_t).exp()
     
     assert move_chance_t.ndim == p_x0.ndim
     q_xs = p_x0 * (move_chance_t - move_chance_s)
@@ -623,18 +636,118 @@ class Diffusion(L.LightningModule):
     move_chance_t = move_chance_t[:, None, None]
     move_chance_s = move_chance_s[:, None, None]
     unet_conditioning = sigma_t
-    log_p_x0 = self.forward(x, unet_conditioning)
-    assert move_chance_t.ndim == log_p_x0.ndim
-    # Technically, this isn't q_xs since there's a division
-    # term that is missing. This division term doesn't affect
-    # the samples.
-    q_xs = log_p_x0.exp() * (move_chance_t
-                             - move_chance_s)
+
+    if self.config.backbone == 'crf_dit':
+      p_x0 = self._compute_crf_marginals(
+        x, unet_conditioning)
+    else:
+      log_p_x0 = self.forward(x, unet_conditioning)
+      p_x0 = log_p_x0.exp()
+
+    assert move_chance_t.ndim == p_x0.ndim
+    q_xs = p_x0 * (move_chance_t - move_chance_s)
     q_xs[:, :, self.mask_index] = move_chance_s[:, :, 0]
     _x = _sample_categorical(q_xs)
 
     copy_flag = (x != self.mask_index).to(x.dtype)
     return copy_flag * x + (1 - copy_flag) * _x
+
+  @torch.no_grad()
+  def _compute_crf_marginals(self, x, sigma):
+    """Compute per-position marginals under the first-order CRF.
+
+    Uses the encoder for top-K candidate selection, the CRF
+    decoder for transition matrices, and forward-backward DP
+    for exact marginals over the pruned candidate set.
+
+    Args:
+      x: (batch, seq_len) noisy token indices
+      sigma: (batch,) noise level (1-D, already processed)
+    Returns:
+      marginals: (batch, seq_len, vocab_size) probabilities
+    """
+    sigma = self._process_sigma(sigma)
+    H, c = self.backbone.encode(x, sigma)
+    batch, seq_len, _ = H.shape
+    K = self.backbone.top_k
+    device = x.device
+
+    # --- Unigram logits for top-K selection ---
+    with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+      unigram_logits = self.backbone.output_layer(H, c)
+    unigram_logits = unigram_logits.float()
+    unigram_logits[:, :, self.mask_index] = self.neg_infinity
+
+    # For unmasked positions, force x_t as the only candidate
+    unmasked = (x != self.mask_index)
+    if unmasked.any():
+      det_logits = torch.full_like(
+        unigram_logits, self.neg_infinity)
+      det_logits.scatter_(-1, x.unsqueeze(-1), 0.0)
+      unigram_logits = torch.where(
+        unmasked.unsqueeze(-1), det_logits, unigram_logits)
+
+    _, top_k_indices = unigram_logits.topk(K, dim=-1)
+
+    # --- Position 0: emission from start embedding ---
+    pos0_dummy = torch.zeros(
+      batch, 1, dtype=torch.long, device=device)
+    pos0_pos = torch.zeros(
+      1, dtype=torch.long, device=device)
+    with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+      pos0_logits = self.backbone.crf_decoder(
+        pos0_dummy, pos0_pos, H, use_start_for_first=True)
+    pos0_logits = pos0_logits.float().squeeze(1)
+    pos0_logits[:, self.mask_index] = self.neg_infinity
+    pos0_log_probs = F.log_softmax(pos0_logits, dim=-1)
+    emission_0 = torch.gather(
+      pos0_log_probs, 1, top_k_indices[:, 0, :])
+
+    # --- Transitions for positions 1..N-1 ---
+    if seq_len > 1:
+      prev_candidates = top_k_indices[:, :-1, :]
+      prev_flat = prev_candidates.reshape(
+        batch, (seq_len - 1) * K)
+
+      pos_ids = torch.arange(
+        1, seq_len, device=device).repeat_interleave(K)
+
+      with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+        rest_logits = self.backbone.crf_decoder.forward_batched(
+          prev_flat, pos_ids, H)
+      rest_logits = rest_logits.float()
+      rest_logits = rest_logits.view(
+        batch, seq_len - 1, K, -1)
+      rest_logits[..., self.mask_index] = self.neg_infinity
+      rest_log_probs = F.log_softmax(rest_logits, dim=-1)
+
+      curr_topk = top_k_indices[:, 1:, :]
+      curr_topk_expanded = curr_topk.unsqueeze(2).expand(
+        -1, -1, K, -1)
+      transitions = torch.gather(
+        rest_log_probs, 3, curr_topk_expanded)
+    else:
+      transitions = torch.zeros(
+        batch, 0, K, K, device=device)
+
+    # --- Forward-backward ---
+    marginals_topk = crf_utils.forward_backward(
+      emission_0, transitions)
+
+    # --- Scatter marginals to full vocab ---
+    full_marginals = torch.zeros(
+      batch, seq_len, self.vocab_size,
+      device=device, dtype=marginals_topk.dtype)
+    full_marginals.scatter_(2, top_k_indices, marginals_topk)
+
+    # SUBS: unmasked positions are deterministic
+    if unmasked.any():
+      det_dist = torch.zeros_like(full_marginals)
+      det_dist.scatter_(-1, x.unsqueeze(-1), 1.0)
+      full_marginals = torch.where(
+        unmasked.unsqueeze(-1), det_dist, full_marginals)
+
+    return full_marginals
 
   def _ar_sampler(self, bsz):
     # precompute token buffer
@@ -692,6 +805,11 @@ class Diffusion(L.LightningModule):
                                      device=self.device)
       if self.sampler == 'analytic':
         x = self._denoiser_update(x, t)
+      elif self.config.backbone == 'crf_dit':
+        unet_conditioning = self.noise(t)[0]
+        sigma_1d = self._process_sigma(unet_conditioning)
+        p_x0 = self._compute_crf_marginals(x, sigma_1d)
+        x = p_x0.argmax(dim=-1)
       else:
         unet_conditioning = self.noise(t)[0]
         x = self.forward(x, unet_conditioning).argmax(dim=-1)
@@ -864,7 +982,15 @@ class Diffusion(L.LightningModule):
       move_chance = 1 - torch.exp(-sigma[:, None])
 
     xt = self.q_xt(x0, move_chance)
-    model_output = self.forward(xt, unet_conditioning)
+
+    if self.config.backbone == 'crf_dit':
+      sigma_1d = self._process_sigma(unet_conditioning)
+      crf_logits = self.backbone.forward_crf_train(
+        xt, sigma_1d, x0)
+      model_output = self._subs_parameterization(
+        logits=crf_logits, xt=xt)
+    else:
+      model_output = self.forward(xt, unet_conditioning)
     utils.print_nans(model_output, 'model_output')
 
     if self.parameterization == 'sedd':
