@@ -7,6 +7,8 @@ import types
 import unittest
 from unittest import mock
 
+import torch
+
 
 def _load_dataloader_module():
   """Load dataloader.py without requiring Lightning/timm in unit tests."""
@@ -34,7 +36,6 @@ def _load_dataloader_module():
 
 
 dataloader = _load_dataloader_module()
-import torch
 
 
 def _load_diffusion_module():
@@ -160,6 +161,14 @@ class DataloaderStreamingTest(unittest.TestCase):
         self.assertIs(calls[0][1]['streaming'], False)
         self.assertIs(valid_loader.kwargs['shuffle'], False)
 
+  def test_pinned_train_and_validation_revisions_are_propagated(self):
+    config = _config(streaming=True)
+    config.data.train_revision = 'train-revision'
+    config.data.valid_revision = 'valid-revision'
+    (_, _), calls = self._get_dataloaders(config)
+    self.assertEqual(calls[0][1]['revision'], 'train-revision')
+    self.assertEqual(calls[1][1]['revision'], 'valid-revision')
+
   def test_streaming_dataset_never_reuses_or_writes_map_style_cache(self):
     class FakeStreamingDataset:
       def __init__(self):
@@ -201,12 +210,14 @@ class DataloaderStreamingTest(unittest.TestCase):
         wrap=True,
         mode='train',
         cache_dir='/unused-cache',
-        streaming=True)
+        streaming=True,
+        revision='pinned-revision')
 
     self.assertIs(result, stream)
     load_from_disk.assert_not_called()
     load_dataset.assert_called_once_with(
-      'openwebtext', cache_dir='/unused-cache', streaming=True)
+      'openwebtext', cache_dir='/unused-cache', streaming=True,
+      revision='pinned-revision')
     self.assertEqual(stream.saved_paths, [])
     self.assertEqual(len(stream.map_calls), 2)
     self.assertEqual(

@@ -22,6 +22,10 @@ import torch  # noqa: E402
 import dataloader  # noqa: E402
 import diffusion  # noqa: E402
 import structured_objective  # noqa: E402
+from scripts.export_structured_adapter import (  # noqa: E402
+  load_adapter_into_head,
+)
+from scripts.prepare_released_mdlm_owt import sha256_file  # noqa: E402
 
 
 def _register_resolvers() -> None:
@@ -39,6 +43,8 @@ def _register_resolvers() -> None:
 def _args() -> argparse.Namespace:
   parser = argparse.ArgumentParser()
   parser.add_argument('--checkpoint', type=Path, required=True)
+  parser.add_argument('--adapter', type=Path)
+  parser.add_argument('--adapter-sha256')
   parser.add_argument('--output', type=Path, required=True)
   parser.add_argument('--device', default='cuda')
   return parser.parse_args()
@@ -48,6 +54,10 @@ def main() -> int:
   args = _args()
   if not args.checkpoint.is_file():
     raise FileNotFoundError(args.checkpoint)
+  if args.adapter is not None and not args.adapter.is_file():
+    raise FileNotFoundError(args.adapter)
+  if args.adapter is None and args.adapter_sha256 is not None:
+    raise ValueError('--adapter-sha256 requires --adapter')
   device = torch.device(args.device)
   if device.type == 'cuda' and not torch.cuda.is_available():
     raise RuntimeError('CUDA was requested but is unavailable')
@@ -68,6 +78,13 @@ def main() -> int:
     config = hydra.compose(config_name='config', overrides=overrides)
   tokenizer = dataloader.get_tokenizer(config)
   model = diffusion.Diffusion(config, tokenizer=tokenizer).to(device).eval()
+  adapter_sha256 = None
+  if args.adapter is not None:
+    load_adapter_into_head(
+      model.structured_head,
+      args.adapter,
+      expected_sha256=args.adapter_sha256)
+    adapter_sha256 = sha256_file(args.adapter)
   if any(parameter.requires_grad for parameter in model.backbone.parameters()):
     raise AssertionError('frozen-backbone preflight found trainable parameters')
 
@@ -116,6 +133,10 @@ def main() -> int:
     'timestamp_utc': dt.datetime.now(dt.timezone.utc).isoformat(),
     'git_sha': git_sha,
     'checkpoint': str(args.checkpoint.resolve()),
+    'structured_adapter': (
+      args.adapter.name if args.adapter is not None else None),
+    'structured_adapter_sha256': adapter_sha256,
+    'structured_adapter_strictly_loaded': args.adapter is not None,
     'device': str(device),
     'gpu': (torch.cuda.get_device_name(device)
             if device.type == 'cuda' else None),

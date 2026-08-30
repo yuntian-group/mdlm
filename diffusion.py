@@ -1,3 +1,4 @@
+import hashlib
 import math
 import os
 import typing
@@ -345,6 +346,22 @@ class Diffusion(L.LightningModule):
     if self.structured_backbone_mode == 'frozen':
       self.backbone.requires_grad_(False)
 
+    adapter_checkpoint = self.config.eval.get('adapter_checkpoint', None)
+    adapter_sha256 = self.config.eval.get('adapter_sha256', None)
+    if adapter_sha256 and not adapter_checkpoint:
+      raise ValueError('eval.adapter_sha256 requires adapter_checkpoint')
+    if adapter_checkpoint:
+      if eval_checkpoint:
+        raise ValueError(
+          'set only one of eval.checkpoint_path and '
+          'eval.adapter_checkpoint')
+      if self.config.mode == 'train':
+        raise ValueError(
+          'eval.adapter_checkpoint is evaluation-only')
+      self._load_structured_adapter_checkpoint(
+        str(adapter_checkpoint),
+        expected_sha256=(str(adapter_sha256) if adapter_sha256 else None))
+
     fixed_edges = structured_cfg.get('fixed_edges', None)
     fixed_edge_path = structured_cfg.get('fixed_edge_path', None)
     if fixed_edges is not None and fixed_edge_path:
@@ -425,6 +442,34 @@ class Diffusion(L.LightningModule):
         for (name, parameter), shadow in zip(
           named_parameters, shadow_parameters)}
       self.backbone.load_state_dict(ema_backbone_state, strict=False)
+
+  def _load_structured_adapter_checkpoint(
+      self, path, expected_sha256=None):
+    """Strictly load a prefix-stripped structured-head safetensors file."""
+    with fsspec.open(path, 'rb') as handle:
+      payload = handle.read()
+    actual_sha256 = hashlib.sha256(payload).hexdigest()
+    if (expected_sha256 is not None
+        and actual_sha256 != expected_sha256):
+      raise ValueError(
+        f'structured adapter SHA256 mismatch: expected '
+        f'{expected_sha256}, found {actual_sha256}')
+    from safetensors.torch import load
+    state = load(payload)
+    if not state:
+      raise ValueError('structured adapter contains no tensors')
+    prefixed = [
+      key for key in state
+      if key.startswith(('backbone.', 'structured_head.'))]
+    if prefixed:
+      raise ValueError(
+        'structured adapter must use prefix-stripped head keys; '
+        f'found {prefixed[:5]}')
+    try:
+      self.structured_head.load_state_dict(state, strict=True)
+    except RuntimeError as error:
+      raise ValueError(
+        f'structured adapter state mismatch: {error}') from error
 
   def _trainable_model_parameters(self):
     """Stable parameter order shared by the optimizer and EMA."""

@@ -11,7 +11,13 @@ operational notes.
 - `structural-oracle/` contains the raw per-condition JSON/CSV records, gate,
   hashes, and privacy-sanitized manifest for the finite-data table-fit oracle.
 - `kernel-profile/` contains the CUDA low-rank versus pre-materialized-dense
-  inference profile used in the paper.
+  inference profile used in the paper.  Each backend is measured in a separate
+  steady-state scope that retains only the inputs it requires.
+- `owt-confirm/` contains the frozen-backbone OpenWebText/WikiText-103
+  confirmation protocol, five cryptographically paired validation-corruption
+  seeds for each comparison, paired-seed bootstrap intervals, and the separate
+  topology-coverage diagnostic.  These records support conditional denoising
+  NLL claims only.
 - `released-backbone-preflight/` contains the strict raw-weight loading and
   length-1024 structured-forward compatibility check.  It is not a language
   quality or latency result.
@@ -20,5 +26,7 @@ operational notes.
   excluded from submission evidence and from the manuscript's measured
   claims.
 
-The frozen real-text confirmation is added only after its input/corruption
-digests, checkpoint identity, and paired diagnostics have been validated.
+The real-text confirmation uses one final step-1000 checkpoint from one
+training seed and five validation-corruption seeds.  It is not an independent
+training-seed study, diffusion-ELBO estimate, perplexity result, or generation
+evaluation.

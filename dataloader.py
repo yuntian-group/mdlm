@@ -258,7 +258,7 @@ def get_text8_dataset(cache_dir, max_seq_length=256,
 
     dataset_dict = {}
     for k, v in splits.items():
-      if k == 'train' and crop_train == True:
+      if k == 'train' and crop_train:
         chunk_size = 2 * max_seq_length
       else:
         chunk_size = max_seq_length
@@ -302,7 +302,8 @@ def _group_texts(examples, block_size, bos, eos):
 
 def get_dataset(
     dataset_name, tokenizer, wrap, mode, cache_dir,
-    block_size=1024, num_proc=len(os.sched_getaffinity(0)), streaming=False):
+    block_size=1024, num_proc=len(os.sched_getaffinity(0)), streaming=False,
+    revision=None):
   if wrap:
     filename = f'{dataset_name}_{mode}_bs{block_size}_wrapped.dat'
   else:
@@ -323,20 +324,23 @@ def get_dataset(
   if mode == 'train' and crop_train:
     # double block size for sub-sampling
     block_size *= 2
+  revision_kwargs = {} if revision is None else {'revision': revision}
   
   if dataset_name == 'wikitext103':
     dataset = datasets.load_dataset(
       'wikitext',
       name='wikitext-103-raw-v1',
-      cache_dir=cache_dir)
+      cache_dir=cache_dir,
+      **revision_kwargs)
   elif dataset_name == 'wikitext2':
     dataset = datasets.load_dataset(
       'wikitext',
       name='wikitext-2-raw-v1',
-      cache_dir=cache_dir)
+      cache_dir=cache_dir,
+      **revision_kwargs)
   elif dataset_name == 'ptb':
     dataset = datasets.load_dataset(
-      'ptb_text_only', cache_dir=cache_dir)
+      'ptb_text_only', cache_dir=cache_dir, **revision_kwargs)
   elif dataset_name == 'lambada':
     dataset = get_lambada_test_dataset()
   elif dataset_name == 'text8':
@@ -351,35 +355,41 @@ def get_dataset(
       'openwebtext',
       split='train[:-100000]',
       cache_dir=cache_dir,
-      streaming=streaming)
+      streaming=streaming,
+      **revision_kwargs)
   elif dataset_name == 'openwebtext-valid':
     dataset = datasets.load_dataset(
       'openwebtext',
       split='train[-100000:]',
       cache_dir=cache_dir,
-      streaming=streaming)
+      streaming=streaming,
+      **revision_kwargs)
   elif dataset_name == 'scientific_papers_arxiv':
     dataset = datasets.load_dataset(
       'scientific_papers', 'arxiv',
       trust_remote_code=True,
       cache_dir=cache_dir,
-      streaming=streaming)
+      streaming=streaming,
+      **revision_kwargs)
   elif dataset_name == 'scientific_papers_pubmed':
     dataset = datasets.load_dataset(
       'scientific_papers', 'pubmed',
       trust_remote_code=True,
       cache_dir=cache_dir,
-      streaming=streaming)
+      streaming=streaming,
+      **revision_kwargs)
   elif dataset_name == 'ag_news':
     dataset = datasets.load_dataset(
       'ag_news',
       cache_dir=cache_dir,
-      streaming=streaming)
+      streaming=streaming,
+      **revision_kwargs)
   else:
     dataset = datasets.load_dataset(
       dataset_name,
       cache_dir=cache_dir,
-      streaming=streaming)
+      streaming=streaming,
+      **revision_kwargs)
 
   if dataset_name in ['lambada', 'openwebtext-train',
                       'openwebtext-valid']:
@@ -490,14 +500,18 @@ def get_dataset(
 
 
 def get_tokenizer(config):
+  tokenizer_revision = getattr(config.data, 'tokenizer_revision', None)
+  revision_kwargs = (
+    {} if tokenizer_revision is None
+    else {'revision': tokenizer_revision})
   if config.data.tokenizer_name_or_path == 'text8':
     tokenizer = Text8Tokenizer()
   elif config.data.tokenizer_name_or_path == 'bert-base-uncased':
     tokenizer = transformers.BertTokenizer.\
-      from_pretrained('bert-base-uncased')
+      from_pretrained('bert-base-uncased', **revision_kwargs)
   else:
     tokenizer = transformers.AutoTokenizer.from_pretrained(
-      config.data.tokenizer_name_or_path)
+      config.data.tokenizer_name_or_path, **revision_kwargs)
 
   if (isinstance(tokenizer, transformers.GPT2TokenizerFast)
       or isinstance(tokenizer, transformers.GPT2Tokenizer)):
@@ -569,7 +583,8 @@ def get_dataloaders(config, tokenizer, skip_train=False,
       wrap=config.data.wrap,
       cache_dir=config.data.cache_dir,
       block_size=config.model.length,
-      streaming=bool(config.data.streaming))
+      streaming=bool(config.data.streaming),
+      revision=getattr(config.data, 'train_revision', None))
     if (config.data.streaming
         and not isinstance(
           train_set, torch.utils.data.IterableDataset)):
@@ -592,7 +607,8 @@ def get_dataloaders(config, tokenizer, skip_train=False,
       mode=validation_split,
       cache_dir=config.data.cache_dir,
       block_size=config.model.length,
-      streaming=False)
+      streaming=False,
+      revision=getattr(config.data, 'valid_revision', None))
 
   if skip_train:
     train_loader = None

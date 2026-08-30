@@ -23,7 +23,8 @@ omegaconf.OmegaConf.register_new_resolver(
 
 
 def _load_from_checkpoint(config, tokenizer):
-  if 'hf' in config.backbone:
+  if ('hf' in config.backbone
+      or config.eval.get('adapter_checkpoint', None)):
     return diffusion.Diffusion(
       config, tokenizer=tokenizer).to('cuda')
   

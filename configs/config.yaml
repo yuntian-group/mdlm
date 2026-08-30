@@ -51,6 +51,11 @@ training:
 
 eval:
   checkpoint_path: ''  # Used to evaluate a checkpoint after training.
+  # Portable frozen-backbone evaluation alternative to checkpoint_path.
+  # The structured head is loaded strictly from safetensors after the pinned
+  # backbone in model.structured_decoder.training.backbone_checkpoint.
+  adapter_checkpoint: ''
+  adapter_sha256: ''
   disable_ema: False
   compute_generative_perplexity: False
   perplexity_batch_size: 8
