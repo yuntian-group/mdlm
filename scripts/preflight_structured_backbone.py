@@ -94,9 +94,10 @@ def main() -> int:
   elapsed = time.perf_counter() - start
 
   finite_unaries = torch.isfinite(unary_logits[..., :-1]).all()
-  finite_marginals = torch.isfinite(inference.node_marginals).all()
+  node_marginals = inference.marginals.node_marginals
+  finite_marginals = torch.isfinite(node_marginals).all()
   normalization_error = (
-    inference.node_marginals.sum(dim=-1) - 1.0).abs().max()
+    node_marginals.sum(dim=-1) - 1.0).abs().max()
   if not bool(finite_unaries.item()):
     raise AssertionError('released backbone produced non-finite token logits')
   if not bool(finite_marginals.item()):
