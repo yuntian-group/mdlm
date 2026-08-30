@@ -63,7 +63,8 @@ def main() -> int:
     json.dumps(record_dicts, indent=2, sort_keys=True) + '\n')
   with (output_dir / 'records.csv').open('w', newline='') as handle:
     fieldnames = [field.name for field in dataclasses.fields(records[0])]
-    writer = csv.DictWriter(handle, fieldnames=fieldnames)
+    writer = csv.DictWriter(
+      handle, fieldnames=fieldnames, lineterminator='\n')
     writer.writeheader()
     for record in record_dicts:
       row = dict(record)

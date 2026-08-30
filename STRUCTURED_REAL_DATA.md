@@ -214,6 +214,12 @@ driver, compute capability, device memory, PyTorch, CUDA, and cuDNN versions.
 It deliberately omits the hostname, output path, and raw device identifiers so
 the artifact can be shared without exposing private infrastructure. Factor
 construction and forest construction are outside the timed inference call.
+Peak memory is a steady-state backend comparison: the low-rank measurement
+retains node inputs and endpoint factors, while the dense measurement retains
+node inputs and one pre-materialized log-factor tensor. Raw dense construction
+intermediates and inputs used only to construct that tensor are released before
+dense warmup and measurement. Each row records the logical bytes of the inputs
+that remain live for each backend.
 
 ## Joint sampling and ablations
 

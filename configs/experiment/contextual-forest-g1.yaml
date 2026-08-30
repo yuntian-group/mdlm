@@ -54,7 +54,7 @@ learned_adapter:
 
 samplers:
   - independent_marginals
-  - ancestral_joint
+  - enumerated_joint
 
 gates:
   joint_invalid_absolute_max: 0.05

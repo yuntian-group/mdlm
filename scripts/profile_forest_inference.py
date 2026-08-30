@@ -57,18 +57,26 @@ def _elapsed_ms(callable_, device: torch.device, repetitions: int) -> float:
   return 1000.0 * (time.perf_counter() - start) / repetitions
 
 
-def profile_shape(
+def _tensor_bytes(*tensors: torch.Tensor) -> int:
+  """Return logical bytes for independently allocated benchmark inputs."""
+  return sum(tensor.numel() * tensor.element_size() for tensor in tensors)
+
+
+def _benchmark_inputs(
     length: int,
     candidate_count: int,
     rank: int,
     component_size: int,
-    warmup: int,
-    repetitions: int,
-    device: torch.device) -> dict[str, object]:
-  if warmup < 0:
-    raise ValueError('warmup repetitions must be nonnegative')
-  if repetitions <= 0:
-    raise ValueError('measured repetitions must be positive')
+    device: torch.device,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+  """Construct deterministic inputs shared numerically across backends."""
   generator = torch.Generator(device=device).manual_seed(
     1000 + length + candidate_count)
   node = torch.randn(
@@ -83,6 +91,24 @@ def profile_shape(
   edges, edge_mask = bounded_chain_edges(
     length, component_size, device)
   state_mask = torch.ones_like(node, dtype=torch.bool)
+  return node, left, right, edges, edge_mask, state_mask
+
+
+def _profile_low_rank_backend(
+    length: int,
+    candidate_count: int,
+    rank: int,
+    component_size: int,
+    warmup: int,
+    repetitions: int,
+    device: torch.device,
+) -> tuple[float, int | None, int, int]:
+  """Measure low-rank inference with only low-rank inputs resident."""
+  node, left, right, edges, edge_mask, state_mask = _benchmark_inputs(
+    length, candidate_count, rank, component_size, device)
+  input_bytes = _tensor_bytes(
+    node, left, right, edges, edge_mask, state_mask)
+  active_edges = int(edge_mask.sum())
 
   def low_rank_call():
     return structured_utils.forest_sum_product_low_rank(
@@ -93,49 +119,99 @@ def profile_shape(
   for _ in range(warmup):
     low_rank_call()
   if device.type == 'cuda':
+    torch.cuda.synchronize(device)
     torch.cuda.reset_peak_memory_stats(device)
-  low_rank_ms = _elapsed_ms(low_rank_call, device, repetitions)
-  low_rank_peak = (
+  elapsed_ms = _elapsed_ms(low_rank_call, device, repetitions)
+  peak_bytes = (
     int(torch.cuda.max_memory_allocated(device))
     if device.type == 'cuda' else None)
+  return elapsed_ms, peak_bytes, input_bytes, active_edges
+
+
+def _profile_dense_backend(
+    length: int,
+    candidate_count: int,
+    rank: int,
+    component_size: int,
+    warmup: int,
+    repetitions: int,
+    device: torch.device,
+) -> tuple[float, int | None, int]:
+  """Measure dense inference with construction intermediates released."""
+  node, left, right, edges, edge_mask, state_mask = _benchmark_inputs(
+    length, candidate_count, rank, component_size, device)
+  dense = structured_utils.materialize_low_rank_pair_factors(
+    left, right, edge_mask=edge_mask)
+  log_dense = dense.log()
+  del dense, left, right
+  if device.type == 'cuda':
+    torch.cuda.synchronize(device)
+    torch.cuda.empty_cache()
+  input_bytes = _tensor_bytes(
+    node, log_dense, edges, edge_mask, state_mask)
+
+  def dense_call():
+    return structured_utils.forest_sum_product(
+      node, log_dense, edges,
+      edge_mask=edge_mask, state_mask=state_mask,
+      max_component_size=component_size)
+
+  for _ in range(warmup):
+    dense_call()
+  if device.type == 'cuda':
+    torch.cuda.synchronize(device)
+    torch.cuda.reset_peak_memory_stats(device)
+  elapsed_ms = _elapsed_ms(dense_call, device, repetitions)
+  peak_bytes = (
+    int(torch.cuda.max_memory_allocated(device))
+    if device.type == 'cuda' else None)
+  return elapsed_ms, peak_bytes, input_bytes
+
+
+def profile_shape(
+    length: int,
+    candidate_count: int,
+    rank: int,
+    component_size: int,
+    warmup: int,
+    repetitions: int,
+    device: torch.device) -> dict[str, object]:
+  if warmup < 0:
+    raise ValueError('warmup repetitions must be nonnegative')
+  if repetitions <= 0:
+    raise ValueError('measured repetitions must be positive')
+  low_rank_ms, low_rank_peak, low_rank_input_bytes, active_edges = (
+    _profile_low_rank_backend(
+      length, candidate_count, rank, component_size,
+      warmup, repetitions, device))
+  if device.type == 'cuda':
+    torch.cuda.empty_cache()
 
   result = {
     'batch_size': 1,
     'length': length,
     'k': candidate_count,
     'rank': rank,
-    'active_edges': int(edge_mask.sum()),
+    'active_edges': active_edges,
     'component_size': component_size,
     'warmup_repetitions': warmup,
     'measured_repetitions': repetitions,
     'low_rank_ms': low_rank_ms,
     'low_rank_peak_bytes': low_rank_peak,
+    'low_rank_steady_state_input_bytes': low_rank_input_bytes,
     'dense_ms': None,
     'dense_peak_bytes': None,
+    'dense_steady_state_input_bytes': None,
     'dense_over_low_rank_time': None,
   }
   try:
-    dense = structured_utils.materialize_low_rank_pair_factors(
-      left, right, edge_mask=edge_mask)
-    log_dense = dense.log()
-
-    def dense_call():
-      return structured_utils.forest_sum_product(
-        node, log_dense, edges,
-        edge_mask=edge_mask, state_mask=state_mask,
-        max_component_size=component_size)
-
-    for _ in range(warmup):
-      dense_call()
-    if device.type == 'cuda':
-      torch.cuda.reset_peak_memory_stats(device)
-    dense_ms = _elapsed_ms(dense_call, device, repetitions)
-    dense_peak = (
-      int(torch.cuda.max_memory_allocated(device))
-      if device.type == 'cuda' else None)
+    dense_ms, dense_peak, dense_input_bytes = _profile_dense_backend(
+      length, candidate_count, rank, component_size,
+      warmup, repetitions, device)
     result.update({
       'dense_ms': dense_ms,
       'dense_peak_bytes': dense_peak,
+      'dense_steady_state_input_bytes': dense_input_bytes,
       'dense_over_low_rank_time': dense_ms / low_rank_ms,
     })
   except RuntimeError as error:
@@ -206,7 +282,13 @@ def profile_protocol(
       'before_and_after_each_backend_timing_block'
       if device.type == 'cuda' else 'not_applicable'),
     'peak_memory_scope': (
-      'torch allocator peak after reset; includes live benchmark inputs'),
+      'torch allocator peak after reset; each backend retains only its '
+      'required steady-state inputs plus inference outputs and temporaries'),
+    'dense_construction_memory': (
+      'excluded; raw dense factors and low-rank construction inputs are '
+      'released before dense warmup and measurement'),
+    'steady_state_input_accounting': (
+      'logical tensor bytes are reported per backend in every profile row'),
   }
 
 

@@ -1,9 +1,9 @@
 """Finite-data structural sanity gate for contextual coupling forests.
 
 This module intentionally does not claim to train the neural decoder.  It fits
-the maximum-likelihood forest projection of small, exactly enumerable target
-distributions from sampled data.  The result is an auditable oracle/table-fit
-gate: it verifies that the task, topology ablations, metrics, sampling code,
+an additively smoothed empirical forest projection of small, exactly enumerable
+target distributions from sampled data.  The result is an auditable
+oracle/table-fit gate: it verifies the task, topology ablations, sampling code,
 and frozen decision rule can distinguish adaptive topology before GPU
 time is spent on the learned head.
 """
@@ -316,7 +316,7 @@ def evaluate_task(
         model=model,
         sampler=('independent_marginals'
                  if model in {'factorized', 'parameter_matched_independent'}
-                 else 'ancestral_joint'),
+                 else 'enumerated_joint'),
         kl=kl_divergence(target, probability),
         tv=total_variation(target, probability),
         invalid_rate=float(probability[~valid].sum()),
@@ -446,7 +446,8 @@ def evaluate_frozen_gate(
   return {
     'gate_name': 'g1_table_fit_structural_sanity',
     'scientific_scope': (
-      'finite-data maximum-likelihood forest projection; not neural-head '
+      'finite-data additively smoothed empirical forest projection; '
+      'not neural-head '
       'training evidence'),
     'passed': bool(all(checks.values())),
     'checks': checks,

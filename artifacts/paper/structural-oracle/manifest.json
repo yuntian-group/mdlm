@@ -1,6 +1,6 @@
 {
   "alpha": 0.25,
-  "artifact_sanitization": "The absolute output path and local hostname were removed for release; scientific fields are unchanged.",
+  "artifact_sanitization": "The absolute output path and local hostname were removed and records.csv line endings were normalized to LF for release; scientific fields are unchanged.",
   "benchmark": "g1_table_fit_structural_sanity",
   "command": [
     "scripts/run_contextual_forest_g1.py",
@@ -11,7 +11,7 @@
   "eval_samples_per_model": 20000,
   "file_sha256": {
     "gate.json": "1af6af22d99b1f2d2ba7cc19a69d0bfbf27bc6a568ff16405d43d2e9af008679",
-    "records.csv": "6cc079f3269d1f1ae3261c08094498ca0fa3ab3ebbe612b7eee59af063d8511f3",
+    "records.csv": "b6ed9b16ce77c42e3b5e8fd76b7a9149d17f6b97c9fda8f9a7dba90f1f165a5a",
     "records.json": "975bc3cc8ef69d7a94c4889a0416c60b1727ef6085d45232c3abb2d119daa1f3"
   },
   "git_sha": "ea58d8e1b6eed02f7fac176e5a42915604115e62",

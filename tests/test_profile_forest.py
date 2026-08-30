@@ -10,6 +10,7 @@ from scripts.profile_forest_inference import (
   _args,
   bounded_chain_edges,
   cuda_provenance,
+  profile_shape,
   profile_protocol,
   verify_dense_low_rank_agreement,
 )
@@ -30,6 +31,12 @@ class ForestProfileTest(unittest.TestCase):
     self.assertEqual(
       protocol['cuda_synchronization'],
       'before_and_after_each_backend_timing_block')
+    self.assertIn(
+      'only its required steady-state inputs',
+      protocol['peak_memory_scope'])
+    self.assertIn(
+      'released before dense warmup',
+      protocol['dense_construction_memory'])
 
     config_path = (
       Path(__file__).resolve().parents[1]
@@ -55,6 +62,23 @@ class ForestProfileTest(unittest.TestCase):
     self.assertNotIn([2, 3], selected)
     self.assertNotIn([5, 6], selected)
     self.assertNotIn([8, 9], selected)
+
+  def test_profile_reports_backend_specific_input_accounting(self):
+    profile = profile_shape(
+      length=6,
+      candidate_count=4,
+      rank=3,
+      component_size=3,
+      warmup=0,
+      repetitions=1,
+      device=torch.device('cpu'))
+    self.assertIsNone(profile['low_rank_peak_bytes'])
+    self.assertIsNone(profile['dense_peak_bytes'])
+    # Low-rank: node + two endpoint-factor tensors + edges + masks.
+    self.assertEqual(profile['low_rank_steady_state_input_bytes'], 715)
+    # Dense: node + one (K+1)^2 log-factor tensor + edges + masks.  The
+    # low-rank construction factors and raw (pre-log) dense tensor are absent.
+    self.assertEqual(profile['dense_steady_state_input_bytes'], 735)
 
   def test_profile_reference_agreement(self):
     errors = verify_dense_low_rank_agreement()
