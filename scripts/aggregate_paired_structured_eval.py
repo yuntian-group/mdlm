@@ -311,7 +311,9 @@ def git_metadata(repo_root: Path) -> dict[str, Any]:
 
 
 def checkpoint_metadata(
-    checkpoints: Sequence[tuple[str, Path]]) -> list[dict[str, Any]]:
+    checkpoints: Sequence[tuple[str, Path]],
+    *,
+    source_path_root: Path | None = None) -> list[dict[str, Any]]:
   seen: set[str] = set()
   result = []
   for label, raw_path in checkpoints:
@@ -323,7 +325,7 @@ def checkpoint_metadata(
       raise FileNotFoundError(path)
     result.append({
       'label': label,
-      'path': str(path),
+      'path': _manifest_source_path(path, source_path_root),
       'size_bytes': path.stat().st_size,
       'sha256': sha256_file(path),
     })
@@ -432,6 +434,7 @@ def aggregate_runs(
       'seed': run.seed,
       'run_path': _manifest_source_path(run.run_dir, source_path_root),
       'metrics_csv': _manifest_source_path(metrics_csv, source_path_root),
+      'metrics_csv_sha256': sha256_file(metrics_csv),
       **metrics,
     }
     if require_pairing_digest:
@@ -449,6 +452,8 @@ def aggregate_runs(
       record.update({
         'pairing_digest_path': _manifest_source_path(
           pairing_digest_path, source_path_root),
+        'pairing_digest_file_sha256': sha256_file(
+          pairing_digest_path),
         'pairing_digest': pairing_digest,
       })
     by_key[key] = record
@@ -542,7 +547,8 @@ def aggregate_runs(
       rng_seed=bootstrap_seed,
       confidence_level=bootstrap_confidence),
     'repository': git_metadata(repo_root),
-    'checkpoints': checkpoint_metadata(checkpoints),
+    'checkpoints': checkpoint_metadata(
+      checkpoints, source_path_root=source_path_root),
   }
 
 

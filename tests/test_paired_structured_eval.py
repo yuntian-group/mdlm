@@ -139,6 +139,9 @@ class PairedStructuredEvaluationTest(unittest.TestCase):
         ])
       checkpoint = root / 'backbone.pt'
       checkpoint.write_bytes(b'test-checkpoint')
+      expected_metrics_hash = hashlib.sha256(
+        (root / 'baseline-9/lightning_logs/version_0/metrics.csv').
+        read_bytes()).hexdigest()
       manifest = aggregate_runs(
         runs,
         baseline_arm='factorized',
@@ -160,8 +163,12 @@ class PairedStructuredEvaluationTest(unittest.TestCase):
     self.assertEqual(
       manifest['checkpoints'][0]['sha256'],
       hashlib.sha256(b'test-checkpoint').hexdigest())
+    self.assertEqual(manifest['checkpoints'][0]['path'], 'backbone.pt')
     self.assertEqual(
       manifest['pairs'][0]['baseline']['run_path'], 'baseline-9')
+    self.assertEqual(
+      manifest['pairs'][0]['baseline']['metrics_csv_sha256'],
+      expected_metrics_hash)
     self.assertEqual(
       manifest['paired_bootstrap']['method'],
       'paired_seed_bootstrap_percentile')
@@ -199,6 +206,9 @@ class PairedStructuredEvaluationTest(unittest.TestCase):
       _write_metrics(treatment, nll=1.5)
       expected = _write_pairing_digest(baseline)
       _write_pairing_digest(treatment)
+      expected_digest_file_hash = hashlib.sha256(
+        (baseline / 'validation_pairing_digest.json').
+        read_bytes()).hexdigest()
       manifest = aggregate_runs(
         [
           RunSpec('factorized', 9, baseline),
@@ -219,6 +229,9 @@ class PairedStructuredEvaluationTest(unittest.TestCase):
     self.assertEqual(
       pair['baseline']['pairing_digest_path'],
       'baseline/validation_pairing_digest.json')
+    self.assertEqual(
+      pair['baseline']['pairing_digest_file_sha256'],
+      expected_digest_file_hash)
     self.assertTrue(manifest['protocol']['pairing_digest_required'])
 
   def test_rejects_different_validation_commitments(self):
