@@ -866,13 +866,26 @@ def _exclusive_sibling_sums(
     if degree == 1:
       exclusive = torch.zeros_like(grouped)
     else:
-      prefix = torch.cumsum(grouped, dim=1)
-      suffix = torch.flip(
-        torch.cumsum(torch.flip(grouped, dims=(1,)), dim=1), dims=(1,))
-      zero_column = torch.zeros_like(grouped[:, :1])
-      exclusive = (
-        torch.cat((zero_column, prefix[:, :-1]), dim=1)
-        + torch.cat((suffix[:, 1:], zero_column), dim=1))
+      # ``torch.cumsum`` has no deterministic CUDA implementation in the
+      # PyTorch versions used by our training images.  Explicit recurrences
+      # retain the same O(E) work/storage while making strict deterministic
+      # training possible.  Forest heads normally impose a small degree cap,
+      # so the extra launch count is bounded in the production path.
+      zero = torch.zeros_like(grouped[:, 0])
+      running = zero
+      prefix_exclusive = []
+      for position in range(degree):
+        prefix_exclusive.append(running)
+        running = running + grouped[:, position]
+      running = zero
+      suffix_exclusive = [zero] * degree
+      for position in range(degree - 1, -1, -1):
+        suffix_exclusive[position] = running
+        running = running + grouped[:, position]
+      exclusive = torch.stack([
+        prefix_exclusive[position] + suffix_exclusive[position]
+        for position in range(degree)
+      ], dim=1)
     bucket_exclusive.append(exclusive.reshape(-1, *value_shape))
   return torch.cat(bucket_exclusive, dim=0).index_select(
     0, child_inverse_order)
