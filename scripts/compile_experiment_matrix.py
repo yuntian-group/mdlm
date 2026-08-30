@@ -27,9 +27,14 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MANIFEST = (
   REPO_ROOT / 'configs/experiment/contextual-forest-expansion-v1.yaml')
 DEFAULT_ALLOWED_ARTIFACT_ROOT = Path('/mnt/contextual-forest')
-JOB_SCHEMA_VERSION = 1
-PLAN_SCHEMA_VERSION = 1
+JOB_SCHEMA_VERSION = 2
+PLAN_SCHEMA_VERSION = 2
 SLUG_PATTERN = re.compile(r'^[a-z0-9][a-z0-9_-]*$')
+TRUSTED_PROMOTION_POLICIES = {
+  'contextual-forest-expansion-v1': (
+    REPO_ROOT / 'configs/experiment'
+    / 'contextual-forest-expansion-v1-promotion-policy.yaml'),
+}
 
 
 def _exact_keys(
@@ -162,6 +167,19 @@ def _git_metadata(repo_root: Path) -> dict[str, Any]:
   except (OSError, subprocess.CalledProcessError):
     return {'sha': None, 'dirty': None}
   return {'sha': sha, 'dirty': dirty}
+
+
+def _clean_repository_identity(repo_root: Path) -> dict[str, Any]:
+  repository = _git_metadata(repo_root)
+  if not isinstance(repository, Mapping) \
+      or set(repository) != {'sha', 'dirty'}:
+    raise ValueError('repository metadata has an invalid schema')
+  _validate_git_revision(repository['sha'], context='repository SHA')
+  if repository['dirty'] is not False:
+    raise ValueError(
+      'experiment plans require a clean committed repository; commit all '
+      'scientific code before compiling')
+  return dict(repository)
 
 
 def _read_yaml_or_json(path: Path) -> object:
@@ -467,6 +485,7 @@ def _job(
     *,
     protocol_id: str,
     source_manifest_sha256: str,
+    source_repository_sha: str,
     plan_id: str,
     job_id: str,
     kind: str,
@@ -483,6 +502,7 @@ def _job(
     'schema_version': JOB_SCHEMA_VERSION,
     'protocol_id': protocol_id,
     'source_manifest_sha256': source_manifest_sha256,
+    'source_repository_sha': source_repository_sha,
     'plan_id': plan_id,
     'job_id': job_id,
     'kind': kind,
@@ -503,6 +523,7 @@ def build_jobs(
     selected_suites: Sequence[str],
     artifact_root: Path,
     source_manifest_sha256: str,
+    source_repository_sha: str,
     plan_id: str,
 ) -> dict[str, dict[str, Any]]:
   """Expand selected suites, deduplicating canonical jobs across stages."""
@@ -579,10 +600,19 @@ def build_jobs(
         'checkpointing.resume_from_ckpt=false',
       ]
       argv += _control_overrides(control)
+      # Fixed topology/factor controls intentionally bypass trainable head
+      # branches. Lightning wraps even a one-GPU run in DDP, whose default
+      # reducer otherwise aborts as soon as it sees those unused parameters.
+      # Detection changes only gradient-reduction bookkeeping; the loss,
+      # optimizer, data order, and active gradients remain unchanged.
+      if (control['topology_mode'] != 'dynamic'
+          or control['factor_mode'] != 'dynamic'):
+        argv.append('strategy.find_unused_parameters=true')
       argv += _hydra_common(manifest, '{artifact_dir}')
       job = _job(
         protocol_id=protocol_id,
         source_manifest_sha256=source_manifest_sha256,
+        source_repository_sha=source_repository_sha,
         plan_id=plan_id,
         job_id=train_id,
         kind='train',
@@ -630,10 +660,17 @@ def build_jobs(
         '--manifest', '{artifact_dir}/adapter-manifest.json',
         '--expected-checkpoint-sha256', source_sha,
         '--expected-global-step', str(training['updates']),
+        '--control-identity', control_name,
+        '--topology-mode', control['topology_mode'],
+        '--factor-mode', control['factor_mode'],
+        '--candidate-k', str(candidate_k),
+        '--independent-mode', 'false',
+        '--topology-weight', str(control['topology_weight']),
       ]
       job = _job(
         protocol_id=protocol_id,
         source_manifest_sha256=source_manifest_sha256,
+        source_repository_sha=source_repository_sha,
         plan_id=plan_id,
         job_id=export_id,
         kind='export',
@@ -643,6 +680,10 @@ def build_jobs(
         identity={
           'control': control_name, 'train_seed': train_seed,
           'candidate_k': candidate_k,
+          'topology_mode': control['topology_mode'],
+          'factor_mode': control['factor_mode'],
+          'independent_mode': False,
+          'topology_weight': float(control['topology_weight']),
         },
         argv=argv,
         execution_mode='fresh_attempt',
@@ -672,6 +713,10 @@ def build_jobs(
         f'${{artifact:{export_id}:adapter.safetensors}}',
         f'eval.adapter_sha256='
         f'${{sha256:{export_id}:adapter.safetensors}}',
+        f'eval.adapter_manifest='
+        f'${{artifact:{export_id}:adapter-manifest.json}}',
+        f'eval.adapter_manifest_sha256='
+        f'${{sha256:{export_id}:adapter-manifest.json}}',
         'eval.conditional_records.enabled=true',
         f'eval.conditional_records.protocol_id={protocol_id}',
         f'eval.conditional_records.job_id={eval_id}',
@@ -691,6 +736,7 @@ def build_jobs(
       job = _job(
         protocol_id=protocol_id,
         source_manifest_sha256=source_manifest_sha256,
+        source_repository_sha=source_repository_sha,
         plan_id=plan_id,
         job_id=eval_id,
         kind='eval',
@@ -815,6 +861,7 @@ def compile_matrix(
   if resolved_output == artifact_root:
     raise ValueError('output directory must not equal artifact root')
 
+  repository = _clean_repository_identity(repo_root)
   source_manifest_sha256 = sha256_file(manifest_path)
   evidence_paths = dict(promotion_evidence or {})
   unknown_evidence = sorted(set(evidence_paths) - set(selected_suites))
@@ -836,42 +883,42 @@ def compile_matrix(
         f'suite {suite_name} is gated on {source_suite}; provide '
         f'--promotion-evidence {suite_name} PATH')
     resolved_evidence = evidence_path.expanduser().resolve()
-    evidence = _exact_keys(_read_yaml_or_json(resolved_evidence), {
-      'schema_version', 'artifact', 'protocol_id',
-      'source_manifest_sha256', 'source_suite', 'promoted_suite',
-      'decision', 'criteria', 'created_utc',
-    }, context=f'promotion evidence for {suite_name}')
-    expected = {
-      'schema_version': 1,
-      'artifact': 'experiment_suite_promotion_decision',
-      'protocol_id': manifest['protocol_id'],
-      'source_manifest_sha256': source_manifest_sha256,
-      'source_suite': source_suite,
-      'promoted_suite': suite_name,
-      'decision': 'promote',
-    }
-    for field, value in expected.items():
-      if evidence[field] != value:
-        raise ValueError(
-          f'promotion evidence {field}={evidence[field]!r}; '
-          f'expected {value!r}')
-    criteria = evidence['criteria']
-    if not isinstance(criteria, Mapping) or not criteria \
-        or any(value is not True for value in criteria.values()):
+    trusted_policy = TRUSTED_PROMOTION_POLICIES.get(manifest['protocol_id'])
+    if trusted_policy is None:
       raise ValueError(
-        f'promotion evidence for {suite_name} must have non-empty, '
-        'all-true criteria')
-    if not isinstance(evidence['created_utc'], str) \
-        or not evidence['created_utc']:
-      raise ValueError('promotion evidence created_utc must be non-empty')
+        f'no trusted promotion policy is registered for '
+        f'{manifest["protocol_id"]}')
+    # Import lazily because the evaluator reuses this module's manifest
+    # validator.  The compiler never trusts arbitrary all-true JSON: it reads
+    # the registered policy and deterministically recomputes the decision.
+    from scripts.evaluate_experiment_promotion import (  # pylint: disable=import-outside-toplevel
+      verify_compiler_evidence,
+    )
+    evidence = verify_compiler_evidence(
+      _read_yaml_or_json(resolved_evidence),
+      evidence_path=resolved_evidence,
+      promoted_suite=suite_name,
+      manifest_path=manifest_path,
+      trusted_policy_path=trusted_policy,
+      repo_root=repo_root)
+    if evidence['source_suite'] != source_suite:
+      raise ValueError(
+        f'promotion evidence source suite {evidence["source_suite"]!r}; '
+        f'expected {source_suite!r}')
     evidence_records[suite_name] = {
       'path': str(resolved_evidence),
       'sha256': sha256_file(resolved_evidence),
       'source_suite': source_suite,
+      'route_name': evidence['route_name'],
+      'canonical_decision_sha256': evidence['commitments'][
+        'canonical_decision_sha256'],
+      'source_compiled_plan_sha256': evidence['commitments'][
+        'source_compiled_plan_sha256'],
     }
   plan_identity = {
     'protocol_id': manifest['protocol_id'],
     'source_manifest_sha256': source_manifest_sha256,
+    'repository': repository,
     'artifact_root': str(artifact_root),
     'selected_suites': sorted(set(selected_suites)),
     'promotion_evidence': evidence_records,
@@ -882,6 +929,7 @@ def compile_matrix(
     selected_suites=plan_identity['selected_suites'],
     artifact_root=artifact_root,
     source_manifest_sha256=source_manifest_sha256,
+    source_repository_sha=repository['sha'],
     plan_id=plan_id)
   counts: dict[str, int] = {}
   for job in jobs.values():
@@ -892,7 +940,6 @@ def compile_matrix(
     'plan_id': plan_id,
     'manifest_protocol_status': manifest['protocol_status'],
     'scientific_scope': manifest['scientific_scope'],
-    'repository': _git_metadata(repo_root),
     'job_counts': dict(sorted(counts.items())),
     'num_jobs': len(jobs),
     'job_ids': list(jobs),
@@ -919,8 +966,8 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     '--promotion-evidence', action='append', nargs=2, default=[],
     metavar=('SUITE', 'PATH'),
     help=(
-      'required for a gated suite; PATH must be a matching all-true '
-      'experiment_suite_promotion_decision artifact'))
+      'required for a gated suite; PATH must be canonical revision-bound '
+      'evidence emitted by the registered promotion evaluator'))
   parser.add_argument('--resume', action='store_true')
   return parser.parse_args(argv)
 

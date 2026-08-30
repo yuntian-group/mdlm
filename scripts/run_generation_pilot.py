@@ -12,7 +12,9 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import hashlib
+import importlib.metadata
 import json
+import math
 import os
 from pathlib import Path
 import platform
@@ -37,9 +39,31 @@ from evaluation.generation_harness import (  # noqa: E402
   unconditional_prompt,
 )
 from evaluation.generation_metrics import (  # noqa: E402
+  REFERENCE_LM_SEQUENCE_POLICY,
   TransformersReferenceLMScorer,
   validate_reference_lm_spec,
 )
+
+
+CRITICAL_RUNTIME_PACKAGES = (
+  'numpy', 'safetensors', 'tokenizers', 'transformers',
+)
+
+
+def _critical_runtime_package_versions() -> dict[str, str]:
+  """Resolve versions that can change tokenization or generation numerics."""
+  result = {}
+  for distribution in CRITICAL_RUNTIME_PACKAGES:
+    try:
+      version = importlib.metadata.version(distribution)
+    except importlib.metadata.PackageNotFoundError as error:
+      raise RuntimeError(
+        f'required runtime distribution is missing: {distribution}') from error
+    if not version.strip():
+      raise RuntimeError(
+        f'runtime distribution has an empty version: {distribution}')
+    result[distribution] = version.strip()
+  return result
 
 
 def sha256_file(path: Path, chunk_size: int = 8 * 1024 * 1024) -> str:
@@ -89,6 +113,8 @@ def _parse_args(argv=None) -> argparse.Namespace:
   parser.add_argument('--backbone-sha256', required=True)
   parser.add_argument('--adapter', type=Path, required=True)
   parser.add_argument('--adapter-sha256', required=True)
+  parser.add_argument('--adapter-manifest', type=Path, required=True)
+  parser.add_argument('--adapter-manifest-sha256', required=True)
   parser.add_argument('--output-dir', type=Path, required=True)
   parser.add_argument('--prompt-jsonl', type=Path)
   parser.add_argument('--num-samples', type=int, default=256)
@@ -242,6 +268,8 @@ def _compose_config(args: argparse.Namespace):
     config.eval.checkpoint_path = ''
     config.eval.adapter_checkpoint = str(args.adapter.resolve())
     config.eval.adapter_sha256 = args.adapter_sha256.lower()
+    config.eval.adapter_manifest = str(args.adapter_manifest.resolve())
+    config.eval.adapter_manifest_sha256 = args.adapter_manifest_sha256.lower()
     config.eval.disable_ema = True
     config.eval.compute_generative_perplexity = False
     config.eval.generate_samples = False
@@ -299,30 +327,33 @@ def _attach_reference_lm_scores(
     device=device,
     batch_size=batch_size)
   scores = scorer.score([record['text'] for record in records])
-  total_nll = 0.0
+  nll_contributions = []
   total_tokens = 0
   for record, score in zip(records, scores):
     payload = {
       'model_name_or_path': model_name_or_path,
       'revision': revision,
+      'sequence_policy': REFERENCE_LM_SEQUENCE_POLICY,
       'token_count': score.token_count,
       'mean_nll_nats': score.mean_nll_nats,
       'perplexity': score.perplexity,
     }
     record['reference_lm'] = payload
     if score.mean_nll_nats is not None:
-      total_nll += score.mean_nll_nats * score.token_count
+      nll_contributions.append(score.mean_nll_nats * score.token_count)
       total_tokens += score.token_count
+  total_nll = math.fsum(nll_contributions)
   mean_nll = total_nll / total_tokens if total_tokens else None
   return {
     'model_name_or_path': model_name_or_path,
     'revision': revision,
+    'sequence_policy': REFERENCE_LM_SEQUENCE_POLICY,
     'device': device,
     'num_scored_sequences': len(scores),
     'num_scored_tokens': total_tokens,
     'mean_nll_nats': mean_nll,
     'perplexity': (
-      float(torch.exp(torch.tensor(min(mean_nll, 80.0))).item())
+      math.exp(min(mean_nll, 80.0))
       if mean_nll is not None else None),
   }
 
@@ -330,30 +361,34 @@ def _attach_reference_lm_scores(
 def _summarize_attached_reference_lm(
     records: list[dict[str, Any]],
 ) -> dict[str, Any]:
-  total_nll = 0.0
+  nll_contributions = []
   total_tokens = 0
   for record in records:
     score = record['reference_lm']
     if score['mean_nll_nats'] is not None:
-      total_nll += score['mean_nll_nats'] * score['token_count']
+      nll_contributions.append(
+        score['mean_nll_nats'] * score['token_count'])
       total_tokens += score['token_count']
+  total_nll = math.fsum(nll_contributions)
   mean_nll = total_nll / total_tokens if total_tokens else None
   identities = {
     (record['reference_lm']['model_name_or_path'],
-     record['reference_lm']['revision'])
+     record['reference_lm']['revision'],
+     record['reference_lm']['sequence_policy'])
     for record in records
   }
   if len(identities) != 1:
     raise ValueError('reference-LM identities differ within one summary')
-  model_name_or_path, revision = next(iter(identities))
+  model_name_or_path, revision, sequence_policy = next(iter(identities))
   return {
     'model_name_or_path': model_name_or_path,
     'revision': revision,
+    'sequence_policy': sequence_policy,
     'num_scored_sequences': len(records),
     'num_scored_tokens': total_tokens,
     'mean_nll_nats': mean_nll,
     'perplexity': (
-      float(torch.exp(torch.tensor(min(mean_nll, 80.0))).item())
+      math.exp(min(mean_nll, 80.0))
       if mean_nll is not None else None),
   }
 
@@ -385,10 +420,13 @@ def main(argv=None) -> int:
     raise ValueError('--nfe-budgets contains duplicates')
 
   start_time = dt.datetime.now(dt.timezone.utc)
+  critical_package_versions = _critical_runtime_package_versions()
   backbone_sha256 = verify_artifact(
     args.backbone_checkpoint, args.backbone_sha256, 'backbone')
   adapter_sha256 = verify_artifact(
     args.adapter, args.adapter_sha256, 'adapter')
+  adapter_manifest_sha256 = verify_artifact(
+    args.adapter_manifest, args.adapter_manifest_sha256, 'adapter manifest')
   repository_provenance = _git_provenance()
   if repository_provenance['dirty'] and not args.allow_dirty:
     raise RuntimeError(
@@ -398,6 +436,8 @@ def main(argv=None) -> int:
   config = _compose_config(args)
   tokenizer = dataloader.get_tokenizer(config)
   model = diffusion.Diffusion(config, tokenizer=tokenizer)
+  adapter_identity_sha256 = model.structured_adapter_manifest[
+    'structured_decoder_identity_sha256']
   device = torch.device(args.device)
   if device.type == 'cuda' and not torch.cuda.is_available():
     raise RuntimeError('CUDA was requested but is unavailable')
@@ -531,12 +571,14 @@ def main(argv=None) -> int:
       'platform': platform.platform(),
       'python': platform.python_version(),
       'torch': torch.__version__,
+      'cuda_runtime': torch.version.cuda,
       'device': str(device),
       'gpu': (torch.cuda.get_device_name(device)
               if device.type == 'cuda' else None),
       'parameter_dtypes': parameter_dtypes,
       'precision_policy': (
         'checkpoint dtype; DIT-managed bf16 autocast on CUDA'),
+      'packages': critical_package_versions,
     },
     'repository': repository_provenance,
     'artifacts': {
@@ -549,6 +591,9 @@ def main(argv=None) -> int:
         'path': str(args.adapter.resolve()),
         'sha256': adapter_sha256,
         'size_bytes': args.adapter.resolve().stat().st_size,
+        'manifest_path': str(args.adapter_manifest.resolve()),
+        'manifest_sha256': adapter_manifest_sha256,
+        'identity_sha256': adapter_identity_sha256,
       },
     },
     'prompts': prompt_provenance,

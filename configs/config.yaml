@@ -56,6 +56,10 @@ eval:
   # backbone in model.structured_decoder.training.backbone_checkpoint.
   adapter_checkpoint: ''
   adapter_sha256: ''
+  # Required provenance pair for adapter_checkpoint. The runtime checks the
+  # adapter byte hash and exact structured-decoder identity before loading.
+  adapter_manifest: ''
+  adapter_manifest_sha256: ''
   disable_ema: False
   compute_generative_perplexity: False
   perplexity_batch_size: 8

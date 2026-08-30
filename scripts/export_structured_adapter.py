@@ -4,19 +4,24 @@
 The training checkpoint contains both the immutable released backbone and the
 small learned structured head.  This exporter fails closed on unexpected state
 names, removes the redundant frozen tensors, and writes the learned tensors in
-the non-executable safetensors format plus a provenance manifest.
+the non-executable safetensors format plus a provenance manifest. Both files
+cryptographically bind the canonical control, topology/factor modes, and
+candidate-set size used to fit the head.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import sys
-from typing import Mapping
+from typing import Any, Mapping, Sequence
 
-from safetensors.torch import load_file, save_file
+from safetensors.torch import load as load_safetensors
+from safetensors.torch import save_file
 import torch
 
 # Keep both ``python -m scripts.export_structured_adapter`` and direct script
@@ -37,6 +42,304 @@ from scripts.prepare_released_mdlm_owt import (  # noqa: E402
 
 BACKBONE_PREFIX = 'backbone.'
 ADAPTER_PREFIX = 'structured_head.'
+CONTROL_MODES = {
+  'dynamic_dynamic': ('dynamic', 'dynamic'),
+  'fixed_dynamic': ('fixed', 'dynamic'),
+  'dynamic_fixed': ('dynamic', 'fixed'),
+  'static_static': ('fixed', 'fixed'),
+}
+CONTROL_BY_MODES = {modes: name for name, modes in CONTROL_MODES.items()}
+STRUCTURED_IDENTITY_FIELDS = {
+  'control_identity', 'topology_mode', 'factor_mode', 'candidate_top_k',
+  'independent_mode', 'topology_weight', 'head_semantics',
+  'training_semantics',
+}
+HEAD_INTEGER_FIELDS = (
+  'rank', 'time_embed_dim', 'topology_dim', 'local_window',
+  'num_anchor_slots', 'contextual_neighbors', 'component_size_cap',
+)
+TRAINING_SEMANTIC_FIELDS = (
+  'objective_name', 'factorized_aux_weight', 'topology_strategy',
+  'topology_temperature', 'topology_minimum_choices',
+  'topology_edge_weight', 'topology_anchor_weight',
+  'topology_slot_weight', 'topology_on_validation',
+)
+RELEASED_BACKBONE_IDENTITY = {
+  'repository': RELEASE_REPOSITORY,
+  'revision': RELEASE_REVISION,
+  'source_sha256': RELEASE_SHA256,
+  'source_size_bytes': RELEASE_SIZE_BYTES,
+  'tensor_count': RELEASE_TENSOR_COUNT,
+}
+
+
+def _canonical_json(payload: object) -> str:
+  try:
+    return json.dumps(
+      payload, sort_keys=True, separators=(',', ':'), allow_nan=False)
+  except (TypeError, ValueError) as error:
+    raise ValueError('payload is not canonical JSON data') from error
+
+
+def canonical_sha256(payload: object) -> str:
+  return hashlib.sha256(_canonical_json(payload).encode('utf-8')).hexdigest()
+
+
+def safetensors_metadata_from_bytes(payload: bytes) -> dict[str, str]:
+  """Read the non-executable safetensors header metadata fail-closed."""
+  if len(payload) < 8:
+    raise ValueError('structured adapter is not a valid safetensors file')
+  header_size = int.from_bytes(payload[:8], byteorder='little', signed=False)
+  if header_size <= 0 or 8 + header_size > len(payload):
+    raise ValueError('structured adapter has an invalid safetensors header')
+  try:
+    header = json.loads(payload[8:8 + header_size])
+  except (UnicodeDecodeError, json.JSONDecodeError) as error:
+    raise ValueError(
+      'structured adapter has an invalid safetensors JSON header') from error
+  metadata = header.get('__metadata__') if isinstance(header, Mapping) else None
+  if (not isinstance(metadata, Mapping)
+      or any(not isinstance(key, str) or not isinstance(value, str)
+             for key, value in metadata.items())):
+    raise ValueError('structured adapter lacks valid safetensors metadata')
+  return dict(metadata)
+
+
+def _finite_float(value: object, *, context: str) -> float:
+  if (not isinstance(value, (int, float)) or isinstance(value, bool)
+      or not math.isfinite(float(value))):
+    raise ValueError(f'{context} must be finite')
+  return float(value)
+
+
+def _positive_int(value: object, *, context: str) -> int:
+  if (not isinstance(value, int) or isinstance(value, bool) or value <= 0):
+    raise ValueError(f'{context} must be a positive integer')
+  return value
+
+
+def _nonnegative_int(value: object, *, context: str) -> int:
+  if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+    raise ValueError(f'{context} must be a non-negative integer')
+  return value
+
+
+def _lower_sha256(value: object, *, context: str) -> str:
+  if (not isinstance(value, str) or len(value) != 64
+      or any(character not in '0123456789abcdef' for character in value)):
+    raise ValueError(f'{context} must be 64 lowercase hexadecimal digits')
+  return value
+
+
+def _metadata_integer(
+    metadata: Mapping[str, str],
+    field: str,
+    *,
+    positive: bool,
+) -> int:
+  value = metadata.get(field)
+  if (not isinstance(value, str) or not value or not value.isascii()
+      or not value.isdecimal()
+      or (len(value) > 1 and value.startswith('0'))
+      or (positive and value == '0')):
+    qualifier = 'positive' if positive else 'non-negative'
+    raise ValueError(
+      f'safetensors metadata {field} must be a canonical {qualifier} integer')
+  return int(value)
+
+
+def _canonical_fixed_edges(value: object) -> list[list[int]] | None:
+  if value is None:
+    return None
+  if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
+    raise ValueError('structured_decoder.fixed_edges must be null or pairs')
+  edges = []
+  for index, edge in enumerate(value):
+    if (isinstance(edge, (str, bytes)) or not isinstance(edge, Sequence)
+        or len(edge) != 2):
+      raise ValueError(
+        f'structured_decoder.fixed_edges[{index}] must be an integer pair')
+    endpoints = []
+    for endpoint in edge:
+      if (not isinstance(endpoint, int) or isinstance(endpoint, bool)
+          or endpoint < 0):
+        raise ValueError(
+          f'structured_decoder.fixed_edges[{index}] has an invalid endpoint')
+      endpoints.append(endpoint)
+    edges.append(endpoints)
+  return edges
+
+
+def structured_decoder_identity_from_config(
+    structured: Mapping[str, object],
+    *,
+    control_identity: str | None = None,
+) -> tuple[dict[str, object], str]:
+  """Build the canonical semantic identity required to load an adapter.
+
+  The digest binds architecture, active/disabled factor behavior, candidate
+  support, and the training semantics that can change learned adapter bytes.
+  Paths to the separately pinned backbone are intentionally excluded.
+  """
+  if not isinstance(structured, Mapping):
+    raise ValueError('model.structured_decoder must be a mapping')
+  topology_mode = structured.get('topology_mode')
+  factor_mode = structured.get('factor_mode')
+  inferred_control = CONTROL_BY_MODES.get((topology_mode, factor_mode))
+  if inferred_control is None:
+    raise ValueError(
+      'structured topology/factor modes do not name a frozen control')
+  if control_identity is None:
+    control_identity = inferred_control
+  elif control_identity != inferred_control:
+    raise ValueError(
+      f'control {control_identity!r} requires topology/factor modes '
+      f'{CONTROL_MODES.get(control_identity)}, found '
+      f'{(topology_mode, factor_mode)}')
+
+  candidate_top_k = _positive_int(
+    structured.get('top_k'), context='structured_decoder.top_k')
+  independent_mode = structured.get('independent_mode')
+  if not isinstance(independent_mode, bool):
+    raise ValueError('structured_decoder.independent_mode must be boolean')
+  training = structured.get('training')
+  if not isinstance(training, Mapping):
+    raise ValueError('structured_decoder.training must be a mapping')
+  topology_weight = _finite_float(
+    training.get('topology_weight'),
+    context='structured_decoder.training.topology_weight')
+  if topology_weight < 0:
+    raise ValueError(
+      'structured_decoder.training.topology_weight must be non-negative')
+
+  head_semantics: dict[str, object] = {}
+  for field in HEAD_INTEGER_FIELDS:
+    head_semantics[field] = _positive_int(
+      structured.get(field), context=f'structured_decoder.{field}')
+  min_edge_score = structured.get('min_edge_score')
+  head_semantics['min_edge_score'] = (
+    None if min_edge_score is None else _finite_float(
+      min_edge_score, context='structured_decoder.min_edge_score'))
+  head_semantics['fixed_edges'] = _canonical_fixed_edges(
+    structured.get('fixed_edges'))
+  fixed_edge_path = structured.get('fixed_edge_path')
+  if fixed_edge_path in (None, ''):
+    fixed_edge_path = None
+  elif not isinstance(fixed_edge_path, str):
+    raise ValueError('structured_decoder.fixed_edge_path must be a string')
+  head_semantics['fixed_edge_path'] = fixed_edge_path
+
+  training_semantics: dict[str, object] = {}
+  for field in TRAINING_SEMANTIC_FIELDS:
+    value = training.get(field)
+    if field in {
+        'factorized_aux_weight', 'topology_temperature',
+        'topology_edge_weight', 'topology_anchor_weight',
+        'topology_slot_weight'}:
+      value = _finite_float(
+        value, context=f'structured_decoder.training.{field}')
+    elif field == 'topology_minimum_choices':
+      value = _positive_int(
+        value, context=f'structured_decoder.training.{field}')
+    elif field == 'topology_on_validation':
+      if not isinstance(value, bool):
+        raise ValueError(
+          'structured_decoder.training.topology_on_validation must be '
+          'boolean')
+    elif not isinstance(value, str) or not value:
+      raise ValueError(
+        f'structured_decoder.training.{field} must be non-empty')
+    training_semantics[field] = value
+
+  identity = {
+    'control_identity': control_identity,
+    'topology_mode': topology_mode,
+    'factor_mode': factor_mode,
+    'candidate_top_k': candidate_top_k,
+    'independent_mode': independent_mode,
+    'topology_weight': topology_weight,
+    'head_semantics': head_semantics,
+    'training_semantics': training_semantics,
+  }
+  return identity, canonical_sha256(identity)
+
+
+def _validated_adapter_identity(
+    *,
+    control_identity: str,
+    topology_mode: str,
+    factor_mode: str,
+    candidate_k: int,
+    independent_mode: bool,
+    topology_weight: float,
+) -> tuple[dict[str, object], str]:
+  expected_modes = CONTROL_MODES.get(control_identity)
+  if expected_modes is None:
+    raise ValueError(
+      f'unknown structured control identity: {control_identity!r}')
+  actual_modes = (topology_mode, factor_mode)
+  if actual_modes != expected_modes:
+    raise ValueError(
+      f'control {control_identity!r} requires topology/factor modes '
+      f'{expected_modes}, found {actual_modes}')
+  _positive_int(candidate_k, context='candidate_k')
+  if not isinstance(independent_mode, bool):
+    raise ValueError('independent_mode must be boolean')
+  topology_weight = _finite_float(
+    topology_weight, context='topology_weight')
+  if topology_weight < 0:
+    raise ValueError('topology_weight must be non-negative')
+  identity = {
+    'control_identity': control_identity,
+    'topology_mode': topology_mode,
+    'factor_mode': factor_mode,
+    'candidate_top_k': candidate_k,
+    'independent_mode': independent_mode,
+    'topology_weight': topology_weight,
+  }
+  return identity, canonical_sha256(identity)
+
+
+def _validate_checkpoint_adapter_identity(
+    checkpoint: Mapping[str, object],
+    *,
+    expected_identity: Mapping[str, object],
+) -> tuple[dict[str, object], str]:
+  hyperparameters = checkpoint.get('hyper_parameters')
+  if not isinstance(hyperparameters, Mapping):
+    raise ValueError(
+      'checkpoint lacks the saved hyper_parameters needed to verify its '
+      'structured-decoder identity')
+  config = hyperparameters.get('config')
+  model = config.get('model') if isinstance(config, Mapping) else None
+  structured = (
+    model.get('structured_decoder') if isinstance(model, Mapping) else None)
+  if not isinstance(structured, Mapping):
+    raise ValueError(
+      'checkpoint hyper_parameters lack model.structured_decoder')
+  training = structured.get('training')
+  observed = {
+    'topology_mode': structured.get('topology_mode'),
+    'factor_mode': structured.get('factor_mode'),
+    'candidate_top_k': structured.get('top_k'),
+    'independent_mode': structured.get('independent_mode'),
+    'topology_weight': (
+      training.get('topology_weight') if isinstance(training, Mapping)
+      else None),
+  }
+  expected = {
+    field: expected_identity[field]
+    for field in (
+      'topology_mode', 'factor_mode', 'candidate_top_k',
+      'independent_mode', 'topology_weight')}
+  if observed != expected:
+    raise ValueError(
+      'checkpoint structured-decoder identity mismatch: '
+      f'expected {expected}, found {observed}')
+  full_identity, full_digest = structured_decoder_identity_from_config(
+    structured,
+    control_identity=str(expected_identity['control_identity']))
+  return full_identity, full_digest
 
 
 def _validated_state_dict(
@@ -82,17 +385,23 @@ def load_adapter_state(
     *,
     expected_sha256: str | None = None,
 ) -> dict[str, torch.Tensor]:
-  """Load a prefix-stripped structured-head state with optional byte check."""
+  """Low-level tensor reader; inference callers must validate the manifest."""
   path = path.resolve()
   if not path.is_file():
     raise FileNotFoundError(path)
+  payload = path.read_bytes()
   if expected_sha256 is not None:
-    actual_sha256 = sha256_file(path)
+    normalized_expected = (
+      expected_sha256.lower()
+      if isinstance(expected_sha256, str) else expected_sha256)
+    expected_sha256 = _lower_sha256(
+      normalized_expected, context='expected adapter SHA256')
+    actual_sha256 = hashlib.sha256(payload).hexdigest()
     if actual_sha256 != expected_sha256:
       raise ValueError(
         f'adapter SHA256 mismatch: expected {expected_sha256}, '
         f'found {actual_sha256}')
-  state = load_file(str(path), device='cpu')
+  state = load_safetensors(payload)
   if not state:
     raise ValueError('adapter file contains no tensors')
   invalid = [
@@ -108,9 +417,17 @@ def load_adapter_into_head(
     head: torch.nn.Module,
     path: Path,
     *,
-    expected_sha256: str | None = None,
+    manifest_path: Path,
+    expected_identity: Mapping[str, object],
+    expected_sha256: str,
+    expected_manifest_sha256: str,
 ) -> None:
-  """Strictly rehydrate an instantiated structured head."""
+  """Validate provenance and strictly rehydrate an instantiated head."""
+  load_and_validate_adapter_manifest(
+    manifest_path, path,
+    expected_identity=expected_identity,
+    expected_adapter_sha256=expected_sha256,
+    expected_manifest_sha256=expected_manifest_sha256)
   state = load_adapter_state(path, expected_sha256=expected_sha256)
   incompatible = head.load_state_dict(state, strict=True)
   if incompatible.missing_keys or incompatible.unexpected_keys:
@@ -120,12 +437,262 @@ def load_adapter_into_head(
       f'unexpected={incompatible.unexpected_keys}')
 
 
+def validate_adapter_manifest_payload(
+    payload: object,
+    *,
+    adapter_filename: str,
+    adapter_sha256: str,
+    adapter_size_bytes: int,
+    adapter_metadata: Mapping[str, str],
+    adapter_state: Mapping[str, torch.Tensor],
+    expected_identity: Mapping[str, object],
+) -> dict[str, Any]:
+  """Validate a manifest against exact adapter bytes and runtime semantics."""
+  if not isinstance(payload, Mapping):
+    raise TypeError('structured adapter manifest must be a JSON object')
+  required = {
+    'artifact_role', 'schema_version', 'format', 'adapter_file',
+    'adapter_sha256', 'adapter_size_bytes', 'adapter_tensor_count',
+    'adapter_parameter_count', 'adapter_tensor_bytes',
+    'adapter_namespace_in_source', 'adapter_namespace_in_file',
+    'structured_decoder_identity',
+    'structured_decoder_identity_sha256', 'tensor_schema',
+    'source_checkpoint_sha256', 'source_checkpoint_size_bytes',
+    'source_checkpoint_global_step', 'source_state_dict_tensor_count',
+    'omitted_frozen_backbone_tensor_count', 'ema_available', 'ema_used',
+    'required_loader', 'required_loader_strict', 'released_backbone',
+  }
+  if set(payload) != required:
+    raise ValueError(
+      'structured adapter manifest schema mismatch: '
+      f'missing={sorted(required - set(payload))}, '
+      f'unknown={sorted(set(payload) - required)}')
+  result = dict(payload)
+  if (not isinstance(result['artifact_role'], str)
+      or result['artifact_role'] != 'contextual_forest_structured_adapter'
+      or type(result['schema_version']) is not int
+      or result['schema_version'] != 4
+      or not isinstance(result['format'], str)
+      or result['format'] != 'safetensors'):
+    raise ValueError('unsupported structured adapter manifest identity')
+  if result['adapter_file'] != adapter_filename:
+    raise ValueError(
+      'structured adapter filename differs from its manifest: '
+      f'expected {result["adapter_file"]!r}, found {adapter_filename!r}')
+  manifest_adapter_sha256 = _lower_sha256(
+    result['adapter_sha256'], context='manifest adapter SHA256')
+  actual_adapter_sha256 = _lower_sha256(
+    adapter_sha256, context='actual adapter SHA256')
+  if manifest_adapter_sha256 != actual_adapter_sha256:
+    raise ValueError(
+      'structured adapter SHA256 differs from its manifest: '
+      f'expected {result["adapter_sha256"]}, found {adapter_sha256}')
+  manifest_adapter_size = _positive_int(
+    result['adapter_size_bytes'], context='adapter_size_bytes')
+  actual_adapter_size = _positive_int(
+    adapter_size_bytes, context='actual adapter_size_bytes')
+  if manifest_adapter_size != actual_adapter_size:
+    raise ValueError('structured adapter size differs from its manifest')
+  if not isinstance(adapter_state, Mapping) or not adapter_state:
+    raise ValueError('structured adapter contains no tensors')
+  invalid_values = [
+    key for key, value in adapter_state.items() if not torch.is_tensor(value)]
+  if invalid_values:
+    raise TypeError(
+      f'structured adapter contains non-tensors: {invalid_values[:5]}')
+  invalid_names = [
+    key for key in adapter_state
+    if (not isinstance(key, str) or not key
+        or key.startswith((BACKBONE_PREFIX, ADAPTER_PREFIX)))]
+  if invalid_names:
+    raise ValueError(
+      'structured adapter must use non-empty prefix-stripped head keys: '
+      f'{invalid_names[:5]}')
+  tensor_schema = {
+    key: {'shape': list(value.shape), 'dtype': str(value.dtype)}
+    for key, value in sorted(adapter_state.items())}
+  tensor_count = len(adapter_state)
+  parameter_count = sum(value.numel() for value in adapter_state.values())
+  tensor_bytes = sum(
+    value.numel() * value.element_size()
+    for value in adapter_state.values())
+  derived_adapter_fields = {
+    'adapter_tensor_count': tensor_count,
+    'adapter_parameter_count': parameter_count,
+    'adapter_tensor_bytes': tensor_bytes,
+    'adapter_namespace_in_source': f'{ADAPTER_PREFIX}*',
+    'adapter_namespace_in_file': 'prefix-stripped',
+    'tensor_schema': tensor_schema,
+  }
+  for field, expected_value in derived_adapter_fields.items():
+    if _canonical_json(result[field]) != _canonical_json(expected_value):
+      raise ValueError(
+        f'structured adapter manifest {field} differs from adapter bytes')
+  identity = result['structured_decoder_identity']
+  if not isinstance(identity, Mapping) or set(identity) != \
+      STRUCTURED_IDENTITY_FIELDS:
+    raise ValueError('structured adapter identity schema mismatch')
+  identity = dict(identity)
+  identity_sha256 = canonical_sha256(identity)
+  if result['structured_decoder_identity_sha256'] != identity_sha256:
+    raise ValueError('structured adapter identity digest mismatch')
+  if not isinstance(expected_identity, Mapping):
+    raise ValueError('runtime structured adapter identity must be a mapping')
+  expected = dict(expected_identity)
+  if set(expected) != STRUCTURED_IDENTITY_FIELDS:
+    raise ValueError('runtime structured adapter identity schema mismatch')
+  expected_identity_sha256 = canonical_sha256(expected)
+  if (identity_sha256 != expected_identity_sha256
+      or _canonical_json(identity) != _canonical_json(expected)):
+    differing = {
+      field: {'adapter': identity.get(field), 'runtime': expected.get(field)}
+      for field in sorted(STRUCTURED_IDENTITY_FIELDS)
+      if identity.get(field) != expected.get(field)}
+    raise ValueError(
+      f'structured adapter identity differs from runtime config: {differing}')
+  expected_metadata = {
+    'artifact_role': 'contextual_forest_structured_head',
+    'source_namespace': ADAPTER_PREFIX,
+    'file_namespace': 'prefix-stripped',
+    'control_identity': str(identity['control_identity']),
+    'topology_mode': str(identity['topology_mode']),
+    'factor_mode': str(identity['factor_mode']),
+    'candidate_k': str(identity['candidate_top_k']),
+    'independent_mode': json.dumps(identity['independent_mode']),
+    'topology_weight': json.dumps(identity['topology_weight']),
+    'structured_decoder_identity_sha256': identity_sha256,
+    'source_checkpoint_sha256': str(result['source_checkpoint_sha256']),
+    'source_checkpoint_size_bytes': str(
+      result['source_checkpoint_size_bytes']),
+    'source_checkpoint_global_step': str(
+      result['source_checkpoint_global_step']),
+    'source_state_dict_tensor_count': str(
+      result['source_state_dict_tensor_count']),
+    'omitted_frozen_backbone_tensor_count': str(
+      result['omitted_frozen_backbone_tensor_count']),
+  }
+  if dict(adapter_metadata) != expected_metadata:
+    raise ValueError(
+      'safetensors metadata differs from the validated adapter identity')
+  source_sha = _lower_sha256(
+    result['source_checkpoint_sha256'],
+    context='source_checkpoint_sha256')
+  source_size = _positive_int(
+    result['source_checkpoint_size_bytes'],
+    context='source_checkpoint_size_bytes')
+  source_step = _nonnegative_int(
+    result['source_checkpoint_global_step'],
+    context='source_checkpoint_global_step')
+  source_tensor_count = _positive_int(
+    result['source_state_dict_tensor_count'],
+    context='source_state_dict_tensor_count')
+  omitted_count = _positive_int(
+    result['omitted_frozen_backbone_tensor_count'],
+    context='omitted_frozen_backbone_tensor_count')
+  if source_tensor_count != omitted_count + tensor_count:
+    raise ValueError(
+      'source state tensor count does not equal omitted backbone plus adapter')
+  if omitted_count != RELEASE_TENSOR_COUNT:
+    raise ValueError(
+      'omitted frozen-backbone tensor count differs from the pinned release')
+  if (not isinstance(result['released_backbone'], Mapping)
+      or _canonical_json(dict(result['released_backbone']))
+      != _canonical_json(RELEASED_BACKBONE_IDENTITY)):
+    raise ValueError(
+      'structured adapter released-backbone identity is not the pinned release')
+  header_source_fields = {
+    'source_checkpoint_sha256': source_sha,
+    'source_checkpoint_size_bytes': source_size,
+    'source_checkpoint_global_step': source_step,
+    'source_state_dict_tensor_count': source_tensor_count,
+    'omitted_frozen_backbone_tensor_count': omitted_count,
+  }
+  for field, expected_value in header_source_fields.items():
+    observed_value = (
+      adapter_metadata[field]
+      if field == 'source_checkpoint_sha256'
+      else _metadata_integer(
+        adapter_metadata, field,
+        positive=(field != 'source_checkpoint_global_step')))
+    if observed_value != expected_value:
+      raise ValueError(
+        f'safetensors metadata {field} differs from adapter manifest')
+  if result['required_loader'] != \
+      'manifest_validated_strict_structured_head_loader_v2':
+    raise ValueError('structured adapter manifest names an invalid loader')
+  if result['required_loader_strict'] is not True:
+    raise ValueError('structured adapter manifest does not require strict load')
+  if result['ema_available'] is not False or result['ema_used'] is not False:
+    raise ValueError('structured adapter manifest has an invalid EMA policy')
+  return result
+
+
+def load_and_validate_adapter_manifest(
+    manifest_path: Path,
+    adapter_path: Path,
+    *,
+    expected_identity: Mapping[str, object],
+    expected_adapter_sha256: str,
+    expected_manifest_sha256: str,
+) -> dict[str, Any]:
+  """Load a local export pair and fail closed on any provenance mismatch."""
+  manifest_path = manifest_path.expanduser().resolve()
+  adapter_path = adapter_path.expanduser().resolve()
+  if not manifest_path.is_file():
+    raise FileNotFoundError(manifest_path)
+  if not adapter_path.is_file():
+    raise FileNotFoundError(adapter_path)
+  normalized_adapter_sha256 = (
+    expected_adapter_sha256.lower()
+    if isinstance(expected_adapter_sha256, str)
+    else expected_adapter_sha256)
+  normalized_manifest_sha256 = (
+    expected_manifest_sha256.lower()
+    if isinstance(expected_manifest_sha256, str)
+    else expected_manifest_sha256)
+  expected_adapter_sha256 = _lower_sha256(
+    normalized_adapter_sha256, context='expected adapter SHA256')
+  expected_manifest_sha256 = _lower_sha256(
+    normalized_manifest_sha256, context='expected manifest SHA256')
+  manifest_bytes = manifest_path.read_bytes()
+  actual_manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
+  if actual_manifest_sha256 != expected_manifest_sha256:
+    raise ValueError(
+      f'structured adapter manifest SHA256 mismatch: expected '
+      f'{expected_manifest_sha256}, found {actual_manifest_sha256}')
+  try:
+    payload = json.loads(manifest_bytes)
+  except (UnicodeDecodeError, json.JSONDecodeError) as error:
+    raise ValueError('structured adapter manifest is not valid JSON') from error
+  adapter_bytes = adapter_path.read_bytes()
+  actual_sha256 = hashlib.sha256(adapter_bytes).hexdigest()
+  if actual_sha256 != expected_adapter_sha256:
+    raise ValueError(
+      f'structured adapter SHA256 mismatch: expected '
+      f'{expected_adapter_sha256}, found {actual_sha256}')
+  adapter_state = load_safetensors(adapter_bytes)
+  return validate_adapter_manifest_payload(
+    payload,
+    adapter_filename=adapter_path.name,
+    adapter_sha256=actual_sha256,
+    adapter_size_bytes=len(adapter_bytes),
+    adapter_metadata=safetensors_metadata_from_bytes(adapter_bytes),
+    adapter_state=adapter_state,
+    expected_identity=expected_identity)
+
+
 def export_adapter(
     checkpoint_path: Path,
     output_path: Path,
     manifest_path: Path,
     *,
     expected_checkpoint_sha256: str,
+    control_identity: str,
+    topology_mode: str,
+    factor_mode: str,
+    candidate_k: int,
+    independent_mode: bool,
+    topology_weight: float,
     expected_global_step: int | None = None,
     expected_backbone_tensors: int | None = RELEASE_TENSOR_COUNT,
     overwrite: bool = False,
@@ -142,15 +709,33 @@ def export_adapter(
     raise FileExistsError(
       f'{existing[0]} already exists; pass --force to replace outputs')
 
-  if (len(expected_checkpoint_sha256) != 64
-      or any(character not in '0123456789abcdef'
-             for character in expected_checkpoint_sha256.lower())):
-    raise ValueError('expected checkpoint SHA256 must be 64 hex characters')
+  structured_identity, structured_identity_sha256 = (
+    _validated_adapter_identity(
+      control_identity=control_identity,
+      topology_mode=topology_mode,
+      factor_mode=factor_mode,
+      candidate_k=candidate_k,
+      independent_mode=independent_mode,
+      topology_weight=topology_weight))
+
+  normalized_checkpoint_sha256 = (
+    expected_checkpoint_sha256.lower()
+    if isinstance(expected_checkpoint_sha256, str)
+    else expected_checkpoint_sha256)
+  expected_checkpoint_sha256 = _lower_sha256(
+    normalized_checkpoint_sha256, context='expected checkpoint SHA256')
+  if expected_backbone_tensors != RELEASE_TENSOR_COUNT:
+    raise ValueError(
+      'structured-adapter export requires the pinned released-backbone '
+      f'tensor count {RELEASE_TENSOR_COUNT}')
+  if expected_global_step is not None:
+    _nonnegative_int(
+      expected_global_step, context='expected checkpoint global_step')
   source_checkpoint_sha256 = sha256_file(checkpoint_path)
-  if source_checkpoint_sha256 != expected_checkpoint_sha256.lower():
+  if source_checkpoint_sha256 != expected_checkpoint_sha256:
     raise ValueError(
       f'source checkpoint SHA256 mismatch: expected '
-      f'{expected_checkpoint_sha256.lower()}, '
+      f'{expected_checkpoint_sha256}, '
       f'found {source_checkpoint_sha256}')
 
   # Lightning checkpoints use pickle.  Byte identity is therefore checked
@@ -161,11 +746,15 @@ def export_adapter(
     raise ValueError('checkpoint payload is not a mapping')
   if checkpoint.get('ema') is not None:
     raise ValueError('checkpoint unexpectedly contains EMA state')
-  global_step = int(checkpoint.get('global_step', -1))
+  global_step = _nonnegative_int(
+    checkpoint.get('global_step'), context='source checkpoint global_step')
   if expected_global_step is not None and global_step != expected_global_step:
     raise ValueError(
       f'global-step mismatch: expected {expected_global_step}, '
       f'found {global_step}')
+  structured_identity, structured_identity_sha256 = (
+    _validate_checkpoint_adapter_identity(
+      checkpoint, expected_identity=structured_identity))
   adapter, backbone_count = _validated_state_dict(
     checkpoint,
     expected_backbone_tensors=expected_backbone_tensors)
@@ -184,6 +773,22 @@ def export_adapter(
         'artifact_role': 'contextual_forest_structured_head',
         'source_namespace': ADAPTER_PREFIX,
         'file_namespace': 'prefix-stripped',
+        'control_identity': str(
+          structured_identity['control_identity']),
+        'topology_mode': str(structured_identity['topology_mode']),
+        'factor_mode': str(structured_identity['factor_mode']),
+        'candidate_k': str(structured_identity['candidate_top_k']),
+        'independent_mode': json.dumps(
+          structured_identity['independent_mode']),
+        'topology_weight': json.dumps(
+          structured_identity['topology_weight']),
+        'structured_decoder_identity_sha256': structured_identity_sha256,
+        'source_checkpoint_sha256': source_checkpoint_sha256,
+        'source_checkpoint_size_bytes': str(checkpoint_path.stat().st_size),
+        'source_checkpoint_global_step': str(global_step),
+        'source_state_dict_tensor_count': str(
+          backbone_count + len(adapter)),
+        'omitted_frozen_backbone_tensor_count': str(backbone_count),
       })
     adapter_sha256 = sha256_file(temporary_adapter)
     tensor_schema = {
@@ -195,7 +800,7 @@ def export_adapter(
     }
     manifest = {
       'artifact_role': 'contextual_forest_structured_adapter',
-      'schema_version': 1,
+      'schema_version': 4,
       'format': 'safetensors',
       'adapter_file': output_path.name,
       'adapter_sha256': adapter_sha256,
@@ -207,6 +812,8 @@ def export_adapter(
         value.numel() * value.element_size() for value in adapter.values()),
       'adapter_namespace_in_source': f'{ADAPTER_PREFIX}*',
       'adapter_namespace_in_file': 'prefix-stripped',
+      'structured_decoder_identity': structured_identity,
+      'structured_decoder_identity_sha256': structured_identity_sha256,
       'tensor_schema': tensor_schema,
       'source_checkpoint_sha256': source_checkpoint_sha256,
       'source_checkpoint_size_bytes': checkpoint_path.stat().st_size,
@@ -216,15 +823,9 @@ def export_adapter(
       'ema_available': False,
       'ema_used': False,
       'required_loader': (
-        'scripts.export_structured_adapter.load_adapter_into_head'),
+        'manifest_validated_strict_structured_head_loader_v2'),
       'required_loader_strict': True,
-      'released_backbone': {
-        'repository': RELEASE_REPOSITORY,
-        'revision': RELEASE_REVISION,
-        'source_sha256': RELEASE_SHA256,
-        'source_size_bytes': RELEASE_SIZE_BYTES,
-        'tensor_count': RELEASE_TENSOR_COUNT,
-      },
+      'released_backbone': dict(RELEASED_BACKBONE_IDENTITY),
     }
     temporary_manifest.write_text(
       json.dumps(manifest, indent=2, sort_keys=True) + '\n')
@@ -245,6 +846,16 @@ def _args(argv=None) -> argparse.Namespace:
   parser.add_argument('--output', type=Path, required=True)
   parser.add_argument('--manifest', type=Path, required=True)
   parser.add_argument('--expected-checkpoint-sha256', required=True)
+  parser.add_argument(
+    '--control-identity', choices=sorted(CONTROL_MODES), required=True)
+  parser.add_argument(
+    '--topology-mode', choices=('dynamic', 'fixed'), required=True)
+  parser.add_argument(
+    '--factor-mode', choices=('dynamic', 'fixed'), required=True)
+  parser.add_argument('--candidate-k', type=int, required=True)
+  parser.add_argument(
+    '--independent-mode', choices=('true', 'false'), required=True)
+  parser.add_argument('--topology-weight', type=float, required=True)
   parser.add_argument('--expected-global-step', type=int)
   parser.add_argument(
     '--expected-backbone-tensors', type=int, default=RELEASE_TENSOR_COUNT)
@@ -259,6 +870,12 @@ def main() -> int:
     args.output,
     args.manifest,
     expected_checkpoint_sha256=args.expected_checkpoint_sha256,
+    control_identity=args.control_identity,
+    topology_mode=args.topology_mode,
+    factor_mode=args.factor_mode,
+    candidate_k=args.candidate_k,
+    independent_mode=args.independent_mode == 'true',
+    topology_weight=args.topology_weight,
     expected_global_step=args.expected_global_step,
     expected_backbone_tensors=args.expected_backbone_tensors,
     overwrite=args.force)

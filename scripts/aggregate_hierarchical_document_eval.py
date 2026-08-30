@@ -5,14 +5,15 @@ Corruption replications are averaged within each source document. Chunks from
 the same source document are first combined by masked-token count, so long
 documents do not become pseudo-replicates. The bootstrap then resamples
 training seeds, resamples source documents inside each sampled training seed,
-and equal-weights the predeclared dataset/mask-rate strata.
+and equal-weights the predeclared dataset/mask-rate strata. Every corpus must
+meet its compiled record target; the sole short-split exception is the exact,
+fully consumed pinned WikiText-103 validation split.
 """
 
 from __future__ import annotations
 
 import argparse
 import datetime as dt
-import hashlib
 import json
 import math
 from pathlib import Path
@@ -29,11 +30,17 @@ if str(REPO_ROOT) not in sys.path:
 from data_provenance import canonical_sha256  # noqa: E402
 from scripts.compile_experiment_matrix import (  # noqa: E402
   DEFAULT_MANIFEST,
+  SLUG_PATTERN,
   load_and_validate_manifest,
   sha256_file,
 )
 from scripts.run_compiled_job import (  # noqa: E402
+  SUCCESS_MARKER,
+  _job_digest,
+  _job_execution_digest,
   _load_plan,
+  _output_records,
+  _read_json,
   _validate_repository_checkout,
   _validated_marker,
 )
@@ -47,6 +54,29 @@ ROW_FIELDS = {
   'masked_tokens', 'candidate_hits', 'retained_mass_sum',
   'pairing_digest_sha256',
 }
+
+# This is deliberately an exact protocol-v1 allowlist rather than a heuristic
+# such as ``dataset.startswith('wiki')``. A future WikiText revision or partial
+# source window must be reviewed before it can inherit the short-split policy.
+PINNED_FULL_WIKITEXT_SHORT_SPLIT = {
+  'compiled_dataset': 'wikitext103',
+  'logical_dataset_name': 'wikitext103-pinned',
+  'dataset_name_or_path': 'Salesforce/wikitext',
+  'dataset_config_name': 'wikitext-103-raw-v1',
+  'source_split': 'validation',
+  'source_revision': 'b08601e04326c79dfdd32d625aee71d232d685c3',
+  'source_num_rows': 3760,
+  'source_window': None,
+  'document_boundary_mode': 'wikitext_articles',
+  'processed_num_sequences': 197,
+  'document_num_rows_after_boundary_recovery': 60,
+}
+DATASET_FINGERPRINT_FIELDS = (
+  'raw_fingerprint', 'window_fingerprint', 'processed_fingerprint')
+PINNED_LEGACY_PLAN_SHA256 = (
+  '67a11c102084f5987043e0cb1ddfcf03e3a0f53ffe5ed77f9b8468ae82b5ce22')
+PINNED_LEGACY_REPOSITORY_SHA = (
+  'eaffd28a6667307d64f78fdd05c3ea7574f218d0')
 
 
 def _lower_hex(value: object, length: int, *, context: str) -> str:
@@ -298,15 +328,316 @@ def _validate_provenance_matches_data_config(
       f'dataset provenance differs from compiled data config: {mismatches}')
 
 
+def _is_pinned_full_wikitext_short_split(
+    *,
+    compiled_dataset: str,
+    provenance: Mapping[str, Any],
+) -> bool:
+  specification = provenance.get('specification')
+  observed = provenance.get('observed')
+  if not isinstance(specification, Mapping) \
+      or not isinstance(observed, Mapping):
+    return False
+  expected = dict(PINNED_FULL_WIKITEXT_SHORT_SPLIT)
+  if compiled_dataset != expected.pop('compiled_dataset'):
+    return False
+  expected_processed = expected.pop('processed_num_sequences')
+  expected_documents = expected.pop(
+    'document_num_rows_after_boundary_recovery')
+  if any(specification.get(field) != value
+         for field, value in expected.items()):
+    return False
+  source_rows = expected['source_num_rows']
+  # With no source window, equality of both observed row counts to the pinned
+  # source size proves that preprocessing saw the complete validation split.
+  if (observed.get('source_num_rows') != source_rows
+      or observed.get('window_num_rows') != source_rows):
+    return False
+  return (
+    observed.get('processed_num_sequences') == expected_processed
+    and observed.get('document_num_rows_after_boundary_recovery')
+    == expected_documents)
+
+
+def _expected_record_count(
+    *,
+    compiled_dataset: str,
+    suite_name: str,
+    target_windows: int,
+    provenance: Mapping[str, Any],
+    provenance_path: Path,
+) -> int:
+  observed = provenance.get('observed')
+  if not isinstance(observed, Mapping):
+    raise ValueError(f'{provenance_path} has no observed provenance mapping')
+  available_windows = observed.get('processed_num_sequences')
+  if (not isinstance(available_windows, int)
+      or isinstance(available_windows, bool) or available_windows <= 0):
+    raise ValueError(
+      f'{provenance_path} does not commit a positive processed window count')
+  if available_windows >= target_windows:
+    return target_windows
+  if _is_pinned_full_wikitext_short_split(
+      compiled_dataset=compiled_dataset, provenance=provenance):
+    return available_windows
+  raise ValueError(
+    f'{provenance_path} reports {available_windows} processed windows for '
+    f'{compiled_dataset}, but suite {suite_name} requires {target_windows}; '
+    'only the exact fully consumed pinned WikiText-103 validation split may '
+    'fall below a compiled target')
+
+
+def _record_cross_cell_dataset_provenance(
+    committed: dict[str, tuple[dict[str, Any], Path]],
+    *,
+    compiled_dataset: str,
+    provenance: Mapping[str, Any],
+    provenance_path: Path,
+) -> None:
+  """Require identical preprocessing identities in every factorial cell."""
+  observed = provenance.get('observed')
+  if not isinstance(observed, Mapping):
+    raise ValueError(f'{provenance_path} has no observed provenance mapping')
+  fingerprints = {}
+  for field in DATASET_FINGERPRINT_FIELDS:
+    value = observed.get(field)
+    if not isinstance(value, str) or not value:
+      raise ValueError(
+        f'{provenance_path} lacks a non-empty {field}')
+    fingerprints[field] = value
+  identity = {
+    'specification_sha256': provenance.get('specification_sha256'),
+    'source_num_rows': observed.get('source_num_rows'),
+    'window_num_rows': observed.get('window_num_rows'),
+    'document_num_rows_after_boundary_recovery': observed.get(
+      'document_num_rows_after_boundary_recovery'),
+    'processed_num_sequences': observed.get('processed_num_sequences'),
+    **fingerprints,
+  }
+  previous = committed.setdefault(
+    compiled_dataset, (identity, provenance_path))
+  if previous[0] != identity:
+    differing = {
+      field: {'first': previous[0].get(field), 'current': identity.get(field)}
+      for field in sorted(identity)
+      if previous[0].get(field) != identity.get(field)}
+    raise ValueError(
+      f'dataset preprocessing identity differs across evaluation cells for '
+      f'{compiled_dataset}: {previous[1]} versus {provenance_path}: '
+      f'{differing}')
+
+
+def _load_plan_for_analysis(
+    plan_dir: Path,
+    *,
+    expected_legacy_plan_sha256: str = PINNED_LEGACY_PLAN_SHA256,
+    expected_legacy_repository_sha: str = PINNED_LEGACY_REPOSITORY_SHA,
+) -> tuple[dict[str, Any], dict[str, dict[str, Any]], str, bool]:
+  """Load a current plan or the one explicitly grandfathered legacy plan.
+
+  Version-1 plans omitted the repository SHA from job identities and success
+  markers. They are therefore accepted only when a trusted caller supplies the
+  exact compiled-plan file and clean source-repository commitments. The normal
+  command-line path uses the constants frozen above; the promotion evaluator
+  supplies the same values from its trusted policy.
+  """
+  plan_dir = plan_dir.expanduser().resolve()
+  plan_path = plan_dir / 'compiled-plan.json'
+  plan_sha256 = sha256_file(plan_path)
+  raw_plan = _read_json(plan_path)
+  if raw_plan.get('schema_version') != 1:
+    plan, jobs = _load_plan(plan_dir)
+    _validate_repository_checkout(plan)
+    return plan, jobs, plan_sha256, False
+
+  _lower_hex(
+    expected_legacy_plan_sha256, 64,
+    context='expected legacy compiled-plan SHA256')
+  _lower_hex(
+    expected_legacy_repository_sha, 40,
+    context='expected legacy repository SHA')
+  if plan_sha256 != expected_legacy_plan_sha256:
+    raise ValueError(
+      'legacy compiled plan is not the exact policy-pinned pilot plan: '
+      f'expected {expected_legacy_plan_sha256}, found {plan_sha256}')
+  expected_plan_fields = {
+    'schema_version', 'protocol_id', 'source_manifest_sha256',
+    'artifact_root', 'selected_suites', 'promotion_evidence', 'plan_id',
+    'manifest_protocol_status', 'scientific_scope', 'repository',
+    'job_counts', 'num_jobs', 'job_ids', 'job_spec_sha256',
+  }
+  if set(raw_plan) != expected_plan_fields:
+    raise ValueError(
+      'legacy compiled plan schema mismatch: '
+      f'missing={sorted(expected_plan_fields - set(raw_plan))}, '
+      f'unknown={sorted(set(raw_plan) - expected_plan_fields)}')
+  plan = dict(raw_plan)
+  _lower_hex(plan['plan_id'], 64, context='legacy compiled plan plan_id')
+  _lower_hex(
+    plan['source_manifest_sha256'], 64,
+    context='legacy compiled plan source_manifest_sha256')
+  if plan['repository'] != {
+      'sha': expected_legacy_repository_sha, 'dirty': False}:
+    raise ValueError(
+      'legacy compiled plan repository differs from the trusted policy')
+  job_ids = plan['job_ids']
+  committed = plan['job_spec_sha256']
+  if (not isinstance(job_ids, list) or not job_ids
+      or len(job_ids) != len(set(job_ids))):
+    raise ValueError('legacy compiled plan has invalid job IDs')
+  if not isinstance(committed, Mapping) or set(committed) != set(job_ids):
+    raise ValueError('legacy compiled plan has invalid job commitments')
+  if plan['num_jobs'] != len(job_ids):
+    raise ValueError('legacy compiled plan num_jobs is inconsistent')
+
+  jobs = {}
+  expected_job_fields = {
+    'schema_version', 'protocol_id', 'source_manifest_sha256', 'plan_id',
+    'job_id', 'kind', 'artifact_dir', 'suites', 'dependencies', 'identity',
+    'argv', 'execution_mode', 'external_inputs', 'required_outputs',
+  }
+  for job_id in job_ids:
+    if not isinstance(job_id, str) or not SLUG_PATTERN.fullmatch(job_id):
+      raise ValueError(f'invalid legacy job ID: {job_id!r}')
+    digest = _lower_hex(
+      committed[job_id], 64,
+      context=f'legacy compiled plan job digest {job_id}')
+    job = _read_json(plan_dir / 'jobs' / f'{job_id}.json')
+    if set(job) != expected_job_fields:
+      raise ValueError(f'legacy job {job_id} has an invalid schema')
+    if job['schema_version'] != 1:
+      raise ValueError(f'legacy job {job_id} has an invalid schema version')
+    if (job['job_id'] != job_id or job['plan_id'] != plan['plan_id']
+        or job['protocol_id'] != plan['protocol_id']
+        or job['source_manifest_sha256'] != plan['source_manifest_sha256']):
+      raise ValueError(f'legacy job {job_id} differs from its compiled plan')
+    if _job_digest(job) != digest:
+      raise ValueError(
+        f'legacy job {job_id} differs from its compiled plan commitment')
+    if job['kind'] not in {'train', 'export', 'eval'}:
+      raise ValueError(f'legacy job {job_id} has invalid kind')
+    if job['execution_mode'] not in {'resume_in_place', 'fresh_attempt'}:
+      raise ValueError(f'legacy job {job_id} has invalid execution_mode')
+    if (not isinstance(job['argv'], list) or not job['argv']
+        or any(not isinstance(token, str) or not token for token in job['argv'])):
+      raise ValueError(f'legacy job {job_id} has invalid argv')
+    jobs[job_id] = job
+  for job_id, job in jobs.items():
+    dependencies = job['dependencies']
+    if (not isinstance(dependencies, list)
+        or len(dependencies) != len(set(dependencies))):
+      raise ValueError(f'legacy job {job_id} has invalid dependencies')
+    missing = sorted(set(dependencies) - set(jobs))
+    if missing or job_id in dependencies:
+      raise ValueError(
+        f'legacy job {job_id} has invalid dependencies: {missing}')
+  return plan, jobs, plan_sha256, True
+
+
+def _validated_analysis_marker(
+    job: Mapping[str, Any],
+    *,
+    legacy: bool,
+    required: bool,
+) -> dict[str, Any] | None:
+  """Validate current markers or the exact legacy marker schema."""
+  if not legacy:
+    return _validated_marker(job, required=required)
+  marker_path = Path(job['artifact_dir']).resolve() / SUCCESS_MARKER
+  if not marker_path.exists():
+    if required:
+      raise FileNotFoundError(
+        f'dependency {job["job_id"]} is incomplete: {marker_path}')
+    return None
+  marker = _read_json(marker_path)
+  expected_fields = {
+    'schema_version', 'artifact', 'job_id', 'originating_plan_id',
+    'job_execution_sha256', 'run_dir', 'argv', 'start_time_utc',
+    'end_time_utc', 'outputs',
+  }
+  if set(marker) != expected_fields:
+    raise ValueError(f'invalid legacy success marker schema: {marker_path}')
+  if (marker['schema_version'] != 1
+      or marker['artifact'] != 'compiled_experiment_job_success'):
+    raise ValueError(f'invalid legacy success marker identity: {marker_path}')
+  if (marker['job_id'] != job['job_id']
+      or marker['job_execution_sha256'] != _job_execution_digest(job)):
+    raise ValueError(f'legacy success marker does not match job: {marker_path}')
+  run_dir = Path(marker['run_dir']).expanduser().resolve()
+  artifact_dir = Path(job['artifact_dir']).expanduser().resolve()
+  try:
+    run_dir.relative_to(artifact_dir)
+  except ValueError as error:
+    raise ValueError(
+      f'legacy marker run_dir escapes job artifact directory: {run_dir}') \
+      from error
+  if run_dir == artifact_dir:
+    raise ValueError('legacy marker run_dir must not equal artifact directory')
+  actual_outputs = _output_records(run_dir, job['required_outputs'])
+  if marker['outputs'] != actual_outputs:
+    raise ValueError(f'completed legacy job outputs drifted: {job["job_id"]}')
+  return marker
+
+
+def _source_integrity_commitment(
+    *,
+    plan: Mapping[str, Any],
+    plan_path: Path,
+    plan_sha256: str,
+    jobs: Mapping[str, Mapping[str, Any]],
+    markers: Mapping[str, Mapping[str, Any]],
+) -> dict[str, Any]:
+  """Commit every marker and output used by the authoritative aggregate."""
+  committed_jobs = {}
+  for job_id in sorted(markers):
+    job = jobs[job_id]
+    marker = markers[job_id]
+    marker_path = Path(job['artifact_dir']).resolve() / SUCCESS_MARKER
+    outputs = [dict(output) for output in marker['outputs']]
+    scientific_outputs = {
+      output['name']: output['sha256'] for output in outputs
+      if output['name'] in {
+        'conditional_record_manifest', 'conditional_records',
+        'dataset_provenance', 'pairing_digest'}}
+    committed_jobs[job_id] = {
+      'job_spec_sha256': plan['job_spec_sha256'][job_id],
+      'job_execution_sha256': marker['job_execution_sha256'],
+      'success_marker_path': str(marker_path),
+      'success_marker_sha256': sha256_file(marker_path),
+      'outputs': outputs,
+      'scientific_output_sha256': scientific_outputs,
+    }
+  body = {
+    'schema_version': 1,
+    'source_compiled_plan_path': str(plan_path.expanduser().resolve()),
+    'source_compiled_plan_sha256': plan_sha256,
+    'source_plan_id': plan['plan_id'],
+    'source_manifest_sha256': plan['source_manifest_sha256'],
+    'source_repository_sha': plan['repository']['sha'],
+    'source_repository_clean': plan['repository']['dirty'] is False,
+    'validated_job_ids': sorted(committed_jobs),
+    'jobs': committed_jobs,
+  }
+  return {
+    **body,
+    'commitment_sha256': canonical_sha256(body),
+  }
+
+
 def load_plan_records(
     plan_dir: Path,
     *,
     manifest_path: Path,
     suite_name: str,
     comparison_name: str,
+    expected_legacy_plan_sha256: str = PINNED_LEGACY_PLAN_SHA256,
+    expected_legacy_repository_sha: str = PINNED_LEGACY_REPOSITORY_SHA,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-  plan, jobs = _load_plan(plan_dir)
-  _validate_repository_checkout(plan)
+  plan_dir = plan_dir.expanduser().resolve()
+  plan, jobs, plan_sha256, legacy = _load_plan_for_analysis(
+    plan_dir,
+    expected_legacy_plan_sha256=expected_legacy_plan_sha256,
+    expected_legacy_repository_sha=expected_legacy_repository_sha)
   manifest_path = manifest_path.expanduser().resolve()
   if sha256_file(manifest_path) != plan['source_manifest_sha256']:
     raise ValueError('protocol manifest SHA256 differs from compiled plan')
@@ -348,6 +679,7 @@ def load_plan_records(
       'comparison')
 
   validated_dependencies: set[str] = set()
+  validated_markers: dict[str, dict[str, Any]] = {}
 
   def validate_dependency_tree(job_id: str) -> None:
     if job_id in validated_dependencies:
@@ -355,14 +687,17 @@ def load_plan_records(
     dependency_job = jobs[job_id]
     for dependency_id in dependency_job['dependencies']:
       validate_dependency_tree(dependency_id)
-    _validated_marker(dependency_job, required=True)
+    marker = _validated_analysis_marker(
+      dependency_job, legacy=legacy, required=True)
+    assert marker is not None
+    validated_markers[job_id] = marker
     validated_dependencies.add(job_id)
 
   rows = []
+  dataset_commitments: dict[str, tuple[dict[str, Any], Path]] = {}
   for job in selected_jobs:
     validate_dependency_tree(job['job_id'])
-    marker = _validated_marker(job, required=True)
-    assert marker is not None
+    marker = validated_markers[job['job_id']]
     outputs = {item['name']: item for item in marker['outputs']}
     for required in (
         'conditional_record_manifest', 'conditional_records',
@@ -406,24 +741,33 @@ def load_plan_records(
     target_windows = (
       job['identity']['validation_batches']
       * manifest['evaluation']['batch_size'])
-    available_windows = provenance.get('observed', {}).get(
-      'processed_num_sequences')
-    if (not isinstance(available_windows, int)
-        or isinstance(available_windows, bool) or available_windows <= 0):
-      raise ValueError(
-        f'{provenance_path} does not commit a positive processed window '
-        'count')
-    # Use the frozen target when feasible and the complete processed split
-    # otherwise (notably WikiText-103 validation is smaller than 2,000
-    # document-local 1,024-token windows).
-    expected_windows = min(target_windows, available_windows)
+    expected_windows = _expected_record_count(
+      compiled_dataset=job['identity']['dataset'],
+      suite_name=suite_name,
+      target_windows=target_windows,
+      provenance=provenance,
+      provenance_path=provenance_path)
+    _record_cross_cell_dataset_provenance(
+      dataset_commitments,
+      compiled_dataset=job['identity']['dataset'],
+      provenance=provenance,
+      provenance_path=provenance_path)
     rows.extend(_load_record_bundle(
       record_manifest_path,
       expected_metadata=expected_metadata,
       expected_pairing_digest=pairing_payload,
       expected_num_records=expected_windows))
+  source_integrity = _source_integrity_commitment(
+    plan=plan,
+    plan_path=plan_dir / 'compiled-plan.json',
+    plan_sha256=plan_sha256,
+    jobs=jobs,
+    markers=validated_markers)
   return rows, {
     'plan': plan,
+    'plan_sha256': plan_sha256,
+    'legacy_plan': legacy,
+    'source_integrity': source_integrity,
     'manifest': manifest,
     'suite': suite,
     'comparison': comparison,
@@ -715,6 +1059,29 @@ def aggregate_records(
   }
 
 
+def bind_analysis_to_source(
+    analysis: Mapping[str, Any],
+    context: Mapping[str, Any],
+) -> dict[str, Any]:
+  """Upgrade a computed aggregate to the source-attested v2 schema."""
+  result = dict(analysis)
+  if result.get('schema_version') != 1:
+    raise ValueError('only an unbound schema-v1 aggregate can be source-bound')
+  plan = context['plan']
+  integrity = context['source_integrity']
+  result['schema_version'] = 2
+  result['compiled_plan'] = {
+    'plan_id': plan['plan_id'],
+    'source_manifest_sha256': plan['source_manifest_sha256'],
+    'source_compiled_plan_sha256': context['plan_sha256'],
+    'source_repository_sha': plan['repository']['sha'],
+    'source_repository_clean': plan['repository']['dirty'] is False,
+    'job_artifact_commitment_sha256': integrity['commitment_sha256'],
+  }
+  result['source_integrity'] = integrity
+  return result
+
+
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
   parser = argparse.ArgumentParser(description=__doc__)
   parser.add_argument('--plan-dir', type=Path, required=True)
@@ -749,10 +1116,7 @@ def main() -> int:
     rng_seed=(args.bootstrap_seed or analysis_cfg['bootstrap_seed']),
     confidence_level=(
       args.confidence_level or analysis_cfg['confidence_level']))
-  result['compiled_plan'] = {
-    'plan_id': context['plan']['plan_id'],
-    'source_manifest_sha256': context['plan']['source_manifest_sha256'],
-  }
+  result = bind_analysis_to_source(result, context)
   output = args.output.expanduser().resolve()
   output.parent.mkdir(parents=True, exist_ok=True)
   if output.exists():

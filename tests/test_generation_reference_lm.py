@@ -1,9 +1,12 @@
+import math
 import unittest
 from unittest import mock
 
 from evaluation.generation_metrics import ReferenceLMScore
+from evaluation.generation_shard_aggregation import _summarize_reference_lm
 from scripts.run_generation_pilot import (
   _attach_reference_lm_scores,
+  _critical_runtime_package_versions,
   _summarize_attached_reference_lm,
 )
 
@@ -27,15 +30,41 @@ class GenerationReferenceLMPlumbingTest(unittest.TestCase):
       device='cpu',
       batch_size=2)
     group = _summarize_attached_reference_lm(rows)
+    independently_recomputed = _summarize_reference_lm(rows)
 
     scorer_class.assert_called_once_with(
       'org/model', revision=revision, device='cpu', batch_size=2)
     self.assertTrue(all(
       row['reference_lm']['revision'] == revision for row in rows))
     self.assertEqual(overall['revision'], revision)
+    self.assertEqual(
+      overall['sequence_policy'],
+      'retokenize_decoded_text_score_through_first_nonleading_eos_v1')
     self.assertEqual(group['revision'], revision)
+    self.assertEqual(group['sequence_policy'], overall['sequence_policy'])
     self.assertEqual(group['model_name_or_path'], 'org/model')
-    self.assertAlmostEqual(group['mean_nll_nats'], 4 / 3)
+    self.assertEqual(group['mean_nll_nats'], 4 / 3)
+    self.assertEqual(group['perplexity'], math.exp(4 / 3))
+    for field in (
+        'model_name_or_path', 'revision', 'sequence_policy',
+        'num_scored_sequences', 'num_scored_tokens', 'mean_nll_nats',
+        'perplexity'):
+      self.assertEqual(group[field], overall[field])
+      self.assertEqual(group[field], independently_recomputed[field])
+
+  @mock.patch('scripts.run_generation_pilot.importlib.metadata.version')
+  def test_critical_runtime_package_versions_are_recorded_exactly(
+      self, version):
+    version.side_effect = lambda distribution: f'{distribution}-version'
+
+    result = _critical_runtime_package_versions()
+
+    self.assertEqual(result, {
+      'numpy': 'numpy-version',
+      'safetensors': 'safetensors-version',
+      'tokenizers': 'tokenizers-version',
+      'transformers': 'transformers-version',
+    })
 
 
 if __name__ == '__main__':

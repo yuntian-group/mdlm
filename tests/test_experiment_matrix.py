@@ -9,6 +9,7 @@ import yaml
 
 from scripts.compile_experiment_matrix import (
   DEFAULT_MANIFEST,
+  JOB_SCHEMA_VERSION,
   REPO_ROOT,
   compile_matrix,
   sha256_file,
@@ -17,6 +18,15 @@ from scripts.run_compiled_job import run_job
 
 
 class ExperimentMatrixTest(unittest.TestCase):
+
+  def setUp(self):
+    self.git_metadata = mock.patch(
+      'scripts.compile_experiment_matrix._git_metadata',
+      return_value={'sha': 'd' * 40, 'dirty': False})
+    self.git_metadata.start()
+
+  def tearDown(self):
+    self.git_metadata.stop()
 
   def test_pilot_compiles_canonical_k64_jobs(self):
     with tempfile.TemporaryDirectory() as directory:
@@ -62,6 +72,31 @@ class ExperimentMatrixTest(unittest.TestCase):
       training_provenance['pattern'], 'data_provenance/train-*.json')
     evaluation = next(
       job for job in jobs.values() if job['kind'] == 'eval')
+    export = jobs['export--dynamic_dynamic--s001--k064']
+    self.assertEqual(export['identity'], {
+      'control': 'dynamic_dynamic',
+      'train_seed': 1,
+      'candidate_k': 64,
+      'topology_mode': 'dynamic',
+      'factor_mode': 'dynamic',
+      'independent_mode': False,
+      'topology_weight': 0.1,
+    })
+    for flag, expected in (
+        ('--control-identity', 'dynamic_dynamic'),
+        ('--topology-mode', 'dynamic'),
+        ('--factor-mode', 'dynamic'),
+        ('--candidate-k', '64'),
+        ('--independent-mode', 'false'),
+        ('--topology-weight', '0.1')):
+      index = export['argv'].index(flag)
+      self.assertEqual(export['argv'][index + 1], expected)
+    self.assertNotIn(
+      'strategy.find_unused_parameters=true',
+      jobs['train--dynamic_dynamic--s001--k064']['argv'])
+    self.assertIn(
+      'strategy.find_unused_parameters=true',
+      jobs['train--static_static--s001--k064']['argv'])
     self.assertEqual(evaluation['dependencies'], [
       f'export--{evaluation["identity"]["control"]}--s001--k064'])
     self.assertEqual(evaluation['identity']['validation_batches'], 128)
@@ -70,6 +105,19 @@ class ExperimentMatrixTest(unittest.TestCase):
     self.assertIn(
       f'eval.conditional_records.job_id={evaluation["job_id"]}',
       evaluation['argv'])
+    self.assertIn(
+      f'eval.adapter_manifest=${{artifact:'
+      f'{evaluation["dependencies"][0]}:adapter-manifest.json}}',
+      evaluation['argv'])
+    self.assertIn(
+      f'eval.adapter_manifest_sha256=${{sha256:'
+      f'{evaluation["dependencies"][0]}:adapter-manifest.json}}',
+      evaluation['argv'])
+    self.assertEqual(plan['repository'], {
+      'sha': 'd' * 40, 'dirty': False})
+    self.assertTrue(all(
+      job['source_repository_sha'] == 'd' * 40
+      for job in jobs.values()))
     self.assertEqual(
       {item['name'] for item in evaluation['required_outputs']}, {
         'pairing_digest', 'conditional_records',
@@ -105,20 +153,48 @@ class ExperimentMatrixTest(unittest.TestCase):
         },
         'created_utc': '2026-08-30T00:00:00+00:00',
       }, sort_keys=True))
-      plan, jobs, _ = compile_matrix(
+      with self.assertRaisesRegex(ValueError, 'schema mismatch'):
+        compile_matrix(
+          DEFAULT_MANIFEST,
+          selected_suites=['candidate_k_128_pilot'],
+          allowed_artifact_root=root,
+          artifact_root_override=artifact_root,
+          output_dir=artifact_root / 'plan',
+          promotion_evidence={'candidate_k_128_pilot': evidence})
+
+  def test_plan_identity_changes_with_clean_repository_revision(self):
+    with tempfile.TemporaryDirectory() as directory:
+      root = Path(directory)
+      artifact_root = root / 'artifacts'
+      first, _, _ = compile_matrix(
         DEFAULT_MANIFEST,
-        selected_suites=['candidate_k_128_pilot'],
+        selected_suites=['pilot'],
         allowed_artifact_root=root,
         artifact_root_override=artifact_root,
-        output_dir=artifact_root / 'plan',
-        promotion_evidence={'candidate_k_128_pilot': evidence})
+        output_dir=artifact_root / 'first')
+      with mock.patch(
+          'scripts.compile_experiment_matrix._git_metadata',
+          return_value={'sha': 'e' * 40, 'dirty': False}):
+        second, _, _ = compile_matrix(
+          DEFAULT_MANIFEST,
+          selected_suites=['pilot'],
+          allowed_artifact_root=root,
+          artifact_root_override=artifact_root,
+          output_dir=artifact_root / 'second')
+    self.assertNotEqual(first['plan_id'], second['plan_id'])
 
-    self.assertIn('candidate_k_128_pilot', plan['promotion_evidence'])
-    self.assertEqual(plan['job_counts'], {
-      'eval': 16, 'export': 2, 'train': 2})
-    self.assertTrue(all(
-      job['identity'].get('candidate_k') == 128
-      for job in jobs.values()))
+  def test_dirty_repository_cannot_compile(self):
+    with tempfile.TemporaryDirectory() as directory, mock.patch(
+        'scripts.compile_experiment_matrix._git_metadata',
+        return_value={'sha': 'd' * 40, 'dirty': True}):
+      root = Path(directory)
+      with self.assertRaisesRegex(ValueError, 'clean committed repository'):
+        compile_matrix(
+          DEFAULT_MANIFEST,
+          selected_suites=['pilot'],
+          allowed_artifact_root=root,
+          artifact_root_override=root / 'artifacts',
+          output_dir=root / 'artifacts/plan')
 
   def test_resume_rejects_compiled_job_drift(self):
     with tempfile.TemporaryDirectory() as directory:
@@ -193,11 +269,13 @@ class CompiledJobRunnerTest(unittest.TestCase):
       plan = {
         'artifact_root': str(artifact_root),
         'plan_id': 'a' * 64,
+        'repository': {'sha': 'd' * 40, 'dirty': False},
       }
       job = {
-        'schema_version': 1,
+        'schema_version': JOB_SCHEMA_VERSION,
         'protocol_id': 'test-protocol',
         'source_manifest_sha256': 'b' * 64,
+        'source_repository_sha': 'd' * 40,
         'plan_id': 'a' * 64,
         'job_id': 'fake-job',
         'kind': 'eval',
@@ -236,6 +314,17 @@ class CompiledJobRunnerTest(unittest.TestCase):
       result_path = Path(marker['run_dir']) / output_record['relative_path']
       self.assertEqual(
         output_record['sha256'], hashlib.sha256(result_path.read_bytes()).hexdigest())
+
+      changed_revision_job = dict(
+        promoted_job, source_repository_sha='e' * 40)
+      with self.assertRaisesRegex(ValueError, 'does not match job spec'):
+        run_job(
+          'fake-job',
+          plan={
+            **promoted_plan,
+            'repository': {'sha': 'e' * 40, 'dirty': False},
+          },
+          jobs={'fake-job': changed_revision_job})
 
       result_path.write_text('{"ok": false}\n')
       with self.assertRaisesRegex(ValueError, 'outputs drifted'):

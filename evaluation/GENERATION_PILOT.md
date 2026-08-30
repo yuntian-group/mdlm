@@ -35,6 +35,8 @@ python scripts/run_generation_pilot.py \
   --backbone-sha256 "$BACKBONE_SHA256" \
   --adapter /path/to/structured-adapter.safetensors \
   --adapter-sha256 "$ADAPTER_SHA256" \
+  --adapter-manifest /path/to/adapter-manifest.json \
+  --adapter-manifest-sha256 "$ADAPTER_MANIFEST_SHA256" \
   --num-shards 16 \
   --shard-index 3 \
   --output-dir /mnt/experiment/generation/shard-03
@@ -46,6 +48,24 @@ manifests have the same `global_pairing_digest`, artifact hashes, prompt hash,
 mode/NFE matrix, sequence length, base seed, batch size, and shard count; that
 each shard index appears exactly once; and that sample indices are disjoint and
 cover `[0, num_samples)`.
+
+Run the fail-closed verifier with every shard directory:
+
+```bash
+python scripts/aggregate_generation_shards.py \
+  --shard /mnt/experiment/generation/shard-00 \
+  --shard /mnt/experiment/generation/shard-01 \
+  --output /mnt/experiment/generation/verified-union.json
+```
+
+The verifier binds adapter-manifest identity by its verified SHA256 and
+structured-decoder semantic digest, not by a machine-specific absolute path.
+It also requires identical OS/platform, Python, PyTorch, CUDA runtime,
+parameter dtypes, precision policy, and NumPy, safetensors, tokenizers, and
+Transformers versions. GPU model identity must match before descriptive timing
+is pooled. Deterministic token metrics and shard summaries are recomputed and
+compared exactly; the only numeric tolerance is a near-machine-precision check
+that a stored reference-LM perplexity equals `exp(mean_nll)`.
 
 ## Prompt JSONL schemas
 

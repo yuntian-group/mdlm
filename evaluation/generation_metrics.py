@@ -19,6 +19,8 @@ import torch.nn.functional as F
 
 
 TokenSequence = Sequence[int]
+REFERENCE_LM_SEQUENCE_POLICY = (
+  'retokenize_decoded_text_score_through_first_nonleading_eos_v1')
 
 
 def validate_reference_lm_spec(
@@ -257,7 +259,12 @@ class TransformersReferenceLMScorer:
 
   @torch.no_grad()
   def score(self, texts: Sequence[str]) -> list[ReferenceLMScore]:
-    """Score decoded texts without counting padding or the first token."""
+    """Score decoded texts through their first EOS, excluding padding.
+
+    EOS is interpreted by the pinned reference tokenizer after decoding and
+    re-tokenization.  Its loss is included, while every token after it is
+    excluded.  As usual for a causal LM, the first input token has no loss.
+    """
     scores: list[ReferenceLMScore] = []
     for offset in range(0, len(texts), self.batch_size):
       batch = list(texts[offset:offset + self.batch_size])
@@ -276,6 +283,32 @@ class TransformersReferenceLMScorer:
       shifted_logits = logits[:, :-1].float()
       shifted_targets = input_ids[:, 1:]
       shifted_mask = attention_mask[:, 1:].bool()
+      eos_token_id = getattr(self.tokenizer, 'eos_token_id', None)
+      if eos_token_id is not None:
+        valid_eos = (
+          input_ids.eq(int(eos_token_id)) & attention_mask.bool())
+        # GPT-2 uses the same ID for BOS and EOS.  MDLM sequences carry that
+        # boundary marker at position zero, so treating it as the terminal EOS
+        # would assign every generated sample zero scored tokens.  Ignore only
+        # a valid leading BOS marker; a later occurrence remains terminal.
+        bos_token_id = getattr(self.tokenizer, 'bos_token_id', None)
+        if bos_token_id is not None:
+          first_valid = attention_mask.bool().to(torch.int64).argmax(
+            dim=1, keepdim=True)
+          leading_bos = (
+            input_ids.eq(int(bos_token_id))
+            & attention_mask.bool()
+            & torch.arange(
+              input_ids.shape[1], device=input_ids.device).unsqueeze(0).eq(
+                first_valid))
+          valid_eos &= ~leading_bos
+        positions = torch.arange(
+          input_ids.shape[1], device=input_ids.device).unsqueeze(0)
+        sentinel = torch.full_like(positions, input_ids.shape[1])
+        first_eos = torch.where(valid_eos, positions, sentinel).amin(
+          dim=1, keepdim=True)
+        through_first_eos = positions.le(first_eos)
+        shifted_mask &= through_first_eos[:, 1:]
       token_losses = F.cross_entropy(
         shifted_logits.transpose(1, 2),
         shifted_targets,

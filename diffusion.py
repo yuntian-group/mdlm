@@ -1,4 +1,5 @@
 import hashlib
+import json
 import math
 import os
 import typing
@@ -396,9 +397,20 @@ class Diffusion(L.LightningModule):
 
     adapter_checkpoint = self.config.eval.get('adapter_checkpoint', None)
     adapter_sha256 = self.config.eval.get('adapter_sha256', None)
-    if adapter_sha256 and not adapter_checkpoint:
-      raise ValueError('eval.adapter_sha256 requires adapter_checkpoint')
+    adapter_manifest = self.config.eval.get('adapter_manifest', None)
+    adapter_manifest_sha256 = self.config.eval.get(
+      'adapter_manifest_sha256', None)
+    if (adapter_sha256 or adapter_manifest or adapter_manifest_sha256) \
+        and not adapter_checkpoint:
+      raise ValueError(
+        'eval adapter hashes and manifest require '
+        'adapter_checkpoint')
     if adapter_checkpoint:
+      if (not adapter_sha256 or not adapter_manifest
+          or not adapter_manifest_sha256):
+        raise ValueError(
+          'eval.adapter_checkpoint requires adapter_sha256, '
+          'adapter_manifest, and adapter_manifest_sha256')
       if eval_checkpoint:
         raise ValueError(
           'set only one of eval.checkpoint_path and '
@@ -408,7 +420,10 @@ class Diffusion(L.LightningModule):
           'eval.adapter_checkpoint is evaluation-only')
       self._load_structured_adapter_checkpoint(
         str(adapter_checkpoint),
-        expected_sha256=(str(adapter_sha256) if adapter_sha256 else None))
+        expected_sha256=str(adapter_sha256),
+        manifest_path=str(adapter_manifest),
+        expected_manifest_sha256=str(adapter_manifest_sha256),
+        structured_config=structured_cfg)
 
     fixed_edges = structured_cfg.get('fixed_edges', None)
     fixed_edge_path = structured_cfg.get('fixed_edge_path', None)
@@ -492,18 +507,48 @@ class Diffusion(L.LightningModule):
       self.backbone.load_state_dict(ema_backbone_state, strict=False)
 
   def _load_structured_adapter_checkpoint(
-      self, path, expected_sha256=None):
-    """Strictly load a prefix-stripped structured-head safetensors file."""
+      self, path, *, expected_sha256, manifest_path,
+      expected_manifest_sha256, structured_config):
+    """Load an adapter only after manifest, byte, and config verification."""
     with fsspec.open(path, 'rb') as handle:
       payload = handle.read()
     actual_sha256 = hashlib.sha256(payload).hexdigest()
-    if (expected_sha256 is not None
-        and actual_sha256 != expected_sha256):
+    if actual_sha256 != expected_sha256:
       raise ValueError(
         f'structured adapter SHA256 mismatch: expected '
         f'{expected_sha256}, found {actual_sha256}')
+    with fsspec.open(manifest_path, 'rb') as handle:
+      manifest_bytes = handle.read()
+    actual_manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
+    if actual_manifest_sha256 != expected_manifest_sha256:
+      raise ValueError(
+        f'structured adapter manifest SHA256 mismatch: expected '
+        f'{expected_manifest_sha256}, found {actual_manifest_sha256}')
+    try:
+      manifest_payload = json.loads(manifest_bytes)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+      raise ValueError(
+        'structured adapter manifest is not valid JSON') from error
+    from scripts.export_structured_adapter import (
+      safetensors_metadata_from_bytes,
+      structured_decoder_identity_from_config,
+      validate_adapter_manifest_payload,
+    )
+    runtime_identity, runtime_identity_sha256 = (
+      structured_decoder_identity_from_config(structured_config))
     from safetensors.torch import load
     state = load(payload)
+    validated_manifest = validate_adapter_manifest_payload(
+      manifest_payload,
+      adapter_filename=str(path).rstrip('/').rsplit('/', 1)[-1],
+      adapter_sha256=actual_sha256,
+      adapter_size_bytes=len(payload),
+      adapter_metadata=safetensors_metadata_from_bytes(payload),
+      adapter_state=state,
+      expected_identity=runtime_identity)
+    if (validated_manifest['structured_decoder_identity_sha256']
+        != runtime_identity_sha256):
+      raise AssertionError('validated structured adapter digest drifted')
     if not state:
       raise ValueError('structured adapter contains no tensors')
     prefixed = [
@@ -518,6 +563,7 @@ class Diffusion(L.LightningModule):
     except RuntimeError as error:
       raise ValueError(
         f'structured adapter state mismatch: {error}') from error
+    self.structured_adapter_manifest = validated_manifest
 
   def _trainable_model_parameters(self):
     """Stable parameter order shared by the optimizer and EMA."""

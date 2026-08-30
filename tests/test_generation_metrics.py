@@ -3,6 +3,7 @@ import unittest
 from unittest import mock
 
 from types import SimpleNamespace
+import torch
 
 from evaluation.generation_metrics import (
   distinct_n,
@@ -94,6 +95,48 @@ class GenerationMetricsTest(unittest.TestCase):
     model_loader.assert_called_once_with(
       'org/model', revision='b' * 40)
     self.assertEqual(scorer.revision, 'b' * 40)
+
+  def test_reference_lm_scores_only_through_first_nonpadding_eos(self):
+    class FakeTokenizer:
+      pad_token_id = 2
+      eos_token_id = 2
+      bos_token_id = 2
+
+      def __call__(self, texts, **unused_kwargs):
+        self.texts = texts
+        return {
+          'input_ids': torch.tensor([
+            [2, 10, 11, 2, 20],
+            [2, 30, 31, 2, 2],
+          ]),
+          'attention_mask': torch.tensor([
+            [1, 1, 1, 1, 1],
+            [1, 1, 1, 0, 0],
+          ]),
+        }
+
+    class FakeModel:
+      def __call__(self, *, input_ids, attention_mask):
+        del attention_mask
+        return SimpleNamespace(logits=torch.zeros(
+          *input_ids.shape, 64, device=input_ids.device))
+
+    scorer = TransformersReferenceLMScorer.__new__(
+      TransformersReferenceLMScorer)
+    scorer.batch_size = 2
+    scorer.max_length = 5
+    scorer.device = torch.device('cpu')
+    scorer.tokenizer = FakeTokenizer()
+    scorer.model = FakeModel()
+
+    scores = scorer.score(['has eos then tail', 'padding uses eos id'])
+
+    # The leading GPT-2-style BOS/EOS boundary is ignored. Row one includes
+    # the later EOS target but excludes its real tail token. Row two has no
+    # later valid EOS: padding EOS ids are ignored by attention_mask.
+    self.assertEqual([score.token_count for score in scores], [3, 2])
+    self.assertAlmostEqual(scores[0].mean_nll_nats, math.log(64))
+    self.assertAlmostEqual(scores[1].mean_nll_nats, math.log(64))
 
 
 if __name__ == '__main__':

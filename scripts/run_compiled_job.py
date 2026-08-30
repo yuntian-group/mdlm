@@ -62,8 +62,8 @@ def _job_execution_digest(job: Mapping[str, Any]) -> str:
 
   ``plan_id`` and ``suites`` are orchestration metadata. A promoted plan may
   therefore reuse an already successful prerequisite only when every other
-  job field—including argv, input hashes, output contract, and frozen source
-  manifest—remains byte-for-byte identical.
+  job field—including the clean source repository SHA, argv, input hashes,
+  output contract, and frozen source manifest—remains byte-for-byte identical.
   """
   projected = {
     key: value for key, value in job.items()
@@ -115,6 +115,7 @@ def _load_plan(plan_dir: Path) -> tuple[dict[str, Any], dict[str, dict[str, Any]
     job = _read_json(plan_dir / 'jobs' / f'{job_id}.json')
     expected_keys = {
       'schema_version', 'protocol_id', 'source_manifest_sha256', 'plan_id',
+      'source_repository_sha',
       'job_id', 'kind', 'artifact_dir', 'suites', 'dependencies', 'identity',
       'argv', 'execution_mode', 'external_inputs', 'required_outputs',
     }
@@ -132,6 +133,10 @@ def _load_plan(plan_dir: Path) -> tuple[dict[str, Any], dict[str, dict[str, Any]
     if job['source_manifest_sha256'] != plan.get(
         'source_manifest_sha256'):
       raise ValueError(f'{job_id} source manifest does not match plan')
+    repository = plan.get('repository')
+    if (not isinstance(repository, Mapping)
+        or job['source_repository_sha'] != repository.get('sha')):
+      raise ValueError(f'{job_id} source repository does not match plan')
     if _job_digest(job) != committed_job_digests[job_id]:
       raise ValueError(f'{job_id} differs from its compiled plan commitment')
     if job['kind'] not in {'train', 'export', 'eval'}:
@@ -227,15 +232,17 @@ def _validated_marker(
   marker = _read_json(marker_path)
   expected_keys = {
     'schema_version', 'artifact', 'job_id', 'originating_plan_id',
-    'job_execution_sha256', 'run_dir', 'argv', 'start_time_utc',
+    'source_repository_sha', 'job_execution_sha256',
+    'run_dir', 'argv', 'start_time_utc',
     'end_time_utc', 'outputs',
   }
   if set(marker) != expected_keys:
     raise ValueError(f'invalid success marker schema: {marker_path}')
-  if marker['schema_version'] != 1 \
+  if marker['schema_version'] != 2 \
       or marker['artifact'] != 'compiled_experiment_job_success':
     raise ValueError(f'invalid success marker identity: {marker_path}')
   if (marker['job_id'] != job['job_id']
+      or marker['source_repository_sha'] != job['source_repository_sha']
       or marker['job_execution_sha256'] != _job_execution_digest(job)):
     raise ValueError(f'success marker does not match job spec: {marker_path}')
   run_dir = _within(
@@ -425,10 +432,11 @@ def run_job(
     outputs = _output_records(run_dir, job['required_outputs'])
     end = dt.datetime.now(dt.timezone.utc)
     marker = {
-      'schema_version': 1,
+      'schema_version': 2,
       'artifact': 'compiled_experiment_job_success',
       'job_id': job_id,
       'originating_plan_id': job['plan_id'],
+      'source_repository_sha': job['source_repository_sha'],
       'job_execution_sha256': _job_execution_digest(job),
       'run_dir': str(run_dir),
       'argv': argv,
