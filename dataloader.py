@@ -445,8 +445,7 @@ def get_dataset(
   if streaming:
     tokenized_dataset = data.map(
       preprocess_and_tokenize,
-      batched=True,
-      desc='Tokenizing')
+      batched=True)
   else:
     tokenized_dataset = data.map(
       preprocess_and_tokenize,
@@ -477,8 +476,7 @@ def get_dataset(
   if streaming:
     chunked_dataset = tokenized_dataset.map(
       group_texts,
-      batched=True,
-      desc='Grouping')
+      batched=True)
   else:
     chunked_dataset = tokenized_dataset.map(
       group_texts,

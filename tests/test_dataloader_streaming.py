@@ -209,6 +209,9 @@ class DataloaderStreamingTest(unittest.TestCase):
       'openwebtext', cache_dir='/unused-cache', streaming=True)
     self.assertEqual(stream.saved_paths, [])
     self.assertEqual(len(stream.map_calls), 2)
+    self.assertEqual(
+      [kwargs for _, kwargs in stream.map_calls],
+      [{'batched': True}, {'batched': True}])
     self.assertEqual(stream.format_name, 'torch')
 
   def test_on_train_start_preserves_streaming_loader(self):
