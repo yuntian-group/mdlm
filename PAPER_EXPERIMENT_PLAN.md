@@ -140,7 +140,8 @@ Run exhaustive enumeration for tiny vocabularies and lengths:
 - clamping and top-K behavior.
 
 Every quantity must agree with enumeration to numerical tolerance. This stage
-also needs a parameter-matched independent head.
+also needs an architecture-count/no-edge control; its retained pair parameters
+are inactive, so it is not an active-capacity-matched unary adapter.
 
 ### Stage B: controlled mechanism experiments
 
@@ -173,7 +174,8 @@ as an exact-lattice sanity benchmark.
 Minimum matched baselines:
 
 - original factorized MDLM, with both its original and confidence reveal rules;
-- parameter-matched independent adapter;
+- architecture-count/no-edge control (legacy experiment identifier:
+  `parameter_matched_independent`; pair parameters inactive);
 - locally normalized chain;
 - globally normalized natural-order chain;
 - static forest/transition prior;

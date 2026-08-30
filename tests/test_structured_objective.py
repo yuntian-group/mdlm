@@ -7,6 +7,7 @@ from models.structured_decoder import ContextualCouplingForestHead
 from structured_objective import (
   full_vocabulary_marginals,
   infer_structured_distribution,
+  sample_structured_marginal_tokens,
   sample_structured_tokens,
   structured_token_log_probability,
 )
@@ -55,6 +56,20 @@ class StructuredObjectiveTest(unittest.TestCase):
     samples = sample_structured_tokens(
       output, logits, active, num_samples=30000,
       generator=torch.Generator().manual_seed(71),
+      inference=inference)[0]
+    frequencies = torch.nn.functional.one_hot(
+      samples, num_classes=4).float().mean(dim=0)
+    torch.testing.assert_close(
+      frequencies, marginals[0].float(), atol=0.015, rtol=0.0)
+
+  def test_independent_marginal_sampler_uses_exact_node_marginals(self):
+    output, logits, active = self._problem(top_k=2)
+    inference = infer_structured_distribution(output, active)
+    marginals = full_vocabulary_marginals(
+      output, logits, active, inference)
+    samples = sample_structured_marginal_tokens(
+      output, logits, active, num_samples=30000,
+      generator=torch.Generator().manual_seed(72),
       inference=inference)[0]
     frequencies = torch.nn.functional.one_hot(
       samples, num_classes=4).float().mean(dim=0)

@@ -1,5 +1,6 @@
 name: contextual-forest-tiny
 type: ddit
+monitor_metric: val/structured/conditional_nll_per_masked_token
 hidden_size: 512
 cond_dim: 128
 length: 256
@@ -10,7 +11,8 @@ dropout: 0.1
 tie_word_embeddings: False
 
 # The DIT integration constructs ContextualCouplingForestHead from this block.
-# Switching independent_mode changes no parameter shapes or counts.
+# independent_mode preserves architecture parameter count but makes pair
+# parameters inactive; it is not an active-parameter unary-adapter match.
 structured_decoder:
   enabled: true
   top_k: 32
@@ -25,3 +27,32 @@ structured_decoder:
   factor_mode: dynamic
   independent_mode: false
   min_edge_score: null
+  fixed_edges: null
+  fixed_edge_path: null
+
+  # This is an executable random-backbone smoke configuration.  Real adapter
+  # experiments should use the small config with a released MDLM checkpoint.
+  training:
+    objective_name: conditional_denoising_nll_not_diffusion_elbo
+    backbone_mode: joint
+    backbone_checkpoint: null
+    require_pretrained_backbone: false
+    strict_backbone_checkpoint: true
+    use_ema_backbone: false
+    deterministic_backbone: true
+    head_lr: 3.0e-4
+    backbone_lr_multiplier: 0.05
+    structured_nll_weight: 1.0
+    factorized_aux_weight: 0.1
+    topology_strategy: gold_reveal_influence
+    topology_weight: 0.1
+    topology_temperature: 0.25
+    topology_minimum_choices: 2
+    topology_edge_weight: 1.0
+    topology_anchor_weight: 0.25
+    topology_slot_weight: 0.25
+    topology_on_validation: false
+  sampling:
+    # structured_marginal and structured_joint both use this same checkpoint
+    # and require the global sampling.predictor=ddpm.
+    mode: factorized

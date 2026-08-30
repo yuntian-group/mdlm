@@ -1,9 +1,10 @@
-import itertools
 import math
 import os
 import typing
+import warnings
 from dataclasses import dataclass
 
+import fsspec
 import hydra.utils
 import lightning as L
 import numpy as np
@@ -17,6 +18,8 @@ import crf_utils
 import dataloader
 import models
 import noise_schedule
+import structured_objective
+import structured_training
 import utils
 
 LOG2 = math.log(2)
@@ -66,6 +69,54 @@ class Perplexity(NLL):
     return torch.exp(self.mean_value / self.weight)
 
 
+class RatioMetric(torchmetrics.Metric):
+  """Distributed ratio of explicitly supplied numerators/denominators."""
+
+  full_state_update = False
+
+  def __init__(self):
+    super().__init__()
+    self.add_state(
+      'numerator', default=torch.tensor(0.0, dtype=torch.float64),
+      dist_reduce_fx='sum')
+    self.add_state(
+      'denominator', default=torch.tensor(0.0, dtype=torch.float64),
+      dist_reduce_fx='sum')
+
+  def update(self, numerator, denominator):
+    self.numerator += torch.as_tensor(
+      numerator, device=self.numerator.device,
+      dtype=self.numerator.dtype).detach()
+    self.denominator += torch.as_tensor(
+      denominator, device=self.denominator.device,
+      dtype=self.denominator.dtype).detach()
+
+  def compute(self):
+    return torch.where(
+      self.denominator > 0,
+      self.numerator / self.denominator.clamp_min(1),
+      torch.zeros_like(self.numerator))
+
+
+class DistributedSumMetric(torchmetrics.Metric):
+  """Distributed sum used to expose coverage denominators."""
+
+  full_state_update = False
+
+  def __init__(self):
+    super().__init__()
+    self.add_state(
+      'total', default=torch.tensor(0.0, dtype=torch.float64),
+      dist_reduce_fx='sum')
+
+  def update(self, value):
+    self.total += torch.as_tensor(
+      value, device=self.total.device, dtype=self.total.dtype).detach()
+
+  def compute(self):
+    return self.total
+
+
 class Diffusion(L.LightningModule):
   def __init__(
     self,
@@ -78,6 +129,8 @@ class Diffusion(L.LightningModule):
     self.tokenizer = tokenizer
     self.vocab_size = self.tokenizer.vocab_size
     self.sampler = self.config.sampling.predictor
+    self.monitor_metric = str(
+      self.config.model.get('monitor_metric', 'val/nll'))
     self.gen_ppl_eval_model_name_or_path = self.config.eval.\
       gen_ppl_eval_model_name_or_path
     self.antithetic_sampling = self.config.training.antithetic_sampling
@@ -113,6 +166,19 @@ class Diffusion(L.LightningModule):
       raise ValueError(
         f'Unknown backbone: {self.config.backbone}')
 
+    self.structured_head = None
+    self.structured_enabled = False
+    self.structured_config = None
+    self.structured_training_config = None
+    self.structured_backbone_mode = 'joint'
+    self.structured_deterministic_backbone = True
+    self.structured_sampling_mode = 'factorized'
+    self.register_buffer(
+      'structured_fixed_edge_index', None, persistent=True)
+    self._last_structured_metrics = {}
+    self._last_structured_metric_updates = {}
+    self._initialize_structured_decoder()
+
     self.T = self.config.T
     self.subs_masking = self.config.subs_masking
 
@@ -128,6 +194,22 @@ class Diffusion(L.LightningModule):
     self.valid_metrics = metrics.clone(prefix='val/')
     self.test_metrics = metrics.clone(prefix='test/')
 
+    structured_metrics = torchmetrics.MetricCollection({
+      'conditional_nll_per_masked_token': RatioMetric(),
+      'candidate_recall': RatioMetric(),
+      'retained_unary_mass': RatioMetric(),
+      'topology_edge_coverage': RatioMetric(),
+      'topology_edge_coverage_denominator': DistributedSumMetric(),
+      'topology_anchor_coverage': RatioMetric(),
+      'topology_anchor_coverage_denominator': DistributedSumMetric(),
+      'topology_slot_coverage': RatioMetric(),
+      'topology_slot_coverage_denominator': DistributedSumMetric(),
+    })
+    structured_metrics.set_dtype(torch.float64)
+    self.structured_train_metrics = structured_metrics.clone()
+    self.structured_valid_metrics = structured_metrics.clone()
+    self.structured_test_metrics = structured_metrics.clone()
+
     # generative perplexity
     self.gen_ppl_metric = Perplexity()
     self.eval_model_tokenizer = transformers.AutoTokenizer.\
@@ -142,8 +224,7 @@ class Diffusion(L.LightningModule):
                                           dtype=self.dtype)
     if self.config.training.ema > 0:
       self.ema = models.ema.ExponentialMovingAverage(
-        itertools.chain(self.backbone.parameters(),
-                        self.noise.parameters()),
+        self._trainable_model_parameters(),
         decay=self.config.training.ema)
     else:
       self.ema = None
@@ -172,6 +253,187 @@ class Diffusion(L.LightningModule):
     self.fast_forward_batches = None
     self._validate_configuration()
 
+  def _initialize_structured_decoder(self):
+    """Install the opt-in coupling head without changing ordinary DIT runs."""
+    structured_cfg = self.config.model.get('structured_decoder', None)
+    if structured_cfg is None or not bool(
+        structured_cfg.get('enabled', False)):
+      return
+    if self.config.backbone != 'dit':
+      raise ValueError(
+        'contextual structured decoding currently requires backbone=dit')
+
+    self.structured_enabled = True
+    self.structured_config = structured_cfg
+    training_cfg = structured_cfg.get('training', {})
+    sampling_cfg = structured_cfg.get('sampling', {})
+    self.structured_training_config = training_cfg
+    self.structured_backbone_mode = str(
+      training_cfg.get('backbone_mode', 'joint'))
+    if self.structured_backbone_mode not in {'frozen', 'joint'}:
+      raise ValueError(
+        'structured backbone_mode must be frozen or joint')
+    self.structured_deterministic_backbone = bool(
+      training_cfg.get('deterministic_backbone', True))
+    sampling_mode = sampling_cfg.get('mode', None)
+    legacy_use_joint = sampling_cfg.get('use_joint', None)
+    if sampling_mode is not None and legacy_use_joint is not None:
+      raise ValueError(
+        'set structured sampling.mode, not both mode and use_joint')
+    if sampling_mode is None:
+      sampling_mode = (
+        'structured_joint' if bool(legacy_use_joint) else 'factorized')
+      if legacy_use_joint is not None:
+        warnings.warn(
+          'structured sampling.use_joint is deprecated; use '
+          'model.structured_decoder.sampling.mode=structured_joint',
+          stacklevel=2)
+    self.structured_sampling_mode = (
+      structured_training.validate_structured_sampling_mode(
+        str(sampling_mode)))
+
+    self.structured_head = (
+      models.structured_decoder.ContextualCouplingForestHead(
+        hidden_size=self.config.model.hidden_size,
+        vocab_size=self.vocab_size,
+        top_k=int(structured_cfg.get('top_k', 64)),
+        rank=int(structured_cfg.get('rank', 16)),
+        time_embed_dim=int(structured_cfg.get('time_embed_dim', 64)),
+        topology_dim=int(structured_cfg.get('topology_dim', 128)),
+        local_window=int(structured_cfg.get('local_window', 2)),
+        num_anchor_slots=int(
+          structured_cfg.get('num_anchor_slots', 16)),
+        contextual_neighbors=int(
+          structured_cfg.get('contextual_neighbors', 4)),
+        component_size_cap=int(
+          structured_cfg.get('component_size_cap', 32)),
+        topology_mode=str(
+          structured_cfg.get('topology_mode', 'dynamic')),
+        factor_mode=str(structured_cfg.get('factor_mode', 'dynamic')),
+        independent_mode=bool(
+          structured_cfg.get('independent_mode', False)),
+        min_edge_score=structured_cfg.get('min_edge_score', None)))
+
+    checkpoint_path = training_cfg.get('backbone_checkpoint', None)
+    require_checkpoint = bool(
+      training_cfg.get('require_pretrained_backbone', False))
+    eval_checkpoint = self.config.eval.get('checkpoint_path', None)
+    resume_checkpoint = self.config.checkpointing.get(
+      'resume_ckpt_path', None)
+    full_checkpoint_will_load = bool(
+      (self.config.mode != 'train' and eval_checkpoint)
+      or (self.config.checkpointing.get('resume_from_ckpt', False)
+          and resume_checkpoint
+          and utils.fsspec_exists(str(resume_checkpoint))))
+    if checkpoint_path:
+      self._load_structured_backbone_checkpoint(
+        str(checkpoint_path),
+        strict=bool(training_cfg.get('strict_backbone_checkpoint', True)),
+        use_ema=bool(training_cfg.get('use_ema_backbone', False)))
+    elif require_checkpoint and not full_checkpoint_will_load:
+      raise ValueError(
+        'a pretrained backbone is required; set '
+        'model.structured_decoder.training.backbone_checkpoint')
+    elif (self.structured_backbone_mode == 'frozen'
+          and not full_checkpoint_will_load):
+      warnings.warn(
+        'structured head is freezing a backbone without loading a '
+        'checkpoint; this is suitable only for smoke tests', stacklevel=2)
+
+    if self.structured_backbone_mode == 'frozen':
+      self.backbone.requires_grad_(False)
+
+    fixed_edges = structured_cfg.get('fixed_edges', None)
+    fixed_edge_path = structured_cfg.get('fixed_edge_path', None)
+    if fixed_edges is not None and fixed_edge_path:
+      raise ValueError('set only one of fixed_edges and fixed_edge_path')
+    if fixed_edge_path:
+      with fsspec.open(str(fixed_edge_path), 'rb') as handle:
+        try:
+          fixed_edges = torch.load(
+            handle, map_location='cpu', weights_only=True)
+        except TypeError:
+          handle.seek(0)
+          fixed_edges = torch.load(handle, map_location='cpu')
+      if isinstance(fixed_edges, dict):
+        if 'edge_index' not in fixed_edges:
+          raise ValueError(
+            'fixed-edge checkpoint must contain edge_index')
+        fixed_edges = fixed_edges['edge_index']
+    if fixed_edges is not None:
+      if not torch.is_tensor(fixed_edges):
+        fixed_edges = [list(edge) for edge in fixed_edges]
+      is_empty = (
+        fixed_edges.numel() == 0 if torch.is_tensor(fixed_edges)
+        else len(fixed_edges) == 0)
+      if is_empty:
+        fixed_edges = torch.empty(0, 2, dtype=torch.long)
+      else:
+        fixed_edges = torch.as_tensor(fixed_edges, dtype=torch.long)
+      if fixed_edges.ndim != 2 or fixed_edges.shape[-1] != 2:
+        raise ValueError('configured fixed edges must have shape [E,2]')
+      if (fixed_edges.numel()
+          and (int(fixed_edges.min()) < 0
+               or int(fixed_edges.max()) >= self.config.model.length)):
+        raise ValueError('configured fixed edge is outside model length')
+      self.structured_fixed_edge_index = fixed_edges
+
+  def _load_structured_backbone_checkpoint(
+      self, path, strict=True, use_ema=False):
+    """Load only ``backbone.*`` weights from an MDLM Lightning checkpoint."""
+    with fsspec.open(path, 'rb') as handle:
+      try:
+        checkpoint = torch.load(
+          handle, map_location='cpu', weights_only=False)
+      except TypeError:
+        handle.seek(0)
+        checkpoint = torch.load(handle, map_location='cpu')
+    state_dict = checkpoint.get('state_dict', checkpoint)
+    backbone_state = {
+      key[len('backbone.'):]: value
+      for key, value in state_dict.items()
+      if key.startswith('backbone.')
+    }
+    if not backbone_state:
+      backbone_keys = set(self.backbone.state_dict())
+      backbone_state = {
+        key: value for key, value in state_dict.items()
+        if key in backbone_keys}
+    if not backbone_state:
+      raise ValueError(f'no backbone weights found in {path}')
+    incompatible = self.backbone.load_state_dict(
+      backbone_state, strict=False)
+    if strict and (incompatible.missing_keys or incompatible.unexpected_keys):
+      raise ValueError(
+        'backbone checkpoint mismatch: '
+        f'missing={incompatible.missing_keys}, '
+        f'unexpected={incompatible.unexpected_keys}')
+    if use_ema:
+      ema_state = checkpoint.get('ema', None)
+      named_parameters = list(self.backbone.named_parameters())
+      shadow_parameters = (
+        structured_training.validated_ema_shadow_parameters(
+          ema_state=ema_state,
+          expected_parameters=[
+            parameter for _, parameter in named_parameters],
+          context=f'backbone checkpoint {path}',
+          allow_extra=True))
+      ema_backbone_state = {
+        name: shadow.detach().to(dtype=parameter.dtype)
+        for (name, parameter), shadow in zip(
+          named_parameters, shadow_parameters)}
+      self.backbone.load_state_dict(ema_backbone_state, strict=False)
+
+  def _trainable_model_parameters(self):
+    """Stable parameter order shared by the optimizer and EMA."""
+    modules = [self.backbone, self.noise]
+    if self.structured_head is not None:
+      modules.append(self.structured_head)
+    for module in modules:
+      for parameter in module.parameters():
+        if parameter.requires_grad:
+          yield parameter
+
   def _validate_configuration(self):
     assert not (self.change_of_variables
                 and self.importance_sampling)
@@ -195,10 +457,61 @@ class Diffusion(L.LightningModule):
         f'Unknown CRF reveal mode: {self.crf_reveal}'
       assert self.crf_unigram_aux_warmup_steps >= 0, \
         'CRF unigram auxiliary warmup must be non-negative'
+    if self.structured_enabled:
+      if self.parameterization != 'subs' or self.T != 0:
+        raise ValueError(
+          'contextual forests currently support continuous-time SUBS only')
+      training_cfg = self.structured_training_config
+      structured_training.validate_structured_objective_name(
+        str(training_cfg.get('objective_name', '')))
+      expected_monitor = (
+        'val/structured/conditional_nll_per_masked_token')
+      if self.monitor_metric != expected_monitor:
+        raise ValueError(
+          'structured model.monitor_metric must be '
+          f'{expected_monitor!r}, got {self.monitor_metric!r}')
+      topology_strategy = str(
+        training_cfg.get('topology_strategy', 'gold_reveal_influence'))
+      if topology_strategy not in {'none', 'gold_reveal_influence'}:
+        raise ValueError(
+          'topology_strategy must be none or gold_reveal_influence')
+      for name in (
+          'structured_nll_weight', 'factorized_aux_weight',
+          'topology_weight', 'backbone_lr_multiplier'):
+        if float(training_cfg.get(name, 0.0)) < 0:
+          raise ValueError(f'{name} must be nonnegative')
+      if (self.structured_sampling_mode != 'factorized'
+          and self.sampler != 'ddpm'):
+        raise ValueError(
+          'structured marginal/joint sampling requires '
+          'sampling.predictor=ddpm')
+      if (self.structured_sampling_mode != 'factorized'
+          and bool(self.config.sampling.semi_ar)):
+        raise ValueError(
+          'structured marginal/joint sampling does not support '
+          'semi-AR strides')
 
   def on_load_checkpoint(self, checkpoint):
     if self.ema:
-      self.ema.load_state_dict(checkpoint['ema'])
+      ema_state = checkpoint.get('ema', None)
+      disable_eval_ema = bool(
+        self.config.mode != 'train'
+        and self.config.eval.get('disable_ema', False))
+      if disable_eval_ema:
+        if ema_state is None:
+          warnings.warn(
+            'checkpoint has no EMA state and eval.disable_ema=true; '
+            'continuing with raw parameters', stacklevel=2)
+        self.ema = None
+      else:
+        shadows = structured_training.validated_ema_shadow_parameters(
+          ema_state=ema_state,
+          expected_parameters=list(self._trainable_model_parameters()),
+          context='full Lightning checkpoint',
+          allow_extra=False)
+        normalized_ema_state = dict(ema_state)
+        normalized_ema_state['shadow_params'] = shadows
+        self.ema.load_state_dict(normalized_ema_state)
     # Copied from:
     # https://github.com/Dao-AILab/flash-attention/blob/main/training/src/datamodules/language_modeling_hf.py#L41
     self.fast_forward_epochs = checkpoint['loops'][
@@ -259,6 +572,11 @@ class Diffusion(L.LightningModule):
       sampler_cls = dataloader.RandomFaultTolerantSampler
     updated_dls = []
     for dl in self.trainer.fit_loop._combined_loader.flattened:
+      if isinstance(dl.dataset, torch.utils.data.IterableDataset):
+        # Streaming datasets own iteration, worker sharding, and epoch state;
+        # they have no length or random-access index for our resumable sampler.
+        updated_dls.append(dl)
+        continue
       if hasattr(dl.sampler, 'shuffle'):
         dl_sampler = sampler_cls(
           dl.dataset, shuffle=dl.sampler.shuffle)
@@ -279,15 +597,13 @@ class Diffusion(L.LightningModule):
           pin_memory=self.config.loader.pin_memory,
           sampler=dl_sampler,
           shuffle=False,
-          persistent_workers=True))
+          persistent_workers=(self.config.loader.num_workers > 0)))
     self.trainer.fit_loop._combined_loader.flattened = updated_dls
 
   def optimizer_step(self, *args, **kwargs):
     super().optimizer_step(*args, **kwargs)
     if self.ema:
-      self.ema.update(itertools.chain(
-        self.backbone.parameters(),
-        self.noise.parameters()))
+      self.ema.update(self._trainable_model_parameters())
 
   def _subs_parameterization(self, logits, xt):
     # log prob at the mask index = - infinity
@@ -396,26 +712,51 @@ class Diffusion(L.LightningModule):
     losses = self._loss(batch['input_ids'], attention_mask)
     loss = losses.loss
 
-    if prefix == 'train':
-      self.train_metrics.update(losses.nlls, losses.token_mask)
-      metrics = self.train_metrics
-    elif prefix == 'val':
-      self.valid_metrics.update(losses.nlls, losses.token_mask)
-      metrics = self.valid_metrics
-    elif prefix == 'test':
-      self.test_metrics.update(losses.nlls, losses.token_mask)
-      metrics = self.test_metrics
-    else:
+    if prefix not in {'train', 'val', 'test'}:
       raise ValueError(f'Invalid prefix: {prefix}')
-
-    self.log_dict(metrics,
-                  on_step=False,
-                  on_epoch=True,
-                  sync_dist=True)
+    if not self.structured_enabled:
+      if prefix == 'train':
+        metrics = self.train_metrics
+      elif prefix == 'val':
+        metrics = self.valid_metrics
+      else:
+        metrics = self.test_metrics
+      metrics.update(losses.nlls, losses.token_mask)
+      self.log_dict(metrics,
+                    on_step=False,
+                    on_epoch=True,
+                    sync_dist=True)
+    if self.structured_enabled and self._last_structured_metrics:
+      if prefix == 'train':
+        weighted_metrics = self.structured_train_metrics
+      elif prefix == 'val':
+        weighted_metrics = self.structured_valid_metrics
+      else:
+        weighted_metrics = self.structured_test_metrics
+      for name, update_arguments in (
+          self._last_structured_metric_updates.items()):
+        weighted_metrics[name].update(*update_arguments)
+      self.log_dict({
+        f'{prefix}/structured/{name}': metric
+        for name, metric in weighted_metrics.items()
+      }, on_step=False, on_epoch=True, sync_dist=True)
+      self.log_dict({
+        f'{prefix}/structured/{name}': value
+        for name, value in self._last_structured_metrics.items()
+      }, on_step=(prefix == 'train'), on_epoch=True, sync_dist=True,
+        batch_size=batch['input_ids'].shape[0])
     return loss
 
   def on_train_epoch_start(self):
-    self.backbone.train()
+    if (self.structured_enabled
+        and self.structured_deterministic_backbone):
+      # Influence distillation compares two corruption views; disabling
+      # dropout prevents stochastic view noise from becoming a topology label.
+      self.backbone.eval()
+    else:
+      self.backbone.train()
+    if self.structured_head is not None:
+      self.structured_head.train()
     self.noise.train()
 
   def training_step(self, batch, batch_idx):
@@ -441,13 +782,11 @@ class Diffusion(L.LightningModule):
 
   def on_validation_epoch_start(self):
     if self.ema:
-      self.ema.store(itertools.chain(
-        self.backbone.parameters(),
-        self.noise.parameters()))
-      self.ema.copy_to(itertools.chain(
-        self.backbone.parameters(),
-        self.noise.parameters()))
+      self.ema.store(self._trainable_model_parameters())
+      self.ema.copy_to(self._trainable_model_parameters())
     self.backbone.eval()
+    if self.structured_head is not None:
+      self.structured_head.eval()
     self.noise.eval()
     assert self.valid_metrics.nll.mean_value == 0
     assert self.valid_metrics.nll.weight == 0
@@ -485,18 +824,41 @@ class Diffusion(L.LightningModule):
                  on_step=False,
                  sync_dist=True)
     if self.ema:
-      self.ema.restore(
-        itertools.chain(self.backbone.parameters(),
-                        self.noise.parameters()))
+      self.ema.restore(self._trainable_model_parameters())
 
   def configure_optimizers(self):
     # TODO(yair): Lightning currently giving this warning when using `fp16`:
     #  "Detected call of `lr_scheduler.step()` before `optimizer.step()`. "
     #  Not clear if this is a problem or not.
     #  See: https://github.com/Lightning-AI/pytorch-lightning/issues/5558
+    parameter_groups = None
+    if self.structured_enabled:
+      training_cfg = self.structured_training_config
+      configured_head_lr = training_cfg.get('head_lr', None)
+      head_lr = (self.config.optim.lr if configured_head_lr is None
+                 else float(configured_head_lr))
+      backbone_lr = (
+        self.config.optim.lr
+        * float(training_cfg.get('backbone_lr_multiplier', 0.05)))
+      head_and_noise = [
+        parameter for module in (self.structured_head, self.noise)
+        for parameter in module.parameters() if parameter.requires_grad]
+      backbone_parameters = [
+        parameter for parameter in self.backbone.parameters()
+        if parameter.requires_grad]
+      parameter_groups = []
+      if head_and_noise:
+        parameter_groups.append({
+          'params': head_and_noise, 'lr': head_lr,
+          'name': 'structured_head'})
+      if backbone_parameters:
+        parameter_groups.append({
+          'params': backbone_parameters, 'lr': backbone_lr,
+          'name': 'backbone'})
+    else:
+      parameter_groups = list(self._trainable_model_parameters())
     optimizer = torch.optim.AdamW(
-      itertools.chain(self.backbone.parameters(),
-                      self.noise.parameters()),
+      parameter_groups,
       lr=self.config.optim.lr,
       betas=(self.config.optim.beta1,
              self.config.optim.beta2),
@@ -508,7 +870,7 @@ class Diffusion(L.LightningModule):
     scheduler_dict = {
       'scheduler': scheduler,
       'interval': 'step',
-      'monitor': 'val/loss',
+      'monitor': self.monitor_metric,
       'name': 'trainer/lr',
     }
     return [optimizer], [scheduler_dict]
@@ -698,7 +1060,63 @@ class Diffusion(L.LightningModule):
     copy_flag = (x != self.mask_index).to(x.dtype)
     return p_x0, copy_flag * x + (1 - copy_flag) * _x
 
+  @torch.no_grad()
+  def _structured_clean_sample(self, x, conditioning):
+    """Draw from exact node marginals or the exact joint forest law."""
+    active_mask = x.eq(self.mask_index)
+    if not bool(active_mask.any().item()):
+      return x
+    if self.structured_sampling_mode == 'factorized':
+      raise RuntimeError(
+        '_structured_clean_sample requires a structured sampling mode')
+    output, unary_logits = self._structured_head_output(
+      tokens=x,
+      conditioning=conditioning,
+      active_mask=active_mask,
+      force_no_grad_backbone=True)
+    if self.structured_sampling_mode == 'structured_joint':
+      clean = structured_objective.sample_structured_tokens(
+        output=output,
+        unary_logits=unary_logits,
+        active_mask=active_mask,
+        num_samples=1)[:, 0]
+    elif self.structured_sampling_mode == 'structured_marginal':
+      clean = structured_objective.sample_structured_marginal_tokens(
+        output=output,
+        unary_logits=unary_logits,
+        active_mask=active_mask,
+        num_samples=1)[:, 0]
+    else:
+      raise RuntimeError(
+        f'unsupported structured sampling mode '
+        f'{self.structured_sampling_mode!r}')
+    return torch.where(active_mask, clean, x)
+
+  @torch.no_grad()
+  def _structured_ddpm_update(self, x, t, dt):
+    """Sample structured token identities, then apply the reveal kernel."""
+    sigma_t, _ = self.noise(t)
+    sigma_s, _ = self.noise(t - dt)
+    if sigma_t.ndim > 1:
+      sigma_t = sigma_t.squeeze(-1)
+    if sigma_s.ndim > 1:
+      sigma_s = sigma_s.squeeze(-1)
+    move_chance_t = 1 - torch.exp(-sigma_t)
+    move_chance_s = 1 - torch.exp(-sigma_s)
+    proposed_clean = self._structured_clean_sample(x, sigma_t)
+    reveal_probability = (
+      (move_chance_t - move_chance_s)
+      / move_chance_t.clamp_min(1e-12)).clamp(0.0, 1.0)
+    reveal = (
+      torch.rand(x.shape, device=x.device)
+      < reveal_probability[:, None])
+    reveal = reveal & x.eq(self.mask_index)
+    return torch.where(reveal, proposed_clean, x)
+
   def _ddpm_update(self, x, t, dt):
+    if (self.structured_enabled
+        and self.structured_sampling_mode != 'factorized'):
+      return self._structured_ddpm_update(x, t, dt)
     sigma_t, _ = self.noise(t)
     sigma_s, _ = self.noise(t - dt)
     if sigma_t.ndim > 1:
@@ -911,6 +1329,10 @@ class Diffusion(L.LightningModule):
         sigma_1d = self._process_sigma(unet_conditioning)
         p_x0 = self._compute_crf_marginals(x, sigma_1d)
         x = p_x0.argmax(dim=-1)
+      elif (self.structured_enabled
+            and self.structured_sampling_mode != 'factorized'):
+        unet_conditioning = self.noise(t)[0]
+        x = self._structured_clean_sample(x, unet_conditioning)
       else:
         unet_conditioning = self.noise(t)[0]
         x = self.forward(x, unet_conditioning).argmax(dim=-1)
@@ -920,20 +1342,18 @@ class Diffusion(L.LightningModule):
     """Generate samples from the model."""
     # Lightning auto-casting is not working in this method for some reason
     if self.ema:
-      self.ema.store(itertools.chain(
-        self.backbone.parameters(),
-        self.noise.parameters()))
-      self.ema.copy_to(itertools.chain(
-        self.backbone.parameters(),
-        self.noise.parameters()))
+      self.ema.store(self._trainable_model_parameters())
+      self.ema.copy_to(self._trainable_model_parameters())
     self.backbone.eval()
+    if self.structured_head is not None:
+      self.structured_head.eval()
     self.noise.eval()
     samples = self._sample(num_steps=num_steps, eps=eps)
     if self.ema:
-      self.ema.restore(itertools.chain(
-        self.backbone.parameters(),
-        self.noise.parameters()))
+      self.ema.restore(self._trainable_model_parameters())
     self.backbone.train()
+    if self.structured_head is not None:
+      self.structured_head.train()
     self.noise.train()
     return samples
 
@@ -1063,6 +1483,216 @@ class Diffusion(L.LightningModule):
                           dim=-1,
                           index=x0[:, :, None]).squeeze(-1)
 
+  def _structured_backbone_output(
+      self, tokens, conditioning, force_no_grad=False):
+    """Encode once and return hidden states plus mask-excluded raw unaries."""
+    backbone_conditioning = self._process_sigma(conditioning)
+
+    def run_backbone():
+      hidden_states, time_conditioning = self.backbone.encode(
+        tokens, backbone_conditioning)
+      unary_logits = self.backbone.decode(
+        hidden_states, time_conditioning).float()
+      # The absorbing mask is not a clean-token candidate.  This exclusion is
+      # based only on the known vocabulary role, never on x0.
+      unary_logits = unary_logits.clone()
+      unary_logits[:, :, self.mask_index] = -torch.inf
+      return hidden_states, unary_logits
+
+    if force_no_grad or self.structured_backbone_mode == 'frozen':
+      with torch.no_grad():
+        return run_backbone()
+    return run_backbone()
+
+  def _structured_head_output(
+      self, tokens, conditioning, active_mask,
+      force_no_grad_backbone=False):
+    hidden_states, unary_logits = self._structured_backbone_output(
+      tokens=tokens,
+      conditioning=conditioning,
+      force_no_grad=force_no_grad_backbone)
+    if conditioning.ndim == 2 and conditioning.shape[-1] == 1:
+      head_timestep = conditioning[:, 0]
+    else:
+      head_timestep = conditioning
+    fixed_edge_mask = None
+    if self.structured_fixed_edge_index is not None:
+      fixed_edges = self.structured_fixed_edge_index
+      fixed_edge_mask = (
+        active_mask[:, fixed_edges[:, 0]]
+        & active_mask[:, fixed_edges[:, 1]])
+    output = self.structured_head(
+      hidden_states=hidden_states,
+      unary_logits=unary_logits,
+      timestep=head_timestep,
+      active_mask=active_mask,
+      fixed_edge_index=self.structured_fixed_edge_index,
+      fixed_edge_mask=fixed_edge_mask)
+    return output, unary_logits
+
+  def _forward_pass_structured(self, x0, attention_mask):
+    """Train the forest adapter on a real forward-corrupted text batch.
+
+    The returned objective is conditional denoising NLL per masked token plus
+    optional topology distillation and factorized-unary auxiliary terms.  It
+    is intentionally not reported as a diffusion ELBO.
+    """
+    t = self._sample_t(x0.shape[0], x0.device)
+    if self.change_of_variables:
+      conditioning = t[:, None]
+      f_T = torch.log1p(-torch.exp(-self.noise.sigma_max))
+      f_0 = torch.log1p(-torch.exp(-self.noise.sigma_min))
+      move_chance = torch.exp(f_0 + t * (f_T - f_0))[:, None]
+    else:
+      sigma, _ = self.noise(t)
+      conditioning = sigma[:, None]
+      move_chance = 1 - torch.exp(-sigma[:, None])
+    xt = self.q_xt(x0, move_chance)
+    if attention_mask is None:
+      attention_mask = torch.ones_like(x0, dtype=torch.bool)
+    else:
+      attention_mask = attention_mask.bool()
+    active_mask = xt.eq(self.mask_index) & attention_mask
+
+    output, unary_logits = self._structured_head_output(
+      tokens=xt,
+      conditioning=conditioning,
+      active_mask=active_mask)
+    denoising = structured_training.structured_denoising_loss(
+      output=output,
+      unary_logits=unary_logits,
+      clean_tokens=x0,
+      active_mask=active_mask)
+
+    training_cfg = self.structured_training_config
+    factorized_auxiliary = structured_training.factorized_denoising_nll(
+      unary_logits=unary_logits,
+      clean_tokens=x0,
+      active_mask=active_mask)
+    topology_zero = torch.where(
+      torch.isfinite(output.proposal_scores),
+      output.proposal_scores,
+      torch.zeros_like(output.proposal_scores)).sum() * 0.0
+    topology_loss = topology_zero
+    topology_edge_loss = topology_zero
+    topology_anchor_loss = topology_zero
+    topology_slot_loss = topology_zero
+    topology_valid_examples = topology_zero.detach()
+    topology_influence = topology_zero.detach()
+    topology_edge_coverage_numerator = topology_zero.detach()
+    topology_edge_coverage_denominator = topology_zero.detach()
+    topology_anchor_coverage_numerator = topology_zero.detach()
+    topology_anchor_coverage_denominator = topology_zero.detach()
+    topology_slot_coverage_numerator = topology_zero.detach()
+    topology_slot_coverage_denominator = topology_zero.detach()
+    topology_weight = float(training_cfg.get('topology_weight', 0.0))
+    topology_strategy = str(
+      training_cfg.get('topology_strategy', 'gold_reveal_influence'))
+    train_topology = (
+      topology_weight > 0.0
+      and topology_strategy == 'gold_reveal_influence'
+      and output.topology_mode == 'dynamic'
+      and not output.independent_mode
+      and (self.training
+           or bool(training_cfg.get('topology_on_validation', False))))
+    if train_topology:
+      sources = structured_training.sample_active_sources(active_mask)
+      revealed_xt = xt.clone()
+      valid_sources = sources >= 0
+      batch_index = torch.arange(x0.shape[0], device=x0.device)
+      revealed_xt[
+        batch_index[valid_sources], sources[valid_sources]
+      ] = x0[batch_index[valid_sources], sources[valid_sources]]
+      _, revealed_logits = self._structured_backbone_output(
+        tokens=revealed_xt,
+        conditioning=conditioning,
+        force_no_grad=True)
+      topology = (
+        structured_training.gold_reveal_influence_topology_loss(
+          output=output,
+          base_unary_logits=unary_logits.detach(),
+          revealed_unary_logits=revealed_logits,
+          clean_tokens=x0,
+          active_mask=active_mask,
+          source_positions=sources,
+          temperature=float(
+            training_cfg.get('topology_temperature', 0.25)),
+          minimum_choices=int(
+            training_cfg.get('topology_minimum_choices', 2)),
+          edge_weight=float(
+            training_cfg.get('topology_edge_weight', 1.0)),
+          anchor_weight=float(
+            training_cfg.get('topology_anchor_weight', 0.25)),
+          slot_weight=float(
+            training_cfg.get('topology_slot_weight', 0.25))))
+      topology_loss = topology.loss
+      topology_edge_loss = topology.edge_loss
+      topology_anchor_loss = topology.anchor_loss
+      topology_slot_loss = topology.slot_loss
+      topology_valid_examples = topology.valid_examples
+      topology_influence = topology.mean_influence
+      topology_edge_coverage_numerator = (
+        topology.edge_coverage_numerator)
+      topology_edge_coverage_denominator = (
+        topology.edge_coverage_denominator)
+      topology_anchor_coverage_numerator = (
+        topology.anchor_coverage_numerator)
+      topology_anchor_coverage_denominator = (
+        topology.anchor_coverage_denominator)
+      topology_slot_coverage_numerator = (
+        topology.slot_coverage_numerator)
+      topology_slot_coverage_denominator = (
+        topology.slot_coverage_denominator)
+
+    structured_weight = float(
+      training_cfg.get('structured_nll_weight', 1.0))
+    factorized_weight = float(
+      training_cfg.get('factorized_aux_weight', 0.0))
+    total_loss = (
+      structured_weight * denoising.loss
+      + factorized_weight * factorized_auxiliary
+      + topology_weight * topology_loss)
+    attention_tokens = attention_mask.sum().clamp_min(1)
+    self._last_structured_metrics = {
+      'loss': total_loss.detach(),
+      'active_fraction': (
+        denoising.active_tokens.detach() / attention_tokens),
+      'selected_edges': output.edge_mask.sum(dim=-1).float().mean().detach(),
+      'factorized_aux_nll': factorized_auxiliary.detach(),
+      'topology_loss': topology_loss.detach(),
+      'topology_edge_loss': topology_edge_loss.detach(),
+      'topology_anchor_loss': topology_anchor_loss.detach(),
+      'topology_slot_loss': topology_slot_loss.detach(),
+      'topology_valid_examples': topology_valid_examples.detach(),
+      'topology_teacher_influence': topology_influence.detach(),
+    }
+    self._last_structured_metric_updates = {
+      'conditional_nll_per_masked_token': (
+        denoising.nll_sum.detach(), denoising.active_tokens.detach()),
+      'candidate_recall': (
+        denoising.candidate_hits.detach(),
+        denoising.active_tokens.detach()),
+      'retained_unary_mass': (
+        denoising.retained_mass_sum.detach(),
+        denoising.active_tokens.detach()),
+      'topology_edge_coverage': (
+        topology_edge_coverage_numerator.detach(),
+        topology_edge_coverage_denominator.detach()),
+      'topology_edge_coverage_denominator': (
+        topology_edge_coverage_denominator.detach(),),
+      'topology_anchor_coverage': (
+        topology_anchor_coverage_numerator.detach(),
+        topology_anchor_coverage_denominator.detach()),
+      'topology_anchor_coverage_denominator': (
+        topology_anchor_coverage_denominator.detach(),),
+      'topology_slot_coverage': (
+        topology_slot_coverage_numerator.detach(),
+        topology_slot_coverage_denominator.detach()),
+      'topology_slot_coverage_denominator': (
+        topology_slot_coverage_denominator.detach(),),
+    }
+    return total_loss, denoising.distributed_nll, active_mask
+
   def _forward_pass_diffusion(self, x0, return_components=False):
     t = self._sample_t(x0.shape[0], x0.device)
     if self.T > 0:
@@ -1151,6 +1781,14 @@ class Diffusion(L.LightningModule):
      attention_mask) = self._maybe_sub_sample(
        x0, attention_mask)
 
+    if self.structured_enabled:
+      (structured_loss, metric_losses,
+       structured_token_mask) = self._forward_pass_structured(
+         input_tokens, attention_mask)
+      return Loss(
+        loss=structured_loss,
+        nlls=metric_losses,
+        token_mask=structured_token_mask)
     if self.parameterization == 'ar':
       logprobs = self.backbone(input_tokens, None)
       objective_losses = - logprobs.gather(
@@ -1267,13 +1905,11 @@ class Diffusion(L.LightningModule):
     """Generate samples from the model."""
     # Lightning auto-casting is not working in this method for some reason
     if self.ema:
-      self.ema.store(itertools.chain(
-        self.backbone.parameters(),
-        self.noise.parameters()))
-      self.ema.copy_to(itertools.chain(
-        self.backbone.parameters(),
-        self.noise.parameters()))
+      self.ema.store(self._trainable_model_parameters())
+      self.ema.copy_to(self._trainable_model_parameters())
     self.backbone.eval()
+    if self.structured_head is not None:
+      self.structured_head.eval()
     self.noise.eval()
     (sampling_steps, samples,
      sequence_lengths) = self.sample_subs_guidance(
@@ -1282,9 +1918,9 @@ class Diffusion(L.LightningModule):
       num_strides=num_strides, 
       dt=dt)
     if self.ema:
-      self.ema.restore(itertools.chain(
-        self.backbone.parameters(),
-        self.noise.parameters()))
+      self.ema.restore(self._trainable_model_parameters())
     self.backbone.train()
+    if self.structured_head is not None:
+      self.structured_head.train()
     self.noise.train()
     return sampling_steps, samples, sequence_lengths

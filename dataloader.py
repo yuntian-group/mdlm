@@ -309,10 +309,15 @@ def get_dataset(
     filename = f'{dataset_name}_{mode}_bs{block_size}_unwrapped.dat'
   _path = os.path.join(cache_dir, filename)
   
-  if utils.fsspec_exists(_path):
+  # A streaming run must not silently fall back to a previously materialized
+  # map-style cache at the same path.
+  if not streaming and utils.fsspec_exists(_path):
     LOGGER.info(f'Loading data from: {_path}')
     return datasets.load_from_disk(_path).with_format('torch')
-  LOGGER.info(f'Generating new data at: {_path}')
+  if streaming:
+    LOGGER.info(f'Streaming {dataset_name} split {mode}.')
+  else:
+    LOGGER.info(f'Generating new data at: {_path}')
 
   crop_train = dataset_name == 'text8-crop'
   if mode == 'train' and crop_train:
@@ -463,7 +468,8 @@ def get_dataset(
       'text')
 
   if not wrap:
-    tokenized_dataset.save_to_disk(_path)
+    if not streaming:
+      tokenized_dataset.save_to_disk(_path)
     return tokenized_dataset.with_format('torch')
 
   group_texts = functools.partial(
@@ -520,7 +526,22 @@ def get_tokenizer(config):
     tokenizer.add_special_tokens({'pad_token': '[PAD]'})
 
   return tokenizer
-    
+
+
+class _TorchIterableDatasetAdapter(torch.utils.data.IterableDataset):
+  """Expose a Hugging Face streaming dataset to PyTorch as iterable-style."""
+
+  def __init__(self, dataset):
+    super().__init__()
+    self.dataset = dataset
+
+  def __iter__(self):
+    return iter(self.dataset)
+
+  def set_epoch(self, epoch):
+    if hasattr(self.dataset, 'set_epoch'):
+      self.dataset.set_epoch(epoch)
+
 
 def get_dataloaders(config, tokenizer, skip_train=False,
                     skip_valid=False, valid_seed=None):
@@ -549,7 +570,12 @@ def get_dataloaders(config, tokenizer, skip_train=False,
       mode='train',
       wrap=config.data.wrap,
       cache_dir=config.data.cache_dir,
-      block_size=config.model.length)
+      block_size=config.model.length,
+      streaming=bool(config.data.streaming))
+    if (config.data.streaming
+        and not isinstance(
+          train_set, torch.utils.data.IterableDataset)):
+      train_set = _TorchIterableDatasetAdapter(train_set)
   
   if config.data.valid in ['text8', 'lm1b', 'ag_news']:
     validation_split = 'test'
@@ -558,6 +584,9 @@ def get_dataloaders(config, tokenizer, skip_train=False,
   if skip_valid:
     valid_set = None
   else:
+    # Evaluation is deliberately finite and map-style, even when the training
+    # corpus is streamed.  This keeps validation/test length and ordering
+    # stable for checkpoint selection and comparable metrics.
     valid_set = get_dataset(
       config.data.valid,
       tokenizer,
@@ -576,7 +605,7 @@ def get_dataloaders(config, tokenizer, skip_train=False,
       num_workers=config.loader.num_workers,
       pin_memory=config.loader.pin_memory,
       shuffle=not config.data.streaming,
-      persistent_workers=True)
+      persistent_workers=(config.loader.num_workers > 0))
     train_loader.tokenizer = tokenizer
   if skip_valid:
     valid_loader = None
@@ -593,7 +622,8 @@ def get_dataloaders(config, tokenizer, skip_train=False,
       num_workers=config.loader.num_workers,
       pin_memory=config.loader.pin_memory,
       shuffle=shuffle_valid,
-      generator=generator)
+      generator=generator,
+      persistent_workers=(config.loader.num_workers > 0))
     # Will be used in generative perplexity calculation
     valid_loader.tokenizer = tokenizer
 

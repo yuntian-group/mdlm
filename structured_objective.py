@@ -240,3 +240,38 @@ def sample_structured_tokens(
       batch_size, sequence_length, num_samples).transpose(1, 2)
     tokens = torch.where(uses_residual, tail_draws, tokens)
   return tokens
+
+
+def sample_structured_marginal_tokens(
+    output: StructuredDecoderOutput,
+    unary_logits: torch.Tensor,
+    active_mask: torch.Tensor,
+    num_samples: int = 1,
+    generator: Optional[torch.Generator] = None,
+    inference: Optional[StructuredInference] = None) -> torch.Tensor:
+  """Sample nodes independently from exact structured node marginals.
+
+  This is the controlled marginal-sampling ablation: inference still uses the
+  same forest and checkpoint as joint sampling, but the final categorical
+  draws deliberately discard cross-node correlations.  Output is ``[B,S,L]``.
+  """
+  if num_samples < 1:
+    raise ValueError('num_samples must be positive')
+  active_mask = _validate_active_mask(output, active_mask)
+  probabilities = full_vocabulary_marginals(
+    output=output,
+    unary_logits=unary_logits,
+    active_mask=active_mask,
+    inference=inference).clamp_min(0)
+  normalizer = probabilities.sum(dim=-1, keepdim=True)
+  if bool((normalizer <= 0).any().item()):
+    raise RuntimeError('structured node marginal has zero total mass')
+  probabilities = probabilities / normalizer
+  batch_size, sequence_length, vocab_size = probabilities.shape
+  draws = torch.multinomial(
+    probabilities.reshape(-1, vocab_size),
+    num_samples=num_samples,
+    replacement=True,
+    generator=generator)
+  return draws.reshape(
+    batch_size, sequence_length, num_samples).transpose(1, 2)

@@ -556,7 +556,9 @@ class ContextualCouplingForestHead(nn.Module):
     topology_mode: ``dynamic`` for learned forests or ``fixed`` for chains.
     factor_mode: ``dynamic`` for context/time FiLM or ``fixed`` token factors.
     independent_mode: Replace every pair factor by one while retaining all
-      parameters, yielding a parameter-matched independent head.
+      architecture parameters. Pair-factor parameters are inactive in this
+      mode, so this is an architecture-count/no-edge control rather than an
+      active-capacity-matched unary adapter.
     min_edge_score: Optional threshold below which dynamic edges are omitted.
 
   The structured part has O(VR + H(D+R) + DA) parameters.  Given existing
@@ -791,7 +793,8 @@ class ContextualCouplingForestHead(nn.Module):
       topology_mode: Optional per-call ``fixed``/``dynamic`` ablation.
       factor_mode: Optional per-call ``fixed``/``dynamic`` ablation.
       independent_mode: Optional per-call neutral-factor ablation.  It changes
-        no parameters, giving a parameter-matched independent output head.
+        no architecture parameters, but makes pair-factor parameters inactive;
+        it is an architecture-count/no-edge control.
       fixed_edge_index: Optional static forest, shared as ``[E,2]`` or batched
         as ``[B,E,2]``.  Supplying it is an explicit static-topology override;
         edges are validated, canonicalized, detached, and padded to ``L-1``.
