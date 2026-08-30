@@ -44,6 +44,9 @@ def _args() -> argparse.Namespace:
   parser.add_argument('--dependency-weight', type=float, default=1.0)
   parser.add_argument('--eval-samples', type=int, default=20000)
   parser.add_argument('--log-every', type=int, default=100)
+  parser.add_argument(
+    '--inference-backend', choices=('auto', 'dense', 'low_rank'),
+    default='low_rank')
   parser.add_argument('--device', default='cuda' if torch.cuda.is_available()
                       else 'cpu')
   return parser.parse_args()
@@ -72,7 +75,8 @@ def main() -> int:
     learning_rate=args.learning_rate,
     dependency_weight=args.dependency_weight,
     eval_samples=args.eval_samples,
-    log_every=args.log_every)
+    log_every=args.log_every,
+    inference_backend=args.inference_backend)
   device = torch.device(args.device)
   start = dt.datetime.now(dt.timezone.utc)
   records_path = output_dir / 'records.json'

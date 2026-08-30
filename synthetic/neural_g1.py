@@ -46,6 +46,7 @@ class NeuralTrainConfig:
   gradient_clip: float = 5.0
   eval_samples: int = 20000
   log_every: int = 100
+  inference_backend: str = 'auto'
 
 
 def model_specs(task: ContextSwitchingMatching) -> dict[str, NeuralModelSpec]:
@@ -137,6 +138,8 @@ class SyntheticForestAdapter(nn.Module):
         persistent=True)
     else:
       self.fixed_edges = None
+    self.register_buffer(
+      'dependency_adjacency', dependency_adjacency(task), persistent=True)
 
   def forward(self, contexts: torch.Tensor, timestep: torch.Tensor):
     hidden, unary_logits = self.backbone(contexts)
@@ -174,19 +177,13 @@ def sample_training_batch(
   return contexts, tokens, timestep
 
 
-def dependency_targets(
+def dependency_adjacency(
     task: ContextSwitchingMatching,
-    contexts: torch.Tensor,
-    edge_index: torch.Tensor) -> torch.Tensor:
-  # This is the exact synthetic counterpart of the paper's cached
-  # conditional-influence target: an edge is positive when revealing one
-  # endpoint changes the other endpoint's distribution.  Mutual information
-  # computes that criterion without reading ``task.true_edges``.  It is still
-  # supervised topology and should be reported as an upper bound, not as
-  # unsupervised graph discovery.
+    device: Optional[torch.device] = None) -> torch.Tensor:
+  """Compute the exact context-level conditional-influence table once."""
   adjacency = torch.zeros(
     task.num_contexts, task.length, task.length,
-    dtype=torch.bool, device=contexts.device)
+    dtype=torch.bool, device=device)
   for context in range(task.num_contexts):
     for first in range(task.length):
       for second in range(first + 1, task.length):
@@ -201,6 +198,27 @@ def dependency_targets(
         if influence > 1e-8:
           adjacency[context, first, second] = True
           adjacency[context, second, first] = True
+  return adjacency
+
+
+def dependency_targets(
+    task: ContextSwitchingMatching,
+    contexts: torch.Tensor,
+    edge_index: torch.Tensor,
+    adjacency: Optional[torch.Tensor] = None) -> torch.Tensor:
+  # This is the exact synthetic counterpart of the paper's cached
+  # conditional-influence target: an edge is positive when revealing one
+  # endpoint changes the other endpoint's distribution.  Mutual information
+  # computes that criterion without reading ``task.true_edges``.  It is still
+  # supervised topology and should be reported as an upper bound, not as
+  # unsupervised graph discovery.
+  if adjacency is None:
+    adjacency = dependency_adjacency(task, contexts.device)
+  expected = (task.num_contexts, task.length, task.length)
+  if adjacency.shape != expected or adjacency.dtype != torch.bool:
+    raise ValueError(
+      f'adjacency must be boolean with shape {expected}')
+  adjacency = adjacency.to(contexts.device)
   batch = torch.arange(contexts.shape[0], device=contexts.device)[:, None]
   return adjacency[
     contexts[:, None], edge_index[:, :, 0], edge_index[:, :, 1]]
@@ -209,10 +227,11 @@ def dependency_targets(
 def dependency_loss(
     task: ContextSwitchingMatching,
     contexts: torch.Tensor,
-    output) -> torch.Tensor:
+    output,
+    adjacency: Optional[torch.Tensor] = None) -> torch.Tensor:
   valid = output.proposal_edge_mask
   targets = dependency_targets(
-    task, contexts, output.proposal_edge_index).to(
+    task, contexts, output.proposal_edge_index, adjacency).to(
       output.proposal_scores.dtype)
   logits = output.proposal_scores.masked_select(valid)
   targets = targets.masked_select(valid)
@@ -232,6 +251,9 @@ def train_adapter(
   if device.type == 'cuda':
     torch.cuda.manual_seed_all(seed)
   generator = torch.Generator(device=device).manual_seed(seed + 10_000)
+  if config.inference_backend not in {'auto', 'dense', 'low_rank'}:
+    raise ValueError(
+      "inference_backend must be 'auto', 'dense', or 'low_rank'")
   model = SyntheticForestAdapter(task, spec).to(device)
   optimizer = torch.optim.AdamW(
     model.head.parameters(), lr=config.learning_rate, weight_decay=1e-4)
@@ -241,9 +263,12 @@ def train_adapter(
     contexts, tokens, timestep = sample_training_batch(
       task, config.batch_size, generator, device)
     output, unary_logits, active = model(contexts, timestep)
+    inference = infer_structured_distribution(
+      output, active, backend=config.inference_backend)
     nll = -structured_token_log_probability(
-      output, unary_logits, tokens, active).mean()
-    dep = dependency_loss(task, contexts, output)
+      output, unary_logits, tokens, active, inference).mean()
+    dep = dependency_loss(
+      task, contexts, output, model.dependency_adjacency)
     loss = nll + config.dependency_weight * dep
     optimizer.zero_grad(set_to_none=True)
     loss.backward()

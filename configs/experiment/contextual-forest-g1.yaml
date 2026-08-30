@@ -43,6 +43,7 @@ learned_adapter:
   dependency_weight: 1.0
   factor_init_std: 0.25
   eval_samples: 20000
+  inference_backend: low_rank
   topology_proposals: all_pairs
   min_edge_score: 0.0
 

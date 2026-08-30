@@ -5,7 +5,9 @@ import torch
 from synthetic.distributions import ContextSwitchingMatching
 from synthetic.neural_g1 import (
   NeuralTrainConfig,
+  dependency_adjacency,
   dependency_loss,
+  dependency_targets,
   model_specs,
   sample_training_batch,
   train_adapter,
@@ -29,7 +31,8 @@ class NeuralG1Test(unittest.TestCase):
     model, history = train_adapter(
       task, spec, seed=2,
       config=NeuralTrainConfig(
-        steps=2, batch_size=6, eval_samples=20, log_every=1),
+        steps=2, batch_size=6, eval_samples=20, log_every=1,
+        inference_backend='low_rank'),
       device=torch.device('cpu'))
     self.assertTrue(all(torch.isfinite(torch.tensor([
       row['loss'], row['structured_nll'], row['dependency_loss'],
@@ -42,6 +45,19 @@ class NeuralG1Test(unittest.TestCase):
     self.assertTrue(bool(torch.isfinite(log_probability).all()))
     self.assertGreater(
       float(dependency_loss(task, contexts, output).detach()), 0.0)
+
+  def test_cached_dependency_adjacency_matches_direct_targets(self):
+    task = ContextSwitchingMatching(vocab_size=3)
+    contexts = torch.tensor([0, 1, 2])
+    edges = torch.tensor([
+      [[0, 1], [0, 2], [1, 4]],
+      [[0, 1], [0, 2], [1, 4]],
+      [[0, 1], [0, 2], [1, 4]],
+    ])
+    direct = dependency_targets(task, contexts, edges)
+    cached = dependency_targets(
+      task, contexts, edges, dependency_adjacency(task))
+    torch.testing.assert_close(cached, direct)
 
 
 if __name__ == '__main__':

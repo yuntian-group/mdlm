@@ -2,13 +2,13 @@
 set -euo pipefail
 
 readonly PROJECT='interactive-training-2026'
-readonly REGION='us-east4'
-readonly ZONE='us-east4-c'
+readonly REGION='us-central1'
+readonly ZONE='us-central1-a'
 readonly NETWORK='contextual-forest-net-20260830'
-readonly SUBNET='contextual-forest-subnet-20260830'
+readonly SUBNET='contextual-forest-subnet-central-20260830'
 readonly FIREWALL='contextual-forest-iap-ssh-20260830'
-readonly ROUTER='contextual-forest-router-20260830'
-readonly NAT='contextual-forest-nat-20260830'
+readonly ROUTER='contextual-forest-router-central-20260830'
+readonly NAT='contextual-forest-nat-central-20260830'
 readonly DATA_DISK='contextual-forest-l4-data-20260830'
 readonly VM='contextual-forest-l4-20260830'
 readonly IMAGE='ubuntu-accelerator-2204-amd64-with-nvidia-580-v20260825'
@@ -50,7 +50,7 @@ gcloud compute networks subnets create "${SUBNET}" \
   --project="${PROJECT}" \
   --network="${NETWORK}" \
   --region="${REGION}" \
-  --range=10.206.0.0/24 \
+  --range=10.206.1.0/24 \
   --enable-private-ip-google-access
 gcloud compute firewall-rules create "${FIREWALL}" \
   --project="${PROJECT}" \
