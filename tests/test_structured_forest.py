@@ -359,6 +359,72 @@ class LowRankProductionPathTest(Float64TestCase):
       low_rank.node_marginals, dense.node_marginals,
       atol=8e-12, rtol=8e-12)
 
+  def test_marginals_are_invariant_to_large_additive_child_offset(self):
+    # A state-independent child offset must cancel from every marginal.  The
+    # power-of-two shift keeps the integer unary differences exactly
+    # representable while exposing cancellation in ``total - child`` schemes.
+    node = torch.tensor([[
+      [0.0, -1.0, 2.0, 1.0],
+      [1.0, -2.0, 0.0, 2.0],
+      [-1.0, 2.0, 1.0, 0.0],
+      [2.0, 0.0, -2.0, 1.0],
+    ]], dtype=torch.float64)
+    left = torch.tensor([[
+      [[1.3, 0.4], [0.2, 1.7], [0.9, 0.8]],
+      [[0.7, 1.2], [1.6, 0.3], [0.5, 1.1]],
+      [[1.4, 0.2], [0.6, 1.5], [1.0, 0.7]],
+    ]], dtype=torch.float64)
+    right = torch.tensor([[
+      [[0.8, 1.1], [1.5, 0.2], [0.4, 1.3]],
+      [[1.2, 0.5], [0.3, 1.4], [1.1, 0.9]],
+      [[0.6, 1.6], [1.3, 0.4], [0.8, 1.0]],
+    ]], dtype=torch.float64)
+    edges = torch.tensor([[0, 1], [2, 0], [0, 3]])
+    baseline = structured_utils.forest_sum_product_low_rank(
+      node, left, right, edges)
+    additive_offset = float(2 ** 50)
+    shifted_node = node.clone()
+    shifted_node[:, 1] += additive_offset
+    shifted = structured_utils.forest_sum_product_low_rank(
+      shifted_node, left, right, edges)
+
+    torch.testing.assert_close(
+      shifted.node_marginals, baseline.node_marginals,
+      atol=2e-12, rtol=2e-12)
+    torch.testing.assert_close(
+      shifted.log_partition - additive_offset,
+      baseline.log_partition, atol=0.3, rtol=0.0)
+
+  def test_broom_schedule_stores_each_child_once(self):
+    # At depth two this tree has 512 possible parents, one with 511 children.
+    # Max-degree rectangular padding would allocate 512*511 slots there.
+    length = 1024
+    edges = torch.tensor(
+      ([(0, node) for node in range(1, 513)]
+       + [(1, node) for node in range(513, length)]),
+      dtype=torch.long)
+    edge_mask = torch.ones(edges.shape[0], dtype=torch.bool)
+    canonical_edges, canonical_mask = structured_utils._canonical_topology(
+      edges, edge_mask, batch_size=1, edge_count=edges.shape[0],
+      device=torch.device('cpu'))
+    topologies = structured_utils._build_topology(
+      canonical_edges, canonical_mask, length, None, None)
+    schedule = structured_utils._build_low_rank_level_schedule(
+      topologies, canonical_edges, length, edges.shape[0])
+
+    stored_child_slots = 0
+    hypothetical_rectangular_slots = 0
+    for buckets in schedule.child_degree_buckets[1:]:
+      self.assertIsNotNone(buckets)
+      stored_child_slots += sum(
+        bucket.child_indices.numel() for bucket in buckets)
+      parent_count = sum(bucket.parent_slots.numel() for bucket in buckets)
+      maximum_degree = max(
+        bucket.child_indices.shape[1] for bucket in buckets)
+      hypothetical_rectangular_slots += parent_count * maximum_degree
+    self.assertEqual(stored_child_slots, length - 1)
+    self.assertGreater(hypothetical_rectangular_slots, 260_000)
+
   def test_partition_gradients_match_dense_materialisation(self):
     generator = torch.Generator().manual_seed(9917)
     node = torch.randn(
@@ -398,6 +464,146 @@ class LowRankProductionPathTest(Float64TestCase):
       low_rank_gradients[1][:, 2], torch.zeros_like(left[:, 2]))
     torch.testing.assert_close(
       low_rank_gradients[2][:, 2], torch.zeros_like(right[:, 2]))
+
+  def test_depth_batched_mixed_forests_match_dense_gradients(self):
+    generator = torch.Generator().manual_seed(5031)
+    node = torch.randn(
+      3, 8, 5, generator=generator, dtype=torch.float64,
+      requires_grad=True)
+    left = torch.exp(0.35 * torch.randn(
+      3, 7, 4, 3, generator=generator, dtype=torch.float64)).requires_grad_()
+    right = torch.exp(0.35 * torch.randn(
+      3, 7, 4, 3, generator=generator, dtype=torch.float64)).requires_grad_()
+    # Mix a deep chain, a high-degree tree, and a disconnected forest.  Edge
+    # orientation alternates independently of the rooted traversal.
+    edges = torch.tensor([
+      [[1, 0], [1, 2], [3, 2], [3, 4], [5, 4], [5, 6], [7, 6]],
+      [[1, 0], [0, 2], [3, 0], [0, 4], [5, 0], [0, 6], [7, 0]],
+      [[0, 2], [3, 2], [1, 4], [4, 6], [7, 6], [-1, -1], [-1, -1]],
+    ])
+    edge_mask = torch.tensor([
+      [True, True, True, True, True, True, True],
+      [True, True, True, True, True, True, True],
+      [True, True, True, True, True, False, False],
+    ])
+    state_mask = torch.ones_like(node, dtype=torch.bool)
+    state_mask[0, 5, 1] = False
+    state_mask[1, 0, 4] = False
+    state_mask[2, 7, 0] = False
+    clamps = torch.tensor([
+      [-1, -1, 2, -1, -1, -1, -1, -1],
+      [-1, 4, -1, -1, -1, -1, -1, -1],
+      [-1, -1, -1, -1, 1, -1, -1, -1],
+    ])
+
+    low_rank = structured_utils.forest_sum_product_low_rank(
+      node, left, right, edges, edge_mask=edge_mask,
+      state_mask=state_mask, clamped_states=clamps)
+    low_rank_gradients = torch.autograd.grad(
+      low_rank.log_partition.sum(), (node, left, right), retain_graph=True)
+    dense = structured_utils.forest_sum_product(
+      node,
+      structured_utils.materialize_low_rank_pair_factors(
+        left, right, edge_mask=edge_mask).log(),
+      edges, edge_mask=edge_mask, state_mask=state_mask,
+      clamped_states=clamps)
+    dense_gradients = torch.autograd.grad(
+      dense.log_partition.sum(), (node, left, right))
+
+    torch.testing.assert_close(
+      low_rank.log_partition, dense.log_partition,
+      atol=1e-11, rtol=1e-11)
+    torch.testing.assert_close(
+      low_rank.node_marginals, dense.node_marginals,
+      atol=1e-11, rtol=1e-11)
+    for actual, expected in zip(low_rank_gradients, dense_gradients):
+      torch.testing.assert_close(actual, expected, atol=1e-11, rtol=1e-11)
+
+  def test_marginal_dependent_gradients_match_dense(self):
+    generator = torch.Generator().manual_seed(7721)
+    node = torch.randn(
+      2, 5, 4, generator=generator, dtype=torch.float64,
+      requires_grad=True)
+    left = torch.exp(0.4 * torch.randn(
+      2, 4, 3, 3, generator=generator,
+      dtype=torch.float64)).requires_grad_()
+    right = torch.exp(0.4 * torch.randn(
+      2, 4, 3, 3, generator=generator,
+      dtype=torch.float64)).requires_grad_()
+    edges = torch.tensor([
+      [[1, 0], [0, 2], [3, 0], [3, 4]],
+      [[0, 2], [3, 2], [1, 4], [-1, -1]],
+    ])
+    edge_mask = torch.tensor([
+      [True, True, True, True],
+      [True, True, True, False],
+    ])
+    weights = torch.randn(
+      2, 5, 4, generator=generator, dtype=torch.float64)
+
+    low_rank = structured_utils.forest_sum_product_low_rank(
+      node, left, right, edges, edge_mask=edge_mask)
+    low_rank_loss = (low_rank.node_marginals * weights).sum()
+    low_rank_gradients = torch.autograd.grad(
+      low_rank_loss, (node, left, right), retain_graph=True)
+    dense = structured_utils.forest_sum_product(
+      node,
+      structured_utils.materialize_low_rank_pair_factors(
+        left, right, edge_mask=edge_mask).log(),
+      edges, edge_mask=edge_mask)
+    dense_loss = (dense.node_marginals * weights).sum()
+    dense_gradients = torch.autograd.grad(
+      dense_loss, (node, left, right))
+
+    torch.testing.assert_close(
+      low_rank_loss, dense_loss, atol=2e-11, rtol=2e-11)
+    for actual, expected in zip(low_rank_gradients, dense_gradients):
+      torch.testing.assert_close(actual, expected, atol=3e-11, rtol=3e-11)
+
+  @unittest.skipUnless(torch.cuda.is_available(), 'CUDA is not available')
+  def test_depth_batched_cuda_forward_and_gradients_are_repeatable(self):
+    device = torch.device('cuda')
+    generator = torch.Generator(device=device).manual_seed(992)
+    base_node = torch.randn(
+      4, 9, 6, generator=generator, device=device)
+    base_left = torch.rand(
+      4, 8, 5, 4, generator=generator, device=device) + 0.2
+    base_right = torch.rand(
+      4, 8, 5, 4, generator=generator, device=device) + 0.2
+    edges = torch.tensor([
+      [0, 1], [0, 2], [3, 0], [3, 4],
+      [5, 4], [5, 6], [7, 5], [7, 8],
+    ], device=device)
+    weights = torch.randn(
+      4, 9, 6, generator=generator, device=device)
+
+    deterministic_was_enabled = torch.are_deterministic_algorithms_enabled()
+    warn_only_was_enabled = (
+      torch.is_deterministic_algorithms_warn_only_enabled())
+    records = []
+    try:
+      torch.use_deterministic_algorithms(True)
+      for _ in range(2):
+        node = base_node.detach().clone().requires_grad_()
+        left = base_left.detach().clone().requires_grad_()
+        right = base_right.detach().clone().requires_grad_()
+        result = structured_utils.forest_sum_product_low_rank(
+          node, left, right, edges)
+        loss = (
+          result.log_partition.sum()
+          + (result.node_marginals * weights).sum())
+        gradients = torch.autograd.grad(loss, (node, left, right))
+        torch.cuda.synchronize(device)
+        records.append((
+          result.log_partition.detach(),
+          result.node_log_marginals.detach(),
+          *(gradient.detach() for gradient in gradients)))
+    finally:
+      torch.use_deterministic_algorithms(
+        deterministic_was_enabled, warn_only=warn_only_was_enabled)
+
+    for first, second in zip(*records):
+      self.assertTrue(torch.equal(first, second))
 
   def test_low_rank_joint_sampling_matches_dense_edge_marginals(self):
     node = torch.tensor([[

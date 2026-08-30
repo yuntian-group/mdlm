@@ -110,6 +110,30 @@ class _ForestTopology:
   active_edges: Tuple[int, ...]
 
 
+@dataclass(frozen=True)
+class _ChildDegreeBucket:
+  """Parents with equal child degree and their compact child indices."""
+
+  parent_slots: torch.Tensor
+  child_indices: torch.Tensor
+
+
+@dataclass(frozen=True)
+class _LowRankLevelSchedule:
+  """Device-side indices for depth-batched forest message passing."""
+
+  node_ids: Tuple[torch.Tensor, ...]
+  parent_slots: Tuple[Optional[torch.Tensor], ...]
+  edge_ids: Tuple[Optional[torch.Tensor], ...]
+  child_is_left: Tuple[Optional[torch.Tensor], ...]
+  child_degree_buckets: Tuple[
+    Optional[Tuple[_ChildDegreeBucket, ...]], ...]
+  parent_inverse_order: Tuple[Optional[torch.Tensor], ...]
+  child_inverse_order: Tuple[Optional[torch.Tensor], ...]
+  inverse_node_order: torch.Tensor
+  roots_by_batch: torch.Tensor
+
+
 def _require(condition: bool, message: str) -> None:
   if not condition:
     raise ValueError(message)
@@ -164,6 +188,11 @@ def _build_topology(edge_index: torch.Tensor,
     _require(max_component_size > 0,
              'max_component_size must be positive')
 
+  # One bulk device-to-host transfer is dramatically cheaper than calling
+  # ``.item()`` for every edge on a GPU.  Topology is discrete/stop-gradient,
+  # so keeping the traversal metadata on the host does not alter autograd.
+  host_edges = edge_index.detach().cpu().tolist()
+  host_mask = edge_mask.detach().cpu().tolist()
   topologies = []
   for batch_index in range(edge_index.shape[0]):
     adjacency: List[List[Tuple[int, int, bool]]] = [
@@ -179,10 +208,9 @@ def _build_topology(edge_index: torch.Tensor,
     seen_edges = set()
     active_edges = []
     for edge_id in range(edge_index.shape[1]):
-      if not bool(edge_mask[batch_index, edge_id].item()):
+      if not host_mask[batch_index][edge_id]:
         continue
-      left = int(edge_index[batch_index, edge_id, 0].item())
-      right = int(edge_index[batch_index, edge_id, 1].item())
+      left, right = host_edges[batch_index][edge_id]
       _require(0 <= left < num_nodes and 0 <= right < num_nodes,
                'active edge endpoint is outside the node range')
       _require(left != right, 'self loops are not valid forest edges')
@@ -370,13 +398,17 @@ def _validate_low_rank_inputs(
            'endpoint factors need positive state and rank dimensions')
   _require(num_states == explicit_states + 1,
            'node states must be explicit endpoint states plus one residual')
-  _require(not bool(torch.isnan(node_log_potentials).any().item())
-           and not bool(torch.isposinf(node_log_potentials).any().item()),
+  invalid_nodes = (
+    torch.isnan(node_log_potentials).any()
+    | torch.isposinf(node_log_potentials).any())
+  _require(not bool(invalid_nodes.item()),
            'node_log_potentials may contain -inf, but not NaN or +inf')
-  _require(bool(torch.isfinite(left_factors).all().item())
-           and bool(torch.isfinite(right_factors).all().item())
-           and bool((left_factors > 0).all().item())
-           and bool((right_factors > 0).all().item()),
+  valid_factors = (
+    torch.isfinite(left_factors).all()
+    & torch.isfinite(right_factors).all()
+    & (left_factors > 0).all()
+    & (right_factors > 0).all())
+  _require(bool(valid_factors.item()),
            'all endpoint factors must be finite and strictly positive')
 
   edge_index, edge_mask = _canonical_topology(
@@ -634,6 +666,346 @@ def _low_rank_message(local_log_potential: torch.Tensor,
   return torch.cat((explicit_message, residual_message.unsqueeze(0)))
 
 
+def _safe_logsumexp(input_tensor: torch.Tensor, dim: int) -> torch.Tensor:
+  """``logsumexp`` with zero gradients for an identically ``-inf`` slice."""
+  all_impossible = torch.isneginf(input_tensor).all(dim=dim, keepdim=True)
+  safe_input = torch.where(
+    all_impossible, torch.zeros_like(input_tensor), input_tensor)
+  result = torch.logsumexp(safe_input, dim=dim)
+  return result.masked_fill(all_impossible.squeeze(dim), -torch.inf)
+
+
+def _batched_low_rank_message(
+    local_log_potential: torch.Tensor,
+    source_log_factors: torch.Tensor,
+    target_log_factors: torch.Tensor,
+    safe_logsumexp: bool,
+    ) -> torch.Tensor:
+  """Vectorised version of :func:`_low_rank_message` over many edges."""
+  explicit_local = local_log_potential[:, :-1]
+  residual_local = local_log_potential[:, -1]
+  # Hard clamps may exclude every explicit source state while leaving the
+  # residual state available.  Native logsumexp has undefined (NaN) gradients
+  # on an all--inf slice, even though that slice contributes exactly zero.
+  logsumexp = _safe_logsumexp if safe_logsumexp else torch.logsumexp
+  rank_summary = logsumexp(
+    explicit_local.unsqueeze(-1) + source_log_factors, dim=1)
+  explicit_message = logsumexp(
+    target_log_factors + rank_summary.unsqueeze(1), dim=-1)
+  explicit_message = torch.logaddexp(
+    explicit_message, residual_local.unsqueeze(-1))
+  residual_message = torch.logsumexp(local_log_potential, dim=-1)
+  return torch.cat((explicit_message, residual_message.unsqueeze(-1)), dim=-1)
+
+
+def _build_low_rank_level_schedule(
+    topologies: Sequence[_ForestTopology],
+    edge_index: torch.Tensor,
+    num_nodes: int,
+    edge_count: int,
+    ) -> _LowRankLevelSchedule:
+  """Group independent messages by tree depth across the whole batch."""
+  device = edge_index.device
+  levels: List[List[int]] = []
+  parents: List[List[int]] = []
+  level_edges: List[List[int]] = []
+
+  for batch_index, topology in enumerate(topologies):
+    depths = [0] * num_nodes
+    for node in topology.order:
+      parent = topology.parent[node]
+      depth = 0 if parent < 0 else depths[parent] + 1
+      depths[node] = depth
+      while len(levels) <= depth:
+        levels.append([])
+        parents.append([])
+        level_edges.append([])
+      levels[depth].append(batch_index * num_nodes + node)
+      if depth > 0:
+        parents[depth].append(batch_index * num_nodes + parent)
+        level_edges[depth].append(
+          batch_index * edge_count + topology.parent_edge[node])
+
+  node_ids = tuple(torch.tensor(
+    level, dtype=torch.long, device=device) for level in levels)
+  parent_slots: List[Optional[torch.Tensor]] = [None]
+  edge_ids: List[Optional[torch.Tensor]] = [None]
+  child_is_left: List[Optional[torch.Tensor]] = [None]
+  child_degree_buckets: List[
+    Optional[Tuple[_ChildDegreeBucket, ...]]] = [None]
+  parent_inverse_order: List[Optional[torch.Tensor]] = [None]
+  child_inverse_order: List[Optional[torch.Tensor]] = [None]
+  flat_edges = edge_index.reshape(-1, 2)
+  for depth in range(1, len(levels)):
+    parent_position = {
+      node_id: position for position, node_id in enumerate(levels[depth - 1])
+    }
+    depth_parent_slots = [
+      parent_position[parent] for parent in parents[depth]
+    ]
+    parent_slots.append(torch.tensor(
+      depth_parent_slots, dtype=torch.long, device=device))
+    child_groups: List[List[int]] = [
+      [] for _ in range(len(levels[depth - 1]))
+    ]
+    for child_index, parent_slot in enumerate(depth_parent_slots):
+      child_groups[parent_slot].append(child_index)
+    parents_by_degree: dict[int, List[int]] = {}
+    for parent_slot, group in enumerate(child_groups):
+      parents_by_degree.setdefault(len(group), []).append(parent_slot)
+    depth_buckets = []
+    bucket_parent_order = []
+    bucket_child_order = []
+    for degree in sorted(parents_by_degree):
+      degree_parents = parents_by_degree[degree]
+      bucket_parent_order.extend(degree_parents)
+      degree_children = [child_groups[parent] for parent in degree_parents]
+      for group in degree_children:
+        bucket_child_order.extend(group)
+      depth_buckets.append(_ChildDegreeBucket(
+        parent_slots=torch.tensor(
+          degree_parents, dtype=torch.long, device=device),
+        child_indices=torch.tensor(
+          degree_children, dtype=torch.long, device=device).reshape(
+            len(degree_parents), degree)))
+    inverse_parents = [0] * len(child_groups)
+    for position, parent_slot in enumerate(bucket_parent_order):
+      inverse_parents[parent_slot] = position
+    inverse_children = [0] * len(levels[depth])
+    for position, child_index in enumerate(bucket_child_order):
+      inverse_children[child_index] = position
+    child_degree_buckets.append(tuple(depth_buckets))
+    parent_inverse_order.append(torch.tensor(
+      inverse_parents, dtype=torch.long, device=device))
+    child_inverse_order.append(torch.tensor(
+      inverse_children, dtype=torch.long, device=device))
+    depth_edge_ids = torch.tensor(
+      level_edges[depth], dtype=torch.long, device=device)
+    edge_ids.append(depth_edge_ids)
+    local_node_ids = node_ids[depth].remainder(num_nodes)
+    child_is_left.append(
+      flat_edges.index_select(0, depth_edge_ids)[:, 0] == local_node_ids)
+
+  traversal_order = [node for level in levels for node in level]
+  inverse_order = [0] * (len(topologies) * num_nodes)
+  for position, node_id in enumerate(traversal_order):
+    inverse_order[node_id] = position
+  inverse_node_order = torch.tensor(
+    inverse_order, dtype=torch.long, device=device)
+  root_groups: List[List[int]] = [[] for _ in topologies]
+  for root_position, root_node_id in enumerate(levels[0]):
+    root_groups[root_node_id // num_nodes].append(root_position)
+  max_roots = max(map(len, root_groups))
+  root_sentinel = len(levels[0])
+  roots_by_batch = torch.tensor([
+    roots + [root_sentinel] * (max_roots - len(roots))
+    for roots in root_groups
+  ], dtype=torch.long, device=device)
+  return _LowRankLevelSchedule(
+    node_ids=node_ids,
+    parent_slots=tuple(parent_slots),
+    edge_ids=tuple(edge_ids),
+    child_is_left=tuple(child_is_left),
+    child_degree_buckets=tuple(child_degree_buckets),
+    parent_inverse_order=tuple(parent_inverse_order),
+    child_inverse_order=tuple(child_inverse_order),
+    inverse_node_order=inverse_node_order,
+    roots_by_batch=roots_by_batch)
+
+
+def _oriented_low_rank_factors(
+    flat_left: torch.Tensor,
+    flat_right: torch.Tensor,
+    edge_ids: torch.Tensor,
+    source_is_left: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+  left = flat_left.index_select(0, edge_ids)
+  right = flat_right.index_select(0, edge_ids)
+  orientation = source_is_left[:, None, None]
+  return (
+    torch.where(orientation, left, right),
+    torch.where(orientation, right, left))
+
+
+def _bucketed_group_sum(
+    values: torch.Tensor,
+    buckets: Sequence[_ChildDegreeBucket],
+    parent_inverse_order: torch.Tensor,
+    ) -> torch.Tensor:
+  """Sum ragged child groups with exactly ``O(E)`` gathered values."""
+  bucket_sums = []
+  value_shape = values.shape[1:]
+  for bucket in buckets:
+    parent_count, degree = bucket.child_indices.shape
+    if degree == 0:
+      bucket_sums.append(values.new_zeros(parent_count, *value_shape))
+      continue
+    grouped = values.index_select(
+      0, bucket.child_indices.reshape(-1)).reshape(
+        parent_count, degree, *value_shape)
+    bucket_sums.append(grouped.sum(dim=1))
+  return torch.cat(bucket_sums, dim=0).index_select(
+    0, parent_inverse_order)
+
+
+def _exclusive_sibling_sums(
+    values: torch.Tensor,
+    buckets: Sequence[_ChildDegreeBucket],
+    child_inverse_order: torch.Tensor,
+    ) -> torch.Tensor:
+  """Stably exclude each child using compact degree-bucketed scans."""
+  bucket_exclusive = []
+  value_shape = values.shape[1:]
+  for bucket in buckets:
+    parent_count, degree = bucket.child_indices.shape
+    if degree == 0:
+      continue
+    grouped = values.index_select(
+      0, bucket.child_indices.reshape(-1)).reshape(
+        parent_count, degree, *value_shape)
+    if degree == 1:
+      exclusive = torch.zeros_like(grouped)
+    else:
+      prefix = torch.cumsum(grouped, dim=1)
+      suffix = torch.flip(
+        torch.cumsum(torch.flip(grouped, dims=(1,)), dim=1), dims=(1,))
+      zero_column = torch.zeros_like(grouped[:, :1])
+      exclusive = (
+        torch.cat((zero_column, prefix[:, :-1]), dim=1)
+        + torch.cat((suffix[:, 1:], zero_column), dim=1))
+    bucket_exclusive.append(exclusive.reshape(-1, *value_shape))
+  return torch.cat(bucket_exclusive, dim=0).index_select(
+    0, child_inverse_order)
+
+
+def _center_log_vectors(
+    values: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+  """Remove a state-independent offset from each finite log vector."""
+  offsets = values.max(dim=-1).values
+  return values - offsets.unsqueeze(-1), offsets
+
+
+def _vectorized_low_rank_sum_product(
+    node_log_potentials: torch.Tensor,
+    left_log_factors: torch.Tensor,
+    right_log_factors: torch.Tensor,
+    edge_index: torch.Tensor,
+    topologies: Sequence[_ForestTopology],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+  """Depth-batched exact sum-product for a batch of arbitrary forests.
+
+  Every message at a given depth is independent, so this reduces the CUDA
+  launch count from ``O(B E)`` to ``O(max_depth)``.  Messages are centered and
+  their scalar offsets tracked separately in the upward pass.  Downward
+  cavities use prefix/suffix sibling sums, never ``total - child``; this is
+  invariant to large state-independent message offsets and avoids catastrophic
+  cancellation.  Degree-bucketed reductions store and visit each child once,
+  retaining ``O(E K)`` work space even for unbalanced trees while avoiding
+  nondeterministic atomic ``index_add`` accumulation on CUDA.
+  """
+  batch_size, num_nodes, num_states = node_log_potentials.shape
+  edge_count = left_log_factors.shape[1]
+  schedule = _build_low_rank_level_schedule(
+    topologies, edge_index, num_nodes, edge_count)
+  flat_nodes = node_log_potentials.reshape(-1, num_states)
+  flat_left = left_log_factors.reshape(
+    -1, left_log_factors.shape[-2], left_log_factors.shape[-1])
+  flat_right = right_log_factors.reshape_as(flat_left)
+  depth_count = len(schedule.node_ids)
+  # The guarded reduction is needed only for hard constraints.  Keeping the
+  # common all-finite path on native logsumexp avoids extra kernels per depth.
+  safe_logsumexp = bool(torch.isneginf(node_log_potentials).any().item())
+
+  subtree_locals: List[Optional[torch.Tensor]] = [None] * depth_count
+  subtree_offsets: List[Optional[torch.Tensor]] = [None] * depth_count
+  upward: List[Optional[torch.Tensor]] = [None] * depth_count
+  upward_offsets: List[Optional[torch.Tensor]] = [None] * depth_count
+  for depth in range(depth_count - 1, -1, -1):
+    node_ids = schedule.node_ids[depth]
+    local = flat_nodes.index_select(0, node_ids)
+    local_offsets = torch.zeros(
+      local.shape[0], dtype=local.dtype, device=local.device)
+    if depth + 1 < depth_count:
+      child_messages = upward[depth + 1]
+      child_offsets = upward_offsets[depth + 1]
+      child_buckets = schedule.child_degree_buckets[depth + 1]
+      parent_inverse = schedule.parent_inverse_order[depth + 1]
+      assert (child_messages is not None and child_offsets is not None
+              and child_buckets is not None and parent_inverse is not None)
+      local = local + _bucketed_group_sum(
+        child_messages, child_buckets, parent_inverse)
+      local_offsets = _bucketed_group_sum(
+        child_offsets.unsqueeze(-1), child_buckets,
+        parent_inverse).squeeze(-1)
+    local, centering_offset = _center_log_vectors(local)
+    local_offsets = local_offsets + centering_offset
+    subtree_locals[depth] = local
+    subtree_offsets[depth] = local_offsets
+    if depth > 0:
+      edge_ids = schedule.edge_ids[depth]
+      child_is_left = schedule.child_is_left[depth]
+      assert edge_ids is not None and child_is_left is not None
+      source, target = _oriented_low_rank_factors(
+        flat_left, flat_right, edge_ids, child_is_left)
+      message = _batched_low_rank_message(
+        local, source, target, safe_logsumexp)
+      message, message_offset = _center_log_vectors(message)
+      upward[depth] = message
+      upward_offsets[depth] = local_offsets + message_offset
+
+  downward: List[Optional[torch.Tensor]] = [None] * depth_count
+  assert subtree_locals[0] is not None
+  downward[0] = torch.zeros_like(subtree_locals[0])
+  for depth in range(depth_count - 1):
+    parent_slots = schedule.parent_slots[depth + 1]
+    child_upward = upward[depth + 1]
+    parent_downward = downward[depth]
+    child_buckets = schedule.child_degree_buckets[depth + 1]
+    child_inverse = schedule.child_inverse_order[depth + 1]
+    assert (parent_slots is not None and child_upward is not None
+            and parent_downward is not None and child_buckets is not None
+            and child_inverse is not None)
+    parent_base = (
+      flat_nodes.index_select(0, schedule.node_ids[depth])
+      + parent_downward)
+    sibling_sum = _exclusive_sibling_sums(
+      child_upward, child_buckets, child_inverse)
+    cavity = parent_base.index_select(0, parent_slots) + sibling_sum
+    cavity, _ = _center_log_vectors(cavity)
+    edge_ids = schedule.edge_ids[depth + 1]
+    child_is_left = schedule.child_is_left[depth + 1]
+    assert edge_ids is not None and child_is_left is not None
+    child_source, parent_target = _oriented_low_rank_factors(
+      flat_left, flat_right, edge_ids, child_is_left)
+    child_message = _batched_low_rank_message(
+      cavity, parent_target, child_source, safe_logsumexp)
+    downward[depth + 1], _ = _center_log_vectors(child_message)
+
+  beliefs = []
+  for subtree, parent_message in zip(subtree_locals, downward):
+    assert subtree is not None and parent_message is not None
+    beliefs.append(subtree + parent_message)
+  assert subtree_offsets[0] is not None
+  root_log_partitions = (
+    torch.logsumexp(beliefs[0], dim=-1) + subtree_offsets[0])
+  _require(bool(torch.isfinite(root_log_partitions).all().item()),
+           'constraints leave the forest with no finite-probability state')
+  padded_root_partitions = torch.cat((
+    root_log_partitions,
+    torch.zeros_like(root_log_partitions[:1])))
+  log_partition = padded_root_partitions.index_select(
+    0, schedule.roots_by_batch.reshape(-1)).reshape(
+      batch_size, -1).sum(dim=1)
+
+  level_marginals = [
+    belief - torch.logsumexp(belief, dim=-1, keepdim=True)
+    for belief in beliefs
+  ]
+  node_log_marginals = torch.cat(level_marginals, dim=0).index_select(
+    0, schedule.inverse_node_order).reshape(batch_size, num_nodes, num_states)
+  return log_partition, node_log_marginals
+
+
 def _single_low_rank_sum_product(
     node_log_potentials: torch.Tensor,
     left_log_factors: torch.Tensor,
@@ -757,16 +1129,12 @@ def forest_sum_product_low_rank(
     node_log_potentials, left_factors, right_factors, edge_index,
     edge_mask, state_mask, clamped_states,
     max_components, max_component_size)
-  outputs = [
-    _single_low_rank_sum_product(
-      constrained_nodes[batch_index],
-      left_log_factors[batch_index], right_log_factors[batch_index],
-      edge_index[batch_index], topologies[batch_index])
-    for batch_index in range(node_log_potentials.shape[0])
-  ]
+  log_partition, node_log_marginals = _vectorized_low_rank_sum_product(
+    constrained_nodes, left_log_factors, right_log_factors,
+    edge_index, topologies)
   return LowRankForestMarginals(
-    log_partition=torch.stack([output[0] for output in outputs]),
-    node_log_marginals=torch.stack([output[1] for output in outputs]))
+    log_partition=log_partition,
+    node_log_marginals=node_log_marginals)
 
 
 def _low_rank_pair_rows(
