@@ -44,6 +44,7 @@ class NeuralTrainConfig:
   learning_rate: float = 1e-2
   dependency_weight: float = 1.0
   factor_init_std: float = 0.25
+  factor_warmup_steps: int = 0
   gradient_clip: float = 5.0
   eval_samples: int = 20000
   log_every: int = 100
@@ -145,7 +146,8 @@ class SyntheticForestAdapter(nn.Module):
     self.register_buffer(
       'dependency_adjacency', dependency_adjacency(task), persistent=True)
 
-  def forward(self, contexts: torch.Tensor, timestep: torch.Tensor):
+  def forward(self, contexts: torch.Tensor, timestep: torch.Tensor,
+              factor_mode: Optional[str] = None):
     hidden, unary_logits = self.backbone(contexts)
     active = torch.ones(
       contexts.shape[0], self.task.length,
@@ -157,7 +159,7 @@ class SyntheticForestAdapter(nn.Module):
       kwargs['topology_mode'] = self.spec.topology_mode
     output = self.head(
       hidden, unary_logits, timestep, active,
-      factor_mode=self.spec.factor_mode,
+      factor_mode=factor_mode or self.spec.factor_mode,
       independent_mode=self.spec.independent_mode,
       **kwargs)
     return output, unary_logits, active
@@ -258,6 +260,8 @@ def train_adapter(
   if config.inference_backend not in {'auto', 'dense', 'low_rank'}:
     raise ValueError(
       "inference_backend must be 'auto', 'dense', or 'low_rank'")
+  if config.factor_warmup_steps < 0:
+    raise ValueError('factor_warmup_steps must be nonnegative')
   model = SyntheticForestAdapter(
     task, spec, factor_init_std=config.factor_init_std).to(device)
   optimizer = torch.optim.AdamW(
@@ -267,7 +271,13 @@ def train_adapter(
   for step in range(1, config.steps + 1):
     contexts, tokens, timestep = sample_training_batch(
       task, config.batch_size, generator, device)
-    output, unary_logits, active = model(contexts, timestep)
+    warmup_factor_mode = (
+      'fixed'
+      if (spec.factor_mode == 'dynamic'
+          and step <= config.factor_warmup_steps)
+      else None)
+    output, unary_logits, active = model(
+      contexts, timestep, factor_mode=warmup_factor_mode)
     inference = infer_structured_distribution(
       output, active, backend=config.inference_backend)
     nll = -structured_token_log_probability(

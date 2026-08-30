@@ -24,6 +24,14 @@ class NeuralG1Test(unittest.TestCase):
       SyntheticForestAdapter(
         task, model_specs(task)['contextual_forest'], factor_init_std=0.0)
 
+  def test_factor_warmup_steps_must_be_nonnegative(self):
+    task = ContextSwitchingMatching(vocab_size=3)
+    with self.assertRaisesRegex(ValueError, 'factor_warmup_steps'):
+      train_adapter(
+        task, model_specs(task)['contextual_forest'], seed=1,
+        config=NeuralTrainConfig(steps=1, factor_warmup_steps=-1),
+        device=torch.device('cpu'))
+
   def test_batch_respects_context_matching(self):
     task = ContextSwitchingMatching(vocab_size=4)
     contexts, tokens, _ = sample_training_batch(
