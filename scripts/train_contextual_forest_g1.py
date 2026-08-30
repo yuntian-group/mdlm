@@ -42,6 +42,7 @@ def _args() -> argparse.Namespace:
   parser.add_argument('--batch-size', type=int, default=64)
   parser.add_argument('--learning-rate', type=float, default=1e-2)
   parser.add_argument('--dependency-weight', type=float, default=1.0)
+  parser.add_argument('--factor-init-std', type=float, default=0.25)
   parser.add_argument('--eval-samples', type=int, default=20000)
   parser.add_argument('--log-every', type=int, default=100)
   parser.add_argument(
@@ -74,6 +75,7 @@ def main() -> int:
     batch_size=args.batch_size,
     learning_rate=args.learning_rate,
     dependency_weight=args.dependency_weight,
+    factor_init_std=args.factor_init_std,
     eval_samples=args.eval_samples,
     log_every=args.log_every,
     inference_backend=args.inference_backend)

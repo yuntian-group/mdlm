@@ -5,6 +5,7 @@ import torch
 from synthetic.distributions import ContextSwitchingMatching
 from synthetic.neural_g1 import (
   NeuralTrainConfig,
+  SyntheticForestAdapter,
   dependency_adjacency,
   dependency_loss,
   dependency_targets,
@@ -16,6 +17,12 @@ from structured_objective import structured_token_log_probability
 
 
 class NeuralG1Test(unittest.TestCase):
+
+  def test_factor_initialization_scale_must_be_positive(self):
+    task = ContextSwitchingMatching(vocab_size=3)
+    with self.assertRaisesRegex(ValueError, 'factor_init_std'):
+      SyntheticForestAdapter(
+        task, model_specs(task)['contextual_forest'], factor_init_std=0.0)
 
   def test_batch_respects_context_matching(self):
     task = ContextSwitchingMatching(vocab_size=4)

@@ -43,6 +43,7 @@ class NeuralTrainConfig:
   batch_size: int = 64
   learning_rate: float = 1e-2
   dependency_weight: float = 1.0
+  factor_init_std: float = 0.25
   gradient_clip: float = 5.0
   eval_samples: int = 20000
   log_every: int = 100
@@ -103,8 +104,11 @@ class SyntheticForestAdapter(nn.Module):
   """A coupling head trained on top of frozen, target-independent features."""
 
   def __init__(self, task: ContextSwitchingMatching,
-               spec: NeuralModelSpec):
+               spec: NeuralModelSpec,
+               factor_init_std: float = 0.25):
     super().__init__()
+    if factor_init_std <= 0.0:
+      raise ValueError('factor_init_std must be positive')
     self.task = task
     self.spec = spec
     self.backbone = FrozenContextFeatures(
@@ -131,7 +135,7 @@ class SyntheticForestAdapter(nn.Module):
     inverse_softplus_one = math.log(math.e - 1.0)
     nn.init.normal_(
       self.head.token_factor_embedding.weight,
-      mean=inverse_softplus_one, std=0.25)
+      mean=inverse_softplus_one, std=factor_init_std)
     if spec.fixed_edges is not None:
       self.register_buffer(
         'fixed_edges', torch.tensor(spec.fixed_edges, dtype=torch.long),
@@ -254,7 +258,8 @@ def train_adapter(
   if config.inference_backend not in {'auto', 'dense', 'low_rank'}:
     raise ValueError(
       "inference_backend must be 'auto', 'dense', or 'low_rank'")
-  model = SyntheticForestAdapter(task, spec).to(device)
+  model = SyntheticForestAdapter(
+    task, spec, factor_init_std=config.factor_init_std).to(device)
   optimizer = torch.optim.AdamW(
     model.head.parameters(), lr=config.learning_rate, weight_decay=1e-4)
   history = []
