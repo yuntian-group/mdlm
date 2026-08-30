@@ -152,6 +152,22 @@ class Diffusion(L.LightningModule):
     self.sampling_eps = self.config.training.sampling_eps
     self.time_conditioning = self.config.time_conditioning
     self.neg_infinity = -1000000.0
+    self.crf_reveal = self.config.sampling.get(
+      'crf_reveal', 'independent')
+    self.crf_unigram_aux_enabled = False
+    self.crf_unigram_aux_start_weight = 0.0
+    self.crf_unigram_aux_end_weight = 0.0
+    self.crf_unigram_aux_warmup_steps = 0
+    if self.config.backbone == 'crf_dit':
+      aux_cfg = self.config.model.crf.get('unigram_aux', {})
+      self.crf_unigram_aux_enabled = bool(
+        aux_cfg.get('enabled', False))
+      self.crf_unigram_aux_start_weight = float(
+        aux_cfg.get('start_weight', 0.0))
+      self.crf_unigram_aux_end_weight = float(
+        aux_cfg.get('end_weight', 0.1))
+      self.crf_unigram_aux_warmup_steps = int(
+        aux_cfg.get('warmup_steps', 10000))
     self.fast_forward_epochs = None
     self.fast_forward_batches = None
     self._validate_configuration()
@@ -173,6 +189,12 @@ class Diffusion(L.LightningModule):
         'CRF backbone only supports subs parameterization'
       assert self.T == 0, \
         'CRF backbone only supports continuous time (T=0)'
+      assert self.crf_reveal in {
+        'independent', 'sequential', 'gated',
+        'gated_stochastic'}, \
+        f'Unknown CRF reveal mode: {self.crf_reveal}'
+      assert self.crf_unigram_aux_warmup_steps >= 0, \
+        'CRF unigram auxiliary warmup must be non-negative'
 
   def on_load_checkpoint(self, checkpoint):
     if self.ema:
@@ -403,6 +425,18 @@ class Diffusion(L.LightningModule):
              on_step=True,
              on_epoch=False,
              sync_dist=True)
+    if (self.config.backbone == 'crf_dit'
+        and self.crf_unigram_aux_enabled):
+      self.log(name='trainer/crf_unigram_aux_nll',
+               value=self._last_crf_unigram_aux_nll,
+               on_step=True,
+               on_epoch=False,
+               sync_dist=True)
+      self.log(name='trainer/crf_unigram_aux_weight',
+               value=self._last_crf_unigram_aux_weight,
+               on_step=True,
+               on_epoch=False,
+               sync_dist=True)
     return loss
 
   def on_validation_epoch_start(self):
@@ -598,6 +632,43 @@ class Diffusion(L.LightningModule):
     return self.mask_index * torch.ones(
       * batch_dims, dtype=torch.int64)
 
+  def _crf_unigram_aux_weight(self):
+    """Current scheduled weight for the CRF pruning-head objective."""
+    trainer = getattr(self, '_trainer', None)
+    step = int(getattr(trainer, 'global_step', 0))
+    return crf_utils.linear_warmup_weight(
+      step=step,
+      start_weight=self.crf_unigram_aux_start_weight,
+      end_weight=self.crf_unigram_aux_end_weight,
+      warmup_steps=self.crf_unigram_aux_warmup_steps)
+
+  def _crf_gated_update(self, x, p_x0, move_chance_t,
+                        move_chance_s):
+    """Reveal the most-confident masked sites at the DDPM step count."""
+    if self.crf_reveal == 'sequential':
+      reveal = crf_utils.sequential_reveal_mask(
+        x=x,
+        probabilities=p_x0,
+        mask_index=self.mask_index)
+    else:
+      reveal = crf_utils.confident_reveal_mask(
+        x=x,
+        probabilities=p_x0,
+        mask_index=self.mask_index,
+        move_chance_t=move_chance_t,
+        move_chance_s=move_chance_s)
+
+    token_probs = p_x0.clone()
+    token_probs[..., self.mask_index] = 0
+    if self.crf_reveal in {'sequential', 'gated'}:
+      proposed_tokens = token_probs.argmax(dim=-1)
+    elif self.crf_reveal == 'gated_stochastic':
+      proposed_tokens = _sample_categorical(token_probs)
+    else:
+      raise ValueError(
+        f'_crf_gated_update called for mode {self.crf_reveal}')
+    return torch.where(reveal, proposed_tokens, x)
+
   def _ddpm_caching_update(self, x, t, dt, p_x0=None):
     assert self.config.noise.type == 'loglinear'
     sigma_t, _ = self.noise(t)
@@ -615,6 +686,11 @@ class Diffusion(L.LightningModule):
         p_x0 = self.forward(x, sigma_t).exp()
     
     assert move_chance_t.ndim == p_x0.ndim
+    if (self.config.backbone == 'crf_dit'
+        and self.crf_reveal != 'independent'):
+      return p_x0, self._crf_gated_update(
+        x, p_x0, move_chance_t, move_chance_s)
+
     q_xs = p_x0 * (move_chance_t - move_chance_s)
     q_xs[:, :, self.mask_index] = move_chance_s[:, :, 0]
     _x = _sample_categorical(q_xs)
@@ -645,6 +721,11 @@ class Diffusion(L.LightningModule):
       p_x0 = log_p_x0.exp()
 
     assert move_chance_t.ndim == p_x0.ndim
+    if (self.config.backbone == 'crf_dit'
+        and self.crf_reveal != 'independent'):
+      return self._crf_gated_update(
+        x, p_x0, move_chance_t, move_chance_s)
+
     q_xs = p_x0 * (move_chance_t - move_chance_s)
     q_xs[:, :, self.mask_index] = move_chance_s[:, :, 0]
     _x = _sample_categorical(q_xs)
@@ -688,6 +769,12 @@ class Diffusion(L.LightningModule):
         unmasked.unsqueeze(-1), det_logits, unigram_logits)
 
     _, top_k_indices = unigram_logits.topk(K, dim=-1)
+    # At observed positions top-k still contains K-1 arbitrary entries with
+    # very negative pruning scores. Mark them invalid so they cannot carry
+    # forward/backward probability into neighboring positions.
+    candidate_valid = (
+      (~unmasked).unsqueeze(-1)
+      | top_k_indices.eq(x.unsqueeze(-1)))
 
     # --- Position 0: emission from start embedding ---
     pos0_dummy = torch.zeros(
@@ -712,23 +799,37 @@ class Diffusion(L.LightningModule):
       pos_ids = torch.arange(
         1, seq_len, device=device).repeat_interleave(K)
 
-      with torch.cuda.amp.autocast(dtype=torch.bfloat16):
-        rest_logits = self.backbone.crf_decoder.forward_batched(
-          prev_flat, pos_ids, H)
-      rest_logits = rest_logits.float()
-      rest_logits = rest_logits.view(
-        batch, seq_len - 1, K, -1)
-      rest_logits[..., self.mask_index] = self.neg_infinity
-      rest_log_probs = F.log_softmax(rest_logits, dim=-1)
-
       curr_topk = top_k_indices[:, 1:, :]
-      curr_topk_expanded = curr_topk.unsqueeze(2).expand(
-        -1, -1, K, -1)
-      transitions = torch.gather(
-        rest_log_probs, 3, curr_topk_expanded)
+      curr_flat = curr_topk.unsqueeze(2).expand(
+        -1, -1, K, -1).reshape(
+          batch, (seq_len - 1) * K, K)
+
+      def decode_query_chunk(start, end):
+        with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+          return self.backbone.crf_decoder.forward_batched(
+            prev_flat[:, start:end], pos_ids[start:end], H)
+
+      # A dense [B, (N-1)K, V] tensor is many GB at the intended
+      # N=1024, K=64, V~50k scale. Query chunking retains the exact
+      # full-vocabulary log normalizer while bounding peak decoder output.
+      selected_log_probs = crf_utils.chunked_normalized_gather(
+        logits_fn=decode_query_chunk,
+        gather_indices=curr_flat,
+        query_chunk_size=(
+          self.backbone.inference_query_chunk_size),
+        excluded_index=self.mask_index,
+        neg_infinity=self.neg_infinity)
+      transitions = selected_log_probs.view(
+        batch, seq_len - 1, K, K)
     else:
       transitions = torch.zeros(
         batch, 0, K, K, device=device)
+
+    emission_0, transitions = crf_utils.constrain_chain_potentials(
+      emission_0=emission_0,
+      transitions=transitions,
+      candidate_valid=candidate_valid,
+      neg_infinity=self.neg_infinity)
 
     # --- Forward-backward ---
     marginals_topk = crf_utils.forward_backward(
@@ -962,7 +1063,7 @@ class Diffusion(L.LightningModule):
                           dim=-1,
                           index=x0[:, :, None]).squeeze(-1)
 
-  def _forward_pass_diffusion(self, x0):
+  def _forward_pass_diffusion(self, x0, return_components=False):
     t = self._sample_t(x0.shape[0], x0.device)
     if self.T > 0:
       t = (t * self.T).to(torch.int)
@@ -983,10 +1084,16 @@ class Diffusion(L.LightningModule):
 
     xt = self.q_xt(x0, move_chance)
 
+    unigram_logits = None
     if self.config.backbone == 'crf_dit':
       sigma_1d = self._process_sigma(unet_conditioning)
-      crf_logits = self.backbone.forward_crf_train(
-        xt, sigma_1d, x0)
+      crf_outputs = self.backbone.forward_crf_train(
+        xt, sigma_1d, x0,
+        return_unigram_logits=self.crf_unigram_aux_enabled)
+      if self.crf_unigram_aux_enabled:
+        crf_logits, unigram_logits = crf_outputs
+      else:
+        crf_logits = crf_outputs
       model_output = self._subs_parameterization(
         logits=crf_logits, xt=xt)
     else:
@@ -1013,11 +1120,31 @@ class Diffusion(L.LightningModule):
       index=x0[:, :, None]).squeeze(-1)
     
     if self.change_of_variables or self.importance_sampling:
-      return log_p_theta * torch.log1p(
+      constant = torch.log1p(
         - torch.exp(- self.noise.sigma_min))
-    
-    return - log_p_theta * (
-      dsigma / torch.expm1(sigma))[:, None]
+      primary_loss = log_p_theta * constant
+      aux_token_weight = -constant
+    else:
+      aux_token_weight = dsigma / torch.expm1(sigma)
+      primary_loss = -log_p_theta * aux_token_weight[:, None]
+
+    unigram_aux_loss = torch.zeros_like(primary_loss)
+    unigram_aux_weight = 0.0
+    if unigram_logits is not None:
+      unigram_aux_loss = crf_utils.unigram_denoising_loss(
+        logits=unigram_logits,
+        xt=xt,
+        x0=x0,
+        mask_index=self.mask_index,
+        token_weight=aux_token_weight)
+      unigram_aux_weight = self._crf_unigram_aux_weight()
+
+    objective_loss = (
+      primary_loss + unigram_aux_weight * unigram_aux_loss)
+    if return_components:
+      return (objective_loss, primary_loss,
+              unigram_aux_loss, unigram_aux_weight)
+    return objective_loss
 
   def _loss(self, x0, attention_mask):
     (input_tokens, output_tokens,
@@ -1026,18 +1153,31 @@ class Diffusion(L.LightningModule):
 
     if self.parameterization == 'ar':
       logprobs = self.backbone(input_tokens, None)
-      loss = - logprobs.gather(
+      objective_losses = - logprobs.gather(
         -1, output_tokens[:, :, None])[:, :, 0]
+      metric_losses = objective_losses
     else:
-      loss = self._forward_pass_diffusion(input_tokens)
-    
-    nlls = loss * attention_mask
+      if self.config.backbone == 'crf_dit':
+        (objective_losses, metric_losses,
+         unigram_aux_losses,
+         unigram_aux_weight) = self._forward_pass_diffusion(
+           input_tokens, return_components=True)
+      else:
+        objective_losses = self._forward_pass_diffusion(input_tokens)
+        metric_losses = objective_losses
+
+    nlls = metric_losses * attention_mask
+    objective_nlls = objective_losses * attention_mask
     count = attention_mask.sum()
 
-    batch_nll = nlls.sum()
-    token_nll = batch_nll / count
+    token_objective = objective_nlls.sum() / count
+    if (self.config.backbone == 'crf_dit'
+        and self.crf_unigram_aux_enabled):
+      self._last_crf_unigram_aux_nll = (
+        unigram_aux_losses.detach() * attention_mask).sum() / count
+      self._last_crf_unigram_aux_weight = unigram_aux_weight
 
-    return Loss(loss=token_nll,
+    return Loss(loss=token_objective,
                 nlls=nlls,
                 token_mask=attention_mask)
 

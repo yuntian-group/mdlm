@@ -215,6 +215,8 @@ class CRFDiT(nn.Module):
       max_seq_len=config.model.length,
       dropout=config.model.dropout)
     self.top_k = crf_cfg.top_k
+    self.inference_query_chunk_size = int(
+      crf_cfg.get('inference_query_chunk_size', 0))
 
   def encode(self, indices, sigma):
     """Encode noisy input x_t into hidden states.
@@ -242,17 +244,23 @@ class CRFDiT(nn.Module):
     with torch.cuda.amp.autocast(dtype=torch.bfloat16):
       return self.output_layer(H, c)
 
-  def forward_crf_train(self, xt, sigma, x0):
+  def forward_crf_train(self, xt, sigma, x0,
+                        return_unigram_logits=False):
     """Teacher-forced CRF training forward pass.
 
     Args:
       xt: (batch, seq_len) noisy token indices
       sigma: (batch,) noise level (1-D)
       x0: (batch, seq_len) clean token indices
+      return_unigram_logits: also return the encoder's unigram head. This is
+          used by the optional auxiliary denoising objective that trains the
+          same head later used to choose the CRF's top-K candidates.
     Returns:
-      logits: (batch, seq_len, vocab_size) CRF transition
-          logits. logits[b,i,v] corresponds to unnormalised
+      logits: (batch, seq_len, vocab_size) CRF transition logits.
+          logits[b,i,v] corresponds to unnormalised
           log P(x_{0,i}=v | x_{0,i-1}=x0[b,i-1], x_t).
+      If return_unigram_logits=True, returns
+          (logits, unigram_logits) with matching shapes.
     """
     H, c = self.encode(xt, sigma)
 
@@ -269,4 +277,9 @@ class CRFDiT(nn.Module):
       logits = self.crf_decoder(
         prev_tokens, positions, H, use_start_for_first=True)
 
+      if return_unigram_logits:
+        unigram_logits = self.output_layer(H, c)
+
+    if return_unigram_logits:
+      return logits, unigram_logits
     return logits

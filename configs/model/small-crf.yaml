@@ -14,3 +14,9 @@ crf:
   decoder_heads: 8
   decoder_dim: 512
   top_k: 64
+  inference_query_chunk_size: 64
+  unigram_aux:
+    enabled: true
+    start_weight: 0.0
+    end_weight: 0.1
+    warmup_steps: 10000

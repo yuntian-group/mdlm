@@ -28,6 +28,11 @@ loader:
 
 sampling:
   predictor: ddpm_cache  # analytic, ddpm, ddpm_cache
+  # CRF-only reveal rule. `independent` reproduces the original sampler;
+  # `sequential` reveals one most-confident site per example per step;
+  # `gated` reveals the schedule's most-confident sites with argmax tokens;
+  # `gated_stochastic` keeps the gate but samples their token identities.
+  crf_reveal: gated
   steps: 128
   noise_removal: True
   # TODO(yair): @subham, why aren't these params under `eval`?
