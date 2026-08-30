@@ -6,6 +6,18 @@ readonly DATA_DEVICE="/dev/disk/by-id/google-${DATA_DISK_NAME}"
 readonly MOUNT_POINT='/mnt/contextual-forest'
 readonly HARD_STOP_UNIT='contextual-forest-hard-stop'
 
+# Install the compute guard before any disk work.  This still shuts the guest
+# down if the dedicated disk is missing or mounting fails during provisioning.
+# The local Cloud SDK predates maxRunDuration, and the project-level $10
+# billing hard-stop remains a second independent guard.
+systemctl stop "${HARD_STOP_UNIT}.timer" 2>/dev/null || true
+systemctl reset-failed "${HARD_STOP_UNIT}.service" 2>/dev/null || true
+systemd-run \
+  --unit="${HARD_STOP_UNIT}" \
+  --on-active=4h \
+  --timer-property=AccuracySec=1min \
+  /usr/sbin/shutdown -h now
+
 mkdir -p "${MOUNT_POINT}"
 for _ in $(seq 1 60); do
   if [[ -b "${DATA_DEVICE}" ]]; then
@@ -33,17 +45,6 @@ if ! grep -q "UUID=${filesystem_uuid}" /etc/fstab; then
 fi
 mountpoint -q "${MOUNT_POINT}" || mount "${MOUNT_POINT}"
 chmod 0777 "${MOUNT_POINT}"
-
-# The local Cloud SDK predates maxRunDuration.  Enforce the same four-hour
-# boundary inside the guest on every boot; the project-level $10 billing
-# hard-stop remains a second independent guard.
-systemctl stop "${HARD_STOP_UNIT}.timer" 2>/dev/null || true
-systemctl reset-failed "${HARD_STOP_UNIT}.service" 2>/dev/null || true
-systemd-run \
-  --unit="${HARD_STOP_UNIT}" \
-  --on-active=4h \
-  --timer-property=AccuracySec=1min \
-  /usr/sbin/shutdown -h now
 
 date --iso-8601=seconds > "${MOUNT_POINT}/last-boot.txt"
 nvidia-smi > "${MOUNT_POINT}/nvidia-smi-at-boot.txt" 2>&1 || true
