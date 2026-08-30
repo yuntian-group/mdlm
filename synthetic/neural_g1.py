@@ -5,7 +5,7 @@ from __future__ import annotations
 import dataclasses
 import math
 import time
-from typing import Iterable, Optional, Sequence
+from typing import Optional, Sequence
 
 import numpy as np
 import torch
@@ -28,6 +28,16 @@ from synthetic.distributions import ContextSwitchingMatching, Edge
 from synthetic.g1_benchmark import paired_bootstrap_ci
 
 
+# This is the protocol frozen after development on seeds 1--8 and used for
+# the reported held-out result.  Keep the CLI, named config, and dataclass
+# defaults aligned with these constants.
+REPORTED_HELDOUT_SEEDS = (9, 10, 11, 12, 13)
+REPORTED_TRAINING_STEPS = 900
+REPORTED_FACTOR_WARMUP_STEPS = 300
+REPORTED_FACTOR_INIT_STD = 0.25
+REPORTED_FACTOR_INIT_SEED = 1729
+
+
 @dataclasses.dataclass(frozen=True)
 class NeuralModelSpec:
   name: str
@@ -39,13 +49,13 @@ class NeuralModelSpec:
 
 @dataclasses.dataclass(frozen=True)
 class NeuralTrainConfig:
-  steps: int = 600
+  steps: int = REPORTED_TRAINING_STEPS
   batch_size: int = 64
   learning_rate: float = 1e-2
   dependency_weight: float = 1.0
-  factor_init_std: float = 0.25
-  factor_init_seed: int = 1729
-  factor_warmup_steps: int = 0
+  factor_init_std: float = REPORTED_FACTOR_INIT_STD
+  factor_init_seed: int = REPORTED_FACTOR_INIT_SEED
+  factor_warmup_steps: int = REPORTED_FACTOR_WARMUP_STEPS
   gradient_clip: float = 5.0
   eval_samples: int = 20000
   log_every: int = 100
@@ -232,7 +242,6 @@ def dependency_targets(
     raise ValueError(
       f'adjacency must be boolean with shape {expected}')
   adjacency = adjacency.to(contexts.device)
-  batch = torch.arange(contexts.shape[0], device=contexts.device)[:, None]
   return adjacency[
     contexts[:, None], edge_index[:, :, 0], edge_index[:, :, 1]]
 

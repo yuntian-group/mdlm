@@ -1,0 +1,29 @@
+{
+  "alpha": 0.25,
+  "artifact_sanitization": "The absolute output path and local hostname were removed for release; scientific fields are unchanged.",
+  "benchmark": "g1_table_fit_structural_sanity",
+  "command": [
+    "scripts/run_contextual_forest_g1.py",
+    "--output-dir",
+    "<output-dir>"
+  ],
+  "end_time_utc": "2026-08-30T07:42:15.990654+00:00",
+  "eval_samples_per_model": 20000,
+  "file_sha256": {
+    "gate.json": "1af6af22d99b1f2d2ba7cc19a69d0bfbf27bc6a568ff16405d43d2e9af008679",
+    "records.csv": "6cc079f3269d1f1ae3261c08094498ca0fa3ab3ebbe612b7eee59af063d8511f3",
+    "records.json": "975bc3cc8ef69d7a94c4889a0416c60b1727ef6085d45232c3abb2d119daa1f3"
+  },
+  "git_sha": "ea58d8e1b6eed02f7fac176e5a42915604115e62",
+  "numpy": "2.3.5",
+  "platform": "macOS-26.5.2-arm64-arm-64bit",
+  "python": "3.12.13",
+  "scientific_scope": "finite-data maximum-likelihood forest projection; not neural-head training evidence",
+  "seeds": [
+    1,
+    2,
+    3
+  ],
+  "start_time_utc": "2026-08-30T07:42:13.860076+00:00",
+  "train_samples_per_context": 4096
+}

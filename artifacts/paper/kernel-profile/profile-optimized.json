@@ -1,0 +1,76 @@
+{
+  "agreement": {
+    "max_log_partition_error": 0.0,
+    "max_node_marginal_error": 2.7755575615628914e-16
+  },
+  "benchmark": "forest_inference_profile",
+  "cuda": "12.1",
+  "device": "cuda",
+  "git_sha": "9a7129fafe08021ff38e46642d8f656481aac4a9",
+  "gpu": "NVIDIA L4",
+  "python": "3.10.12",
+  "rows": [
+    {
+      "active_edges": 248,
+      "component_size": 32,
+      "dense_ms": 162.75015950000125,
+      "dense_over_low_rank_time": 2.6744001012185263,
+      "dense_peak_bytes": 14574592,
+      "k": 32,
+      "length": 256,
+      "low_rank_ms": 60.85482849998698,
+      "low_rank_peak_bytes": 2718720,
+      "rank": 16
+    },
+    {
+      "active_edges": 248,
+      "component_size": 32,
+      "dense_ms": 161.02427450000505,
+      "dense_over_low_rank_time": 2.6300425132747383,
+      "dense_peak_bytes": 28584960,
+      "k": 64,
+      "length": 256,
+      "low_rank_ms": 61.22497020000992,
+      "low_rank_peak_bytes": 13699072,
+      "rank": 16
+    },
+    {
+      "active_edges": 496,
+      "component_size": 32,
+      "dense_ms": 325.98797260002357,
+      "dense_over_low_rank_time": 5.268980349336808,
+      "dense_peak_bytes": 48722944,
+      "k": 64,
+      "length": 512,
+      "low_rank_ms": 61.869270900024276,
+      "low_rank_peak_bytes": 18647040,
+      "rank": 16
+    },
+    {
+      "active_edges": 992,
+      "component_size": 32,
+      "dense_ms": 643.527074900021,
+      "dense_over_low_rank_time": 10.001333484562906,
+      "dense_peak_bytes": 88999936,
+      "k": 64,
+      "length": 1024,
+      "low_rank_ms": 64.34412729995529,
+      "low_rank_peak_bytes": 28544000,
+      "rank": 16
+    },
+    {
+      "active_edges": 992,
+      "component_size": 32,
+      "dense_ms": 649.6329486000377,
+      "dense_over_low_rank_time": 10.066337605960587,
+      "dense_peak_bytes": 302999040,
+      "k": 128,
+      "length": 1024,
+      "low_rank_ms": 64.53518389998862,
+      "low_rank_peak_bytes": 48278528,
+      "rank": 16
+    }
+  ],
+  "timestamp_utc": "2026-08-30T09:27:54.844774+00:00",
+  "torch": "2.5.1+cu121"
+}

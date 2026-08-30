@@ -19,6 +19,7 @@ import dataloader
 import models
 import noise_schedule
 import structured_objective
+import structured_pairing
 import structured_training
 import utils
 
@@ -177,6 +178,7 @@ class Diffusion(L.LightningModule):
       'structured_fixed_edge_index', None, persistent=True)
     self._last_structured_metrics = {}
     self._last_structured_metric_updates = {}
+    self._structured_validation_pairing_digest = None
     self._initialize_structured_decoder()
 
     self.T = self.config.T
@@ -709,7 +711,8 @@ class Diffusion(L.LightningModule):
       attention_mask = batch['attention_mask']
     else:
       attention_mask = None
-    losses = self._loss(batch['input_ids'], attention_mask)
+    losses = self._loss(
+      batch['input_ids'], attention_mask, phase=prefix)
     loss = losses.loss
 
     if prefix not in {'train', 'val', 'test'}:
@@ -788,6 +791,9 @@ class Diffusion(L.LightningModule):
     if self.structured_head is not None:
       self.structured_head.eval()
     self.noise.eval()
+    if self.structured_enabled:
+      self._structured_validation_pairing_digest = (
+        structured_pairing.StructuredValidationPairingDigest())
     assert self.valid_metrics.nll.mean_value == 0
     assert self.valid_metrics.nll.weight == 0
 
@@ -795,6 +801,26 @@ class Diffusion(L.LightningModule):
     return self._compute_loss(batch, prefix='val')
 
   def on_validation_epoch_end(self):
+    if (self.structured_enabled
+        and self._structured_validation_pairing_digest is not None):
+      local_record = (
+        self._structured_validation_pairing_digest.rank_record(
+          int(self.global_rank)))
+      if (torch.distributed.is_available()
+          and torch.distributed.is_initialized()):
+        rank_records = [None] * torch.distributed.get_world_size()
+        torch.distributed.all_gather_object(rank_records, local_record)
+      else:
+        rank_records = [local_record]
+      payload = structured_pairing.combine_rank_records(
+        rank_records,
+        epoch=int(self.current_epoch),
+        step=int(self.global_step),
+        sanity_checking=bool(self.trainer.sanity_checking))
+      if self.trainer.is_global_zero:
+        structured_pairing.write_pairing_digest(
+          str(self.config.checkpointing.save_dir), payload)
+      self._structured_validation_pairing_digest = None
     if ((self.config.eval.compute_perplexity_on_sanity
          or not self.trainer.sanity_checking)
          and self.config.eval.generate_samples
@@ -1530,7 +1556,8 @@ class Diffusion(L.LightningModule):
       fixed_edge_mask=fixed_edge_mask)
     return output, unary_logits
 
-  def _forward_pass_structured(self, x0, attention_mask):
+  def _forward_pass_structured(
+      self, x0, attention_mask, *, record_pairing=False):
     """Train the forest adapter on a real forward-corrupted text batch.
 
     The returned objective is conditional denoising NLL per masked token plus
@@ -1553,6 +1580,16 @@ class Diffusion(L.LightningModule):
     else:
       attention_mask = attention_mask.bool()
     active_mask = xt.eq(self.mask_index) & attention_mask
+    if record_pairing:
+      if self._structured_validation_pairing_digest is None:
+        raise RuntimeError(
+          'structured validation pairing digest was not initialized')
+      self._structured_validation_pairing_digest.update(
+        clean_input_ids=x0,
+        attention_mask=attention_mask,
+        sampled_times=t,
+        corrupted_input_ids=xt,
+        active_mask=active_mask)
 
     output, unary_logits = self._structured_head_output(
       tokens=xt,
@@ -1776,7 +1813,7 @@ class Diffusion(L.LightningModule):
               unigram_aux_loss, unigram_aux_weight)
     return objective_loss
 
-  def _loss(self, x0, attention_mask):
+  def _loss(self, x0, attention_mask, phase=None):
     (input_tokens, output_tokens,
      attention_mask) = self._maybe_sub_sample(
        x0, attention_mask)
@@ -1784,7 +1821,8 @@ class Diffusion(L.LightningModule):
     if self.structured_enabled:
       (structured_loss, metric_losses,
        structured_token_mask) = self._forward_pass_structured(
-         input_tokens, attention_mask)
+         input_tokens, attention_mask,
+         record_pairing=(phase == 'val'))
       return Loss(
         loss=structured_loss,
         nlls=metric_losses,

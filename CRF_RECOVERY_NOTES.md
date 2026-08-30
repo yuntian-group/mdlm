@@ -19,9 +19,10 @@ The recovery patch keeps the model defined in `diffusion_lm/main.tex`:
   uses the exact full-vocabulary log-sum-exp, so this changes peak memory but
   not the locally normalised CRF distribution.
 
-The `0 -> 0.1` schedule reported by Nina is represented explicitly as a linear
-optimizer-step warmup. The endpoint and 10,000-step duration are configurable;
-10,000 is a recovery default, not a value established by the surviving notes.
+The collaborator-reported `0 -> 0.1` schedule is represented explicitly as a
+linear optimizer-step warmup. The endpoint and 10,000-step duration are
+configurable; 10,000 is a recovery default, not a value established by the
+surviving notes.
 
 ## Attention runtime fallback
 
@@ -55,7 +56,7 @@ importable but kernel-incompatible wheel installed is not sufficient.
   `N=1024`, `K=64`, and `V=50k`, this reduces that allocation from roughly
   6.5 GB (bf16) / 13 GB (fp32) to roughly 6.4 MB / 12.8 MB at batch 1.
 
-## Joint-chain sampling (Nina Method 2) analysis
+## Joint-chain sampling (recovery Method 2) analysis
 
 Independently sampling position marginals discards first-order correlations.
 A faithful joint-chain ablation can use the already-computed pruned lattice:
@@ -76,7 +77,7 @@ probabilities before it should be used for a long run.
 
 ## Deliberately excluded from this patch
 
-- Nina's imperfect-generation second training pass. It is less certain and
+- The discussed imperfect-generation second training pass. It is less certain and
   changes the training distribution; test probabilities `0, 0.1, 0.25, 0.5`
   only after the two recovery fixes pass a short overfit/sampling gate.
 - Full/global CRF normalisation, scratch-vs-checkpoint initialisation, and
@@ -88,7 +89,7 @@ Run the same seed/data slice/checkpoint budget for:
 
 1. Original control: auxiliary off, `independent` reveal.
 2. Head-only fix: auxiliary `0 -> 0.1`, `independent` reveal.
-3. Nina-parity candidate: auxiliary `0 -> 0.1`, `sequential` reveal, with
+3. Recovery-parity candidate: auxiliary `0 -> 0.1`, `sequential` reveal, with
    `sampling.steps >= model.length`.
 4. Parallel candidate: auxiliary `0 -> 0.1`, `gated` reveal.
 
@@ -103,8 +104,8 @@ single-factor ablation; then test imperfect-generation probabilities.
 
 ## Recovery validation (2026-08-29)
 
-The bounded recovery gate ran on a Spot `g4-standard-48` VM with one NVIDIA RTX
-PRO 6000 Blackwell GPU. The 32-example, 300-step synthetic overfit reduced the
+The bounded recovery gate ran on one NVIDIA RTX PRO 6000 Blackwell GPU. The
+32-example, 300-step synthetic overfit reduced the
 fixed-mask CRF NLL from `2.83757` to `0.15165`, raised top-K target recall from
 `0.05725` to `0.55344`, and produced nonzero final gradients in both the
 pruning head (`0.25745`) and transition decoder (`0.66706`).
@@ -123,6 +124,5 @@ the full quality claim; the four-way experiment matrix above remains required
 before a full OpenWebText run.
 
 Artifacts are stored in `../results/` as the training JSON, inference JSON,
-and 3.1 MB checkpoint. The VM `crf-mdlm-debug-g4-20260829` is stopped. Its
-non-auto-delete 200 GB disk `crf-mdlm-debug-data-20260829` remains attached so
-the environment and server-side artifacts can be resumed without rebuilding.
+and 3.1 MB checkpoint. The compute worker was stopped after the gate; its
+dedicated persistent experiment volume was retained for reproducibility.

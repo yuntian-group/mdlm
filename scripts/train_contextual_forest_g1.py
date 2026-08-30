@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import datetime as dt
 import json
 from pathlib import Path
@@ -19,6 +20,11 @@ import torch  # noqa: E402
 from synthetic.distributions import ContextSwitchingMatching  # noqa: E402
 from synthetic.neural_g1 import (  # noqa: E402
   NeuralTrainConfig,
+  REPORTED_FACTOR_INIT_SEED,
+  REPORTED_FACTOR_INIT_STD,
+  REPORTED_FACTOR_WARMUP_STEPS,
+  REPORTED_HELDOUT_SEEDS,
+  REPORTED_TRAINING_STEPS,
   evaluate_adapter,
   evaluate_neural_gate,
   model_specs,
@@ -26,25 +32,94 @@ from synthetic.neural_g1 import (  # noqa: E402
 )
 
 
-def _args() -> argparse.Namespace:
+REPORTED_MODELS = (
+  'parameter_matched_independent',
+  'natural_chain',
+  'static_forest',
+  'fixed_topology_dynamic_factors',
+  'dynamic_topology_fixed_factors',
+  'contextual_forest',
+)
+
+
+def _validate_resumed_job(
+    checkpoint_path: Path,
+    existing_rows: list[dict[str, object]],
+    history: object,
+    *,
+    seed: int,
+    model_name: str,
+    expected_spec: object,
+    expected_config: NeuralTrainConfig,
+    num_contexts: int) -> None:
+  """Reject a nominally complete resume job unless its provenance matches."""
+  try:
+    checkpoint = torch.load(
+      checkpoint_path, map_location='cpu', weights_only=False)
+  except Exception as error:
+    raise ValueError(
+      f'cannot validate resumed checkpoint {checkpoint_path}') from error
+  if not isinstance(checkpoint, dict):
+    raise ValueError(f'invalid resumed checkpoint payload: {checkpoint_path}')
+  if int(checkpoint.get('seed', -1)) != seed:
+    raise ValueError(
+      f'resumed checkpoint seed mismatch for {model_name}/seed-{seed}')
+  if checkpoint.get('model_spec') != expected_spec:
+    raise ValueError(
+      f'resumed checkpoint model spec mismatch for {model_name}/seed-{seed}')
+  if checkpoint.get('train_config') != expected_config:
+    raise ValueError(
+      f'resumed checkpoint train config mismatch for '
+      f'{model_name}/seed-{seed}')
+  state_dict = checkpoint.get('model_state_dict')
+  if not isinstance(state_dict, dict) or not state_dict:
+    raise ValueError(
+      f'resumed checkpoint has no model state for {model_name}/seed-{seed}')
+
+  contexts = {int(row['context']) for row in existing_rows}
+  if contexts != set(range(num_contexts)):
+    raise ValueError(
+      f'resumed records have wrong contexts for {model_name}/seed-{seed}')
+  if any(int(row['seed']) != seed or row['model'] != model_name
+         for row in existing_rows):
+    raise ValueError(
+      f'resumed records have wrong identity for {model_name}/seed-{seed}')
+  if not isinstance(history, list) or not history:
+    raise ValueError(
+      f'resumed history is empty for {model_name}/seed-{seed}')
+  try:
+    final_step = int(history[-1]['step'])
+  except (KeyError, TypeError, ValueError) as error:
+    raise ValueError(
+      f'resumed history has no valid final step for '
+      f'{model_name}/seed-{seed}') from error
+  if final_step != expected_config.steps:
+    raise ValueError(
+      f'resumed history final step mismatch for {model_name}/seed-{seed}: '
+      f'{final_step} != {expected_config.steps}')
+
+
+def _args(argv=None) -> argparse.Namespace:
   parser = argparse.ArgumentParser()
   parser.add_argument('--output-dir', type=Path, required=True)
   parser.add_argument(
     '--resume', action='store_true',
     help=('resume a partial run in output-dir, skipping only jobs with a '
           'checkpoint, history, and all context-level records'))
-  parser.add_argument('--seeds', type=int, nargs='+', default=[1])
-  parser.add_argument('--models', nargs='+', default=[
-    'parameter_matched_independent', 'natural_chain', 'static_forest',
-    'fixed_topology_dynamic_factors',
-    'dynamic_topology_fixed_factors', 'contextual_forest'])
-  parser.add_argument('--steps', type=int, default=600)
+  parser.add_argument(
+    '--seeds', type=int, nargs='+', default=list(REPORTED_HELDOUT_SEEDS))
+  parser.add_argument('--models', nargs='+', default=list(REPORTED_MODELS))
+  parser.add_argument('--steps', type=int, default=REPORTED_TRAINING_STEPS)
   parser.add_argument('--batch-size', type=int, default=64)
   parser.add_argument('--learning-rate', type=float, default=1e-2)
   parser.add_argument('--dependency-weight', type=float, default=1.0)
-  parser.add_argument('--factor-init-std', type=float, default=0.25)
-  parser.add_argument('--factor-init-seed', type=int, default=1729)
-  parser.add_argument('--factor-warmup-steps', type=int, default=0)
+  parser.add_argument(
+    '--factor-init-std', type=float, default=REPORTED_FACTOR_INIT_STD)
+  parser.add_argument(
+    '--factor-init-seed', type=int, default=REPORTED_FACTOR_INIT_SEED)
+  parser.add_argument(
+    '--factor-warmup-steps', type=int,
+    default=REPORTED_FACTOR_WARMUP_STEPS)
   parser.add_argument('--eval-samples', type=int, default=20000)
   parser.add_argument('--log-every', type=int, default=100)
   parser.add_argument(
@@ -52,7 +127,7 @@ def _args() -> argparse.Namespace:
     default='low_rank')
   parser.add_argument('--device', default='cuda' if torch.cuda.is_available()
                       else 'cpu')
-  return parser.parse_args()
+  return parser.parse_args(argv)
 
 
 def _git_sha() -> str:
@@ -115,6 +190,15 @@ def main() -> int:
         and history_key in histories
         and checkpoint_path.exists())
       if is_complete:
+        _validate_resumed_job(
+          checkpoint_path,
+          existing_rows,
+          histories[history_key],
+          seed=seed,
+          model_name=model_name,
+          expected_spec=available[model_name],
+          expected_config=config,
+          num_contexts=task.num_contexts)
         print(f'skipping complete seed={seed} model={model_name}', flush=True)
         skipped_jobs.append({'seed': seed, 'model': model_name})
         continue
@@ -163,6 +247,19 @@ def main() -> int:
     'resume': args.resume,
     'requested_seeds': args.seeds,
     'requested_models': args.models,
+    'resolved_train_config': dataclasses.asdict(config),
+    'reported_heldout_protocol': {
+      'development_seeds': list(range(1, 9)),
+      'heldout_seeds': list(REPORTED_HELDOUT_SEEDS),
+      'steps': REPORTED_TRAINING_STEPS,
+      'factor_warmup_steps': REPORTED_FACTOR_WARMUP_STEPS,
+      'factor_init_std': REPORTED_FACTOR_INIT_STD,
+      'factor_init_seed': REPORTED_FACTOR_INIT_SEED,
+    },
+    'is_exact_reported_heldout_protocol': (
+      args.seeds == list(REPORTED_HELDOUT_SEEDS)
+      and args.models == list(REPORTED_MODELS)
+      and config == NeuralTrainConfig()),
     'skipped_complete_jobs': skipped_jobs,
     'device': str(device),
     'torch': torch.__version__,

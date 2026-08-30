@@ -31,15 +31,17 @@ structured_decoder:
   fixed_edges: null
   fixed_edge_path: null
 
-  # Frozen-backbone adapter screen.  The path must name a released MDLM
-  # Lightning checkpoint containing backbone.* weights.
+  # Frozen-backbone adapter screen.  The public MDLM-OWT safetensors export is
+  # prepared as a local state_dict wrapper by
+  # scripts/prepare_released_mdlm_owt.py.  It contains raw backbone.* weights
+  # and no EMA state; trusted Lightning checkpoints can opt into EMA below.
   training:
     objective_name: conditional_denoising_nll_not_diffusion_elbo
     backbone_mode: frozen
     backbone_checkpoint: null
     require_pretrained_backbone: true
     strict_backbone_checkpoint: true
-    use_ema_backbone: true
+    use_ema_backbone: false
     deterministic_backbone: true
     head_lr: 3.0e-4
     backbone_lr_multiplier: 0.0

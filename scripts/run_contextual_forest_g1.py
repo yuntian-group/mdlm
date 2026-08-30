@@ -20,7 +20,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
 from synthetic.g1_benchmark import (  # noqa: E402
-  evaluate_preregistered_gate,
+  evaluate_frozen_gate,
   run_benchmark,
 )
 
@@ -53,7 +53,7 @@ def main() -> int:
     train_samples_per_context=args.train_samples_per_context,
     eval_samples_per_model=args.eval_samples_per_model,
     alpha=args.alpha)
-  gate = evaluate_preregistered_gate(records, seeds=args.seeds)
+  gate = evaluate_frozen_gate(records, seeds=args.seeds)
   end = dt.datetime.now(dt.timezone.utc)
 
   output_dir = args.output_dir.resolve()

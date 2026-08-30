@@ -1,9 +1,12 @@
 name: contextual-forest-g1
 description: >-
-  Preregistered synthetic kill gate for the contextual coupling forest paper.
+  Frozen-protocol synthetic kill gate for the contextual coupling forest paper.
 
-seeds: [1, 2, 3]
-screen_seed: 1
+# Protocol development used seeds 1--8.  These five seeds were held out until
+# the protocol below was frozen and are the only seeds in the reported result.
+development_seeds: [1, 2, 3, 4, 5, 6, 7, 8]
+seeds: [9, 10, 11, 12, 13]
+protocol_status: frozen_heldout
 tasks:
   ambiguous_pairs:
     length: 2
@@ -37,13 +40,13 @@ learned_adapter:
   target_access: none
   topology_target: exact_conditional_influence
   interpretation: supervised_topology_upper_bound
-  steps: 600
+  steps: 900
   batch_size: 64
   learning_rate: 0.01
   dependency_weight: 1.0
   factor_init_std: 0.25
   factor_init_seed: 1729
-  factor_warmup_steps: 0
+  factor_warmup_steps: 300
   eval_samples: 20000
   inference_backend: low_rank
   topology_proposals: all_pairs
@@ -64,8 +67,10 @@ gates:
   structured_step_hard_max_ratio: 4.0
 
 profile:
-  warmup_repetitions: 50
-  measured_repetitions: 200
+  # The reported optimized L4 artifact used exactly this timing protocol.
+  warmup_repetitions: 3
+  measured_repetitions: 10
+  cuda_synchronization: before_and_after_each_backend_timing_block
   shapes:
     - {length: 256, k: 32, batch_size: 1}
     - {length: 256, k: 64, batch_size: 1}

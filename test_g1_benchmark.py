@@ -3,7 +3,7 @@ import numpy as np
 from synthetic.distributions import ContextSwitchingMatching
 from synthetic.g1_benchmark import (
   estimate_moments,
-  evaluate_preregistered_gate,
+  evaluate_frozen_gate,
   evaluate_task,
   forest_projection,
   maximum_weight_forest,
@@ -38,6 +38,6 @@ def test_contextual_topology_beats_every_fixed_topology_ablation():
       'context_switching_matching', task, seed,
       train_samples_per_context=2048,
       eval_samples_per_model=2000))
-  gate = evaluate_preregistered_gate(records)
+  gate = evaluate_frozen_gate(records)
   assert gate['passed'], gate
   assert gate['metrics']['contextual_tv'] < gate['metrics']['best_static_tv']

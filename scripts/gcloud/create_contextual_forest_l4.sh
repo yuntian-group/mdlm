@@ -1,17 +1,23 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-readonly PROJECT='interactive-training-2026'
-readonly REGION='us-central1'
-readonly ZONE='us-central1-a'
-readonly NETWORK='contextual-forest-net-20260830'
-readonly SUBNET='contextual-forest-subnet-central-20260830'
-readonly FIREWALL='contextual-forest-iap-ssh-20260830'
-readonly ROUTER='contextual-forest-router-central-20260830'
-readonly NAT='contextual-forest-nat-central-20260830'
-readonly DATA_DISK='contextual-forest-l4-data-20260830'
-readonly VM='contextual-forest-l4-20260830'
-readonly IMAGE='ubuntu-accelerator-2204-amd64-with-nvidia-580-v20260825'
+# Required caller-owned values prevent this public helper from embedding an
+# account/project identifier or accidentally reusing a prior experiment.
+: "${CONTEXTUAL_FOREST_GCP_PROJECT:?set CONTEXTUAL_FOREST_GCP_PROJECT}"
+: "${CONTEXTUAL_FOREST_RESOURCE_PREFIX:?set a fresh resource prefix}"
+
+readonly PROJECT="${CONTEXTUAL_FOREST_GCP_PROJECT}"
+readonly RESOURCE_PREFIX="${CONTEXTUAL_FOREST_RESOURCE_PREFIX}"
+readonly REGION="${CONTEXTUAL_FOREST_REGION:-us-central1}"
+readonly ZONE="${CONTEXTUAL_FOREST_ZONE:-${REGION}-a}"
+readonly NETWORK="${RESOURCE_PREFIX}-net"
+readonly SUBNET="${RESOURCE_PREFIX}-subnet"
+readonly FIREWALL="${RESOURCE_PREFIX}-iap-ssh"
+readonly ROUTER="${RESOURCE_PREFIX}-router"
+readonly NAT="${RESOURCE_PREFIX}-nat"
+readonly DATA_DISK="${RESOURCE_PREFIX}-data"
+readonly VM="${RESOURCE_PREFIX}-worker"
+readonly IMAGE="${CONTEXTUAL_FOREST_IMAGE:-ubuntu-accelerator-2204-amd64-with-nvidia-580-v20260825}"
 readonly IMAGE_PROJECT='ubuntu-os-accelerator-images'
 readonly STARTUP_SCRIPT="$(cd "$(dirname "$0")" && pwd)/contextual_forest_startup.sh"
 
@@ -79,7 +85,7 @@ gcloud compute disks create "${DATA_DISK}" \
   --zone="${ZONE}" \
   --type=pd-balanced \
   --size=200GB \
-  --labels=experiment=contextual-forest,gate=g1,created=20260830
+  --labels=experiment=contextual-forest,gate=g1
 
 gcloud compute instances create "${VM}" \
   --project="${PROJECT}" \
@@ -98,10 +104,11 @@ gcloud compute instances create "${VM}" \
   --subnet="${SUBNET}" \
   --no-address \
   --tags=contextual-forest-iap \
-  --labels=experiment=contextual-forest,gate=g1,created=20260830 \
-  --metadata=enable-oslogin=TRUE \
+  --labels=experiment=contextual-forest,gate=g1 \
+  --metadata=enable-oslogin=TRUE,contextual-forest-data-disk="${DATA_DISK}" \
   --metadata-from-file=startup-script="${STARTUP_SCRIPT}" \
-  --scopes=https://www.googleapis.com/auth/cloud-platform
+  --no-service-account \
+  --no-scopes
 
 gcloud compute instances describe "${VM}" \
   --project="${PROJECT}" \

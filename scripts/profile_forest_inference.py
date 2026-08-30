@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import os
 from pathlib import Path
 import platform
 import subprocess
@@ -18,6 +19,10 @@ sys.path.insert(0, str(REPO_ROOT))
 import torch  # noqa: E402
 
 import structured_utils  # noqa: E402
+
+
+DEFAULT_WARMUP_REPETITIONS = 3
+DEFAULT_MEASURED_REPETITIONS = 10
 
 
 def bounded_chain_edges(
@@ -60,6 +65,10 @@ def profile_shape(
     warmup: int,
     repetitions: int,
     device: torch.device) -> dict[str, object]:
+  if warmup < 0:
+    raise ValueError('warmup repetitions must be nonnegative')
+  if repetitions <= 0:
+    raise ValueError('measured repetitions must be positive')
   generator = torch.Generator(device=device).manual_seed(
     1000 + length + candidate_count)
   node = torch.randn(
@@ -91,11 +100,14 @@ def profile_shape(
     if device.type == 'cuda' else None)
 
   result = {
+    'batch_size': 1,
     'length': length,
     'k': candidate_count,
     'rank': rank,
     'active_edges': int(edge_mask.sum()),
     'component_size': component_size,
+    'warmup_repetitions': warmup,
+    'measured_repetitions': repetitions,
     'low_rank_ms': low_rank_ms,
     'low_rank_peak_bytes': low_rank_peak,
     'dense_ms': None,
@@ -155,18 +167,63 @@ def verify_dense_low_rank_agreement() -> dict[str, float]:
   }
 
 
-def _args():
+def cuda_provenance(device: torch.device) -> dict[str, object] | None:
+  if device.type != 'cuda':
+    return None
+  properties = torch.cuda.get_device_properties(device)
+  try:
+    driver = subprocess.check_output(
+      ['nvidia-smi', '--query-gpu=driver_version',
+       '--format=csv,noheader'], text=True).splitlines()[0].strip()
+  except (OSError, subprocess.CalledProcessError, IndexError):
+    driver = None
+  return {
+    'name': properties.name,
+    'compute_capability': f'{properties.major}.{properties.minor}',
+    'total_memory_bytes': int(properties.total_memory),
+    'driver_version': driver,
+    'cudnn_version': torch.backends.cudnn.version(),
+  }
+
+
+def profile_protocol(
+    warmup: int,
+    repetitions: int,
+    device: torch.device) -> dict[str, object]:
+  """Describe the timing boundary used by every emitted profile row."""
+  if warmup < 0:
+    raise ValueError('warmup repetitions must be nonnegative')
+  if repetitions <= 0:
+    raise ValueError('measured repetitions must be positive')
+  return {
+    'warmup_repetitions_per_backend': warmup,
+    'measured_repetitions_per_backend': repetitions,
+    'reported_statistic': 'arithmetic_mean_wall_clock_ms_per_call',
+    'timed_scope': (
+      'exact forest inference only; input, candidate-factor, and forest '
+      'construction are excluded'),
+    'cuda_synchronization': (
+      'before_and_after_each_backend_timing_block'
+      if device.type == 'cuda' else 'not_applicable'),
+    'peak_memory_scope': (
+      'torch allocator peak after reset; includes live benchmark inputs'),
+  }
+
+
+def _args(argv=None):
   parser = argparse.ArgumentParser()
   parser.add_argument('--output', type=Path, required=True)
   parser.add_argument('--shape', action='append', default=[],
                       help='LENGTH,K; repeat for multiple shapes')
   parser.add_argument('--rank', type=int, default=16)
   parser.add_argument('--component-size', type=int, default=32)
-  parser.add_argument('--warmup', type=int, default=3)
-  parser.add_argument('--repetitions', type=int, default=10)
+  parser.add_argument(
+    '--warmup', type=int, default=DEFAULT_WARMUP_REPETITIONS)
+  parser.add_argument(
+    '--repetitions', type=int, default=DEFAULT_MEASURED_REPETITIONS)
   parser.add_argument('--device', default='cuda' if torch.cuda.is_available()
                       else 'cpu')
-  return parser.parse_args()
+  return parser.parse_args(argv)
 
 
 def main() -> int:
@@ -175,6 +232,7 @@ def main() -> int:
                           '1024,64', '1024,128']
   parsed_shapes = [tuple(map(int, shape.split(','))) for shape in shapes]
   device = torch.device(args.device)
+  protocol = profile_protocol(args.warmup, args.repetitions, device)
   rows = [profile_shape(
     length, k, args.rank, args.component_size,
     args.warmup, args.repetitions, device)
@@ -184,16 +242,33 @@ def main() -> int:
       ['git', 'rev-parse', 'HEAD'], cwd=REPO_ROOT, text=True).strip()
   except (OSError, subprocess.CalledProcessError):
     git_sha = 'unknown'
+  try:
+    git_dirty = bool(subprocess.check_output(
+      ['git', 'status', '--porcelain'], cwd=REPO_ROOT, text=True).strip())
+  except (OSError, subprocess.CalledProcessError):
+    git_dirty = None
   payload = {
     'benchmark': 'forest_inference_profile',
     'git_sha': git_sha,
+    'git_dirty': git_dirty,
     'timestamp_utc': dt.datetime.now(dt.timezone.utc).isoformat(),
+    'platform': platform.platform(),
     'device': str(device),
     'gpu': (torch.cuda.get_device_name(device)
             if device.type == 'cuda' else None),
+    'cuda_device_properties': cuda_provenance(device),
     'torch': torch.__version__,
     'cuda': torch.version.cuda,
     'python': platform.python_version(),
+    # Record whether device filtering was active without publishing a GPU or
+    # MIG UUID from CUDA_VISIBLE_DEVICES.
+    'cuda_visible_devices_is_set': 'CUDA_VISIBLE_DEVICES' in os.environ,
+    'profile_protocol': protocol,
+    'resolved_shapes': [
+      {'length': length, 'k': k, 'batch_size': 1}
+      for length, k in parsed_shapes],
+    'rank': args.rank,
+    'component_size': args.component_size,
     'agreement': verify_dense_low_rank_agreement(),
     'rows': rows,
   }

@@ -1,8 +1,39 @@
 # Paper and Experiment Strategy
 
-Status: planning draft, 2026-08-30. This document is the contract between the
-paper claims and the experiments. It should be revised whenever evidence
-contradicts the current story.
+Status: implementation and verified-evidence snapshot, 2026-08-30. This
+document is the contract between the paper claims and the experiments. It must
+be revised whenever evidence contradicts the current story.
+
+## 0. Current execution status
+
+Completed and usable as evidence:
+
+- exact dense/enumerated versus low-rank forest normalization, marginals,
+  gradients, joint-sampling, hard-constraint, and CUDA-repeatability tests;
+- a protocol frozen after development on seeds 1--8 and evaluated once on
+  held-out seeds 9--13: 900 steps, 300 shared-factor warmup steps, factor
+  initialization standard deviation 0.25, and factor initialization seed 1729;
+- the held-out contextual-matching result at commit `c8d4b70`: contextual TV
+  0.05660, invalid mass 0.00509, edge F1 1.0, and an all-positive paired TV
+  improvement whose 95% bootstrap interval is [0.62089, 0.62821];
+- the optimized inference profile at commit `9a7129f`, using one L4,
+  PyTorch 2.5.1+cu121, three warmups and ten measured calls bracketed by CUDA
+  synchronization per backend: exact agreement to machine precision and
+  2.67x--10.07x dense over low-rank speed ratios across the reported shapes;
+- an opt-in real-data DIT bridge with frozen-backbone loading, streaming
+  OpenWebText training, finite validation, conditional-denoising-NLL metrics,
+  topology-teacher coverage, and factorized/marginal/joint sampling modes;
+- two-step text8 train/resume and structured-sampling plumbing checks; and
+- a strict full-length structured pass using the pinned released raw MDLM-OWT
+  export (no EMA), with finite logits/marginals and normalized nodes.
+
+Not yet evidence and therefore not a current paper claim:
+
+- a trained OpenWebText adapter improvement on paired fixed validation data;
+- generated-text quality or matched-quality end-to-end latency;
+- CoDD, scheduler, and modern 7--8B comparisons; and
+- any diffusion ELBO, data likelihood, MAUVE, reference-model perplexity, or
+  state-of-the-art result for the contextual forest.
 
 ## 1. Decision: pivot from a fixed chain CRF to contextual coupling forests
 
@@ -32,10 +63,10 @@ the corrupted context and diffusion time**:
 The linear chain remains an important ablation and implementation milestone,
 not the headline contribution.
 
-Working title:
+Current title:
 
-> **From Conflict Graphs to Coupling Forests: Joint Denoising in Diffusion
-> Language Models**
+> **Contextual Coupling Forests for Joint Denoising in Diffusion Language
+> Models**
 
 ## 2. What the paper may and may not claim
 
@@ -130,7 +161,7 @@ latency.
 
 ## 5. Backward-designed experiment program
 
-### Stage A: mathematical and implementation correctness
+### Stage A: mathematical and implementation correctness (complete)
 
 Run exhaustive enumeration for tiny vocabularies and lengths:
 
@@ -139,11 +170,11 @@ Run exhaustive enumeration for tiny vocabularies and lengths:
 - reverse-mixture probabilities for absorbing diffusion;
 - clamping and top-K behavior.
 
-Every quantity must agree with enumeration to numerical tolerance. This stage
-also needs an architecture-count/no-edge control; its retained pair parameters
-are inactive, so it is not an active-capacity-matched unary adapter.
+Every quantity agrees with enumeration to numerical tolerance. The implemented
+architecture-count/no-edge control retains inactive pair parameters, so it is
+not described as an active-capacity-matched unary adapter.
 
-### Stage B: controlled mechanism experiments
+### Stage B: controlled mechanism experiments (partially complete)
 
 Use three seeds on:
 
@@ -162,14 +193,23 @@ Decision gate: do not scale unless joint sampling beats independent sampling
 from the same checkpoint and the contextual forest beats both the factorized
 and static-structure models on the nonlocal task.
 
-### Stage C: MDLM-scale controlled language modeling
+The frozen-protocol context-switching-matching experiment passes this gate on
+held-out seeds 9--13. The broader ambiguous-pair, adjustable Markov, and XOR
+learned-task matrix remains pending; oracle/table-fit checks are mechanism
+sanity evidence and must not be conflated with learned-adapter results.
+
+### Stage C: MDLM-scale controlled language modeling (plumbing complete;
+quality pending)
 
 Use the released `kuleshov-group/mdlm-owt` checkpoint in the
-`yuntian-group/mdlm` codebase. Freeze the backbone first and train output
-adapters on OpenWebText. This makes the closest comparisons cheap and fair.
+`yuntian-group/mdlm` codebase, pinned to revision
+`d0958fa851335ece6c15260ce0025f030673c0fb` and verified against the released
+`model.safetensors` SHA256. The public artifact contains raw `backbone.*`
+weights and no EMA. Freeze the backbone first and train output adapters on
+streaming OpenWebText. This makes the closest comparisons cheap and fair.
 Retain OpenWebText because MDLM, SEDD, and AR checkpoints are public; evaluate
-continuations on WikiText-103. Add text8 with its full 35-character vocabulary
-as an exact-lattice sanity benchmark.
+paired fixed examples/corruptions on WikiText-103. Add text8 with its full
+35-character vocabulary as an exact-lattice sanity benchmark.
 
 Minimum matched baselines:
 
@@ -205,7 +245,7 @@ Decision gates:
 - contextual structure beats a static prior, especially at high mask ratios;
 - per-step cost remains below 4x and yields a better matched-quality latency.
 
-### Stage D: modern transfer experiment
+### Stage D: modern transfer experiment (pending)
 
 Primary target: Dream-7B; secondary target: LLaDA-8B. Freeze the backbone and
 train only the structured adapter first. Use the public competitor settings so
@@ -223,7 +263,7 @@ Tasks:
 
 GPQA is optional because it is costly and weakly diagnostic of the mechanism.
 
-### Stage E: essential ablations
+### Stage E: essential ablations (pending)
 
 - no edges / natural chain / static forest / contextual forest;
 - fixed topology with dynamic factors / dynamic topology with fixed factors /
@@ -238,24 +278,27 @@ GPQA is optional because it is costly and weakly diagnostic of the mechanism.
 - frozen versus jointly tuned backbone;
 - scheduler alone, forest alone, and their composition.
 
-## 6. Expected-result placeholders for the first draft
+## 6. Measured evidence and unresolved hypotheses
 
-These values are targets for planning, not observations:
+The only current learned quality result is the frozen-protocol synthetic
+held-out experiment described in Section 0. The optimized forest profile is a
+kernel-only measurement: it excludes candidate/factor and forest construction,
+so it cannot be presented as end-to-end decoding latency. The released-backbone
+and text8 runs are plumbing checks and cannot be presented as language-quality
+evidence.
 
-- near-zero invalid ambiguous pairs for the exact joint sampler versus about
-  50% under matched independent marginals;
-- no material likelihood loss at conservative step counts;
-- the clearest gain at 8--32 denoiser calls and high mask ratios;
-- 10--30% relative reduction in dependency/repetition errors;
-- MAUVE improvement on the order of 0.02--0.05;
-- 5--15% lower reference-model generative perplexity at aggressive decoding;
-- 1.3--2.5x structured-layer overhead per denoiser call, recovered by fewer
-  calls at matched quality;
-- contextual topology consistently better than a static prior on nonlocal and
-  reasoning-sensitive evaluations.
+The earlier numerical targets for MAUVE, reference-model perplexity,
+dependency/repetition error, end-to-end overhead, and denoiser-call regimes
+have been removed. Those cells remain unclaimed until frozen-protocol paired
+experiments produce artifacts. Future hypotheses remain qualitative:
 
-All such values must appear in the paper through a visible `\placeholder{}`
-macro. Nothing bracketed as predicted may remain in a submitted manuscript.
+- benefits should concentrate at high mask ratios and aggressive commitment;
+- contextual topology should matter most when the relevant dependency changes
+  with corrupted context;
+- a scheduler and a structured output distribution may be complementary; and
+- candidate truncation and forest bias may limit gains on long-range cycles.
+
+No predicted numeric result may be inserted into a submission table or prose.
 
 ## 7. Code ownership in `yuntian-group/mdlm`
 
@@ -275,22 +318,27 @@ macro. Nothing bracketed as predicted may remain in a submitted manuscript.
 - `evaluation/`: quality, dependency, infilling, memorization, and latency
   evaluation.
 - `tests/test_structured_forest.py`: exhaustive checks.
-- `scripts/`: resumable pilot/full launchers, with data and checkpoints written
-  to the experiment's new persistent GCloud disk.
+- `scripts/`: resumable pilot/full launchers, immutable release preparation,
+  profile provenance, and paired artifact aggregation; large data and
+  checkpoints belong on a dedicated persistent experiment volume.
 
-The current branch is a recovery baseline, not evidence for the paper: its
-32-example smoke test verifies mechanics but its collapsed samples rule out any
-positive empirical claim.
+The branch now contains paper-usable exact-inference, held-out synthetic, and
+kernel-profile evidence. The original 32-example recovery smoke remains only a
+historical mechanics check, and real-data plumbing still supports no positive
+language-quality claim.
 
 ## 8. Compute order
 
-1. CPU/GPU unit tests and synthetic tasks.
-2. One L4/G4 smoke run with a hard time limit.
-3. Text8 and frozen MDLM-OWT adapter pilots.
-4. Only after decision gates pass, the full MDLM-scale matrix.
-5. Only after the main effect survives, Dream-7B transfer and expensive
-   baseline reproduction.
+1. **Complete:** CPU/GPU unit tests and the frozen-protocol held-out synthetic
+   task.
+2. **Complete:** bounded GPU text8 and released-backbone plumbing checks.
+3. **Next:** a short frozen MDLM-OWT adapter screen with paired fixed
+   validation artifacts and its factorized control.
+4. **Conditional:** only after that gate passes, the full MDLM-scale matrix.
+5. **Conditional:** only after the real-data main effect survives, a modern
+   7--8B transfer and expensive baseline reproduction.
 
-Every cloud run should use the requested new persistent disk, explicit labels,
-resumable checkpoints, and a hard stop. The retained old debug disk is not to
-be reused for the new experiment series.
+Remote runs use an experiment-dedicated persistent volume, explicit run labels,
+resumable checkpoints, immutable source revisions, and a hard stop. Public
+artifacts record hardware/software provenance without private account,
+funding, project, instance, or resource identifiers.

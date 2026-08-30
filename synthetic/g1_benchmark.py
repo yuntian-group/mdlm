@@ -4,7 +4,7 @@ This module intentionally does not claim to train the neural decoder.  It fits
 the maximum-likelihood forest projection of small, exactly enumerable target
 distributions from sampled data.  The result is an auditable oracle/table-fit
 gate: it verifies that the task, topology ablations, metrics, sampling code,
-and preregistered decision rule can distinguish adaptive topology before GPU
+and frozen decision rule can distinguish adaptive topology before GPU
 time is spent on the learned head.
 """
 
@@ -390,7 +390,7 @@ def paired_bootstrap_ci(
   return float(lower), float(upper)
 
 
-def evaluate_preregistered_gate(
+def evaluate_frozen_gate(
     records: Sequence[BenchmarkRecord],
     seeds: Sequence[int] = (1, 2, 3),
     task: str = 'context_switching_matching') -> dict[str, object]:
