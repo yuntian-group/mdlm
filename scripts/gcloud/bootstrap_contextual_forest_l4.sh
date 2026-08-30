@@ -32,9 +32,10 @@ python3 -m venv "${VENV}"
 
 "${VENV}/bin/python" -c \
   'import torch; assert torch.cuda.is_available(); print(torch.__version__, torch.version.cuda, torch.cuda.get_device_name())'
+cd "${REPO_DIR}"
 PYTHONDONTWRITEBYTECODE=1 "${VENV}/bin/python" -m pytest -q \
-  "${REPO_DIR}/tests/test_structured_forest.py" \
-  "${REPO_DIR}/tests/test_structured_objective.py" \
-  "${REPO_DIR}/tests/test_neural_g1.py" \
-  "${REPO_DIR}/test_synthetic_distributions.py" \
-  "${REPO_DIR}/test_g1_benchmark.py"
+  tests/test_structured_forest.py \
+  tests/test_structured_objective.py \
+  tests/test_neural_g1.py \
+  test_synthetic_distributions.py \
+  test_g1_benchmark.py
