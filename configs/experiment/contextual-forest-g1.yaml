@@ -39,7 +39,7 @@ learned_adapter:
   backbone: frozen_context_features
   target_access: none
   topology_target: exact_conditional_influence
-  interpretation: supervised_topology_upper_bound
+  interpretation: favorable_supervision_diagnostic
   steps: 900
   batch_size: 64
   learning_rate: 0.01
