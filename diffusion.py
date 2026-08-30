@@ -17,6 +17,7 @@ from torch import Tensor
 
 import crf_utils
 import dataloader
+from evaluation import conditional_denoising_records
 import models
 import noise_schedule
 import structured_objective
@@ -38,6 +39,30 @@ def _unsqueeze(x, reference):
   return x.view(
     * x.shape,
     * ((1,) * (len(reference.shape) - len(x.shape))))
+
+
+def _loglinear_time_from_mask_rate(mask_rate: float, eps: float) -> float:
+  """Invert ``q(x_t != x_0) = (1 - eps) t`` for a fixed eval rate."""
+  if not 0.0 < mask_rate < 1.0:
+    raise ValueError('mask_rate must be strictly between 0 and 1')
+  if not 0.0 < eps < 1.0:
+    raise ValueError('loglinear eps must be strictly between 0 and 1')
+  timestep = mask_rate / (1.0 - eps)
+  if timestep > 1.0:
+    raise ValueError('mask_rate exceeds the loglinear schedule maximum')
+  return timestep
+
+
+def _structured_training_rng_seeds(
+    base_seed: int, epoch: int, rank: int) -> tuple[int, int]:
+  """Domain-separate paired corruption and topology-teacher RNG streams."""
+  if min(base_seed, epoch, rank) < 0:
+    raise ValueError('structured RNG seed inputs must be non-negative')
+  modulus = 2 ** 63 - 1
+  corruption_seed = (
+    int(base_seed) * 1_000_003 + int(epoch) * 10_007 + int(rank)) % modulus
+  topology_seed = (corruption_seed + 4_294_967_291) % modulus
+  return corruption_seed, topology_seed
 
 
 @dataclass
@@ -180,6 +205,25 @@ class Diffusion(L.LightningModule):
     self._last_structured_metrics = {}
     self._last_structured_metric_updates = {}
     self._structured_validation_pairing_digest = None
+    self._last_structured_example_metrics = {}
+    configured_mask_rate = self.config.eval.get(
+      'structured_mask_rate', None)
+    self.structured_eval_mask_rate = (
+      None if configured_mask_rate is None
+      else float(configured_mask_rate))
+    configured_corruption_seed = self.config.eval.get(
+      'corruption_seed', None)
+    self.structured_eval_corruption_seed = (
+      None if configured_corruption_seed is None
+      else int(configured_corruption_seed))
+    self._structured_validation_generator = None
+    self._structured_training_corruption_generator = None
+    self._structured_training_topology_generator = None
+    record_cfg = self.config.eval.get('conditional_records', {})
+    self.conditional_records_enabled = bool(
+      record_cfg.get('enabled', False))
+    self.conditional_record_config = record_cfg
+    self._conditional_record_writer = None
     self._initialize_structured_decoder()
 
     self.T = self.config.T
@@ -213,15 +257,19 @@ class Diffusion(L.LightningModule):
     self.structured_valid_metrics = structured_metrics.clone()
     self.structured_test_metrics = structured_metrics.clone()
 
-    # generative perplexity
+    # Generative perplexity is optional.  Keep its external tokenizer lazy so
+    # conditional-denoising and paired-generation runs do not depend on an
+    # unused, mutable Hub download during model construction.
     self.gen_ppl_metric = Perplexity()
-    self.eval_model_tokenizer = transformers.AutoTokenizer.\
-      from_pretrained(self.gen_ppl_eval_model_name_or_path)
-    if self.eval_model_tokenizer.pad_token is None:
-      self.eval_model_tokenizer.pad_token =\
-          self.eval_model_tokenizer.eos_token
-      self.eval_model_tokenizer.pad_token_id =\
-          self.eval_model_tokenizer.eos_token_id
+    self.eval_model_tokenizer = None
+    if self.config.eval.compute_generative_perplexity:
+      self.eval_model_tokenizer = transformers.AutoTokenizer.\
+        from_pretrained(self.gen_ppl_eval_model_name_or_path)
+      if self.eval_model_tokenizer.pad_token is None:
+        self.eval_model_tokenizer.pad_token =\
+            self.eval_model_tokenizer.eos_token
+        self.eval_model_tokenizer.pad_token_id =\
+            self.eval_model_tokenizer.eos_token_id
 
     self.noise = noise_schedule.get_noise(self.config,
                                           dtype=self.dtype)
@@ -537,6 +585,66 @@ class Diffusion(L.LightningModule):
         raise ValueError(
           'structured marginal/joint sampling does not support '
           'semi-AR strides')
+      if ((self.structured_eval_mask_rate is None)
+          != (self.structured_eval_corruption_seed is None)):
+        raise ValueError(
+          'eval.structured_mask_rate and eval.corruption_seed must be set '
+          'together for a pinned conditional-denoising evaluation')
+      if self.structured_eval_mask_rate is not None:
+        if not 0.0 < self.structured_eval_mask_rate < 1.0:
+          raise ValueError(
+            'eval.structured_mask_rate must be strictly between 0 and 1')
+        if self.structured_eval_corruption_seed < 0:
+          raise ValueError('eval.corruption_seed must be non-negative')
+        if self.config.noise.type != 'loglinear':
+          raise ValueError(
+            'fixed mask-rate evaluation currently requires '
+            'noise.type=loglinear')
+        if self.change_of_variables or self.importance_sampling:
+          raise ValueError(
+            'fixed mask-rate evaluation requires direct time sampling')
+        maximum_rate = 1.0 - float(self.noise.eps)
+        if self.structured_eval_mask_rate > maximum_rate:
+          raise ValueError(
+            f'eval.structured_mask_rate exceeds the loglinear maximum '
+            f'{maximum_rate}')
+      if self.conditional_records_enabled:
+        if self.config.mode != 'ppl_eval':
+          raise ValueError(
+            'eval.conditional_records is only supported in ppl_eval mode')
+        if self.structured_eval_mask_rate is None:
+          raise ValueError(
+            'conditional records require a fixed mask rate and '
+            'corruption seed')
+        if bool(self.config.eval.generate_samples):
+          raise ValueError(
+            'conditional record evaluation requires '
+            'eval.generate_samples=false')
+        if not bool(self.config.data.get(
+            'require_pinned_provenance', False)):
+          raise ValueError(
+            'conditional records require pinned dataset provenance')
+        boundary_mode = str(self.config.data.get(
+          'valid_document_boundary_mode', 'concatenate'))
+        if boundary_mode == 'concatenate':
+          raise ValueError(
+            'conditional records require document-local validation '
+            'windows')
+        required_record_fields = (
+          'protocol_id', 'job_id', 'arm', 'train_seed')
+        missing_record_fields = [
+          field for field in required_record_fields
+          if self.conditional_record_config.get(field, None) in (None, '')]
+        if missing_record_fields:
+          raise ValueError(
+            'eval.conditional_records is missing '
+            f'{missing_record_fields}')
+        train_seed = self.conditional_record_config.get('train_seed')
+        if (not isinstance(train_seed, int) or isinstance(train_seed, bool)
+            or train_seed < 0):
+          raise ValueError(
+            'eval.conditional_records.train_seed must be a '
+            'non-negative integer')
 
   def on_load_checkpoint(self, checkpoint):
     if self.ema:
@@ -806,6 +914,23 @@ class Diffusion(L.LightningModule):
     if self.structured_head is not None:
       self.structured_head.train()
     self.noise.train()
+    if self.structured_enabled:
+      generator_device = (
+        self.device if self.device.type == 'cuda'
+        else torch.device('cpu'))
+      # Keep forward corruptions independent of topology-teacher sampling.
+      # Otherwise dynamic-topology arms consume an extra global-RNG draw and
+      # cease to be paired with fixed-topology controls after the first batch.
+      corruption_seed, topology_seed = _structured_training_rng_seeds(
+        int(self.config.seed), int(self.current_epoch), int(self.global_rank))
+      self._structured_training_corruption_generator = torch.Generator(
+        device=generator_device)
+      self._structured_training_corruption_generator.manual_seed(
+        corruption_seed)
+      self._structured_training_topology_generator = torch.Generator(
+        device=generator_device)
+      self._structured_training_topology_generator.manual_seed(
+        topology_seed)
 
   def training_step(self, batch, batch_idx):
     loss = self._compute_loss(batch, prefix='train')
@@ -828,6 +953,21 @@ class Diffusion(L.LightningModule):
                sync_dist=True)
     return loss
 
+  def _conditional_record_metadata(self):
+    return {
+      'protocol_id': str(
+        self.conditional_record_config.get('protocol_id')),
+      'job_id': str(self.conditional_record_config.get('job_id')),
+      'arm': str(self.conditional_record_config.get('arm')),
+      'train_seed': int(
+        self.conditional_record_config.get('train_seed')),
+      'corruption_seed': int(self.structured_eval_corruption_seed),
+      'dataset': str(self.config.data.valid),
+      'dataset_revision': str(self.config.data.valid_revision),
+      'mask_rate': float(self.structured_eval_mask_rate),
+      'candidate_k': int(self.structured_config.get('top_k')),
+    }
+
   def on_validation_epoch_start(self):
     if self.ema:
       self.ema.store(self._trainable_model_parameters())
@@ -837,13 +977,39 @@ class Diffusion(L.LightningModule):
       self.structured_head.eval()
     self.noise.eval()
     if self.structured_enabled:
+      if self.structured_eval_corruption_seed is not None:
+        generator_device = (
+          self.device if self.device.type == 'cuda'
+          else torch.device('cpu'))
+        self._structured_validation_generator = torch.Generator(
+          device=generator_device)
+        self._structured_validation_generator.manual_seed(
+          self.structured_eval_corruption_seed + int(self.global_rank))
+      else:
+        self._structured_validation_generator = None
       self._structured_validation_pairing_digest = (
         structured_pairing.StructuredValidationPairingDigest())
+      if (self.conditional_records_enabled
+          and not bool(self.trainer.sanity_checking)):
+        self._conditional_record_writer = (
+          conditional_denoising_records.
+          ConditionalDenoisingRecordWriter(
+            output_dir=str(self.config.checkpointing.save_dir),
+            rank=int(self.global_rank),
+            metadata=self._conditional_record_metadata()))
+      else:
+        self._conditional_record_writer = None
     assert self.valid_metrics.nll.mean_value == 0
     assert self.valid_metrics.nll.weight == 0
 
   def validation_step(self, batch, batch_idx):
-    return self._compute_loss(batch, prefix='val')
+    loss = self._compute_loss(batch, prefix='val')
+    if self._conditional_record_writer is not None:
+      self._conditional_record_writer.append(
+        batch=batch,
+        metrics=self._last_structured_example_metrics,
+        batch_index=batch_idx)
+    return loss
 
   def on_validation_epoch_end(self):
     if (self.structured_enabled
@@ -862,10 +1028,28 @@ class Diffusion(L.LightningModule):
         epoch=int(self.current_epoch),
         step=int(self.global_step),
         sanity_checking=bool(self.trainer.sanity_checking))
+      if self._conditional_record_writer is not None:
+        local_summary = self._conditional_record_writer.finalize(
+          pairing_digest_sha256=payload['sha256'])
+        if (torch.distributed.is_available()
+            and torch.distributed.is_initialized()):
+          rank_summaries = [None] * torch.distributed.get_world_size()
+          torch.distributed.all_gather_object(
+            rank_summaries, local_summary)
+        else:
+          rank_summaries = [local_summary]
+        if self.trainer.is_global_zero:
+          conditional_denoising_records.write_record_manifest(
+            output_dir=str(self.config.checkpointing.save_dir),
+            metadata=self._conditional_record_metadata(),
+            rank_summaries=rank_summaries,
+            pairing_digest=payload)
+        self._conditional_record_writer = None
       if self.trainer.is_global_zero:
         structured_pairing.write_pairing_digest(
           str(self.config.checkpointing.save_dir), payload)
       self._structured_validation_pairing_digest = None
+      self._structured_validation_generator = None
     if ((self.config.eval.compute_perplexity_on_sanity
          or not self.trainer.sanity_checking)
          and self.config.eval.generate_samples
@@ -957,6 +1141,10 @@ class Diffusion(L.LightningModule):
         attn_mask: Attention mask for the eval model
         eval_context_size: Size of the context for the eval model
     """
+    if self.eval_model_tokenizer is None:
+      raise RuntimeError(
+        'generative-perplexity tokenizer was not initialized; set '
+        'eval.compute_generative_perplexity=true before model construction')
     if 'llama2' in self.gen_ppl_eval_model_name_or_path:
       tokenizer_kwargs = {
         'text_samples': text_samples,
@@ -1048,7 +1236,7 @@ class Diffusion(L.LightningModule):
         self.gen_ppl_metric.update(
           nlls, first_eos[..., 1:] + token_mask[..., 1:])
 
-  def q_xt(self, x, move_chance):
+  def q_xt(self, x, move_chance, *, generator=None):
     """Computes the noisy sample xt.
 
     Args:
@@ -1057,7 +1245,7 @@ class Diffusion(L.LightningModule):
       move_chance: float torch.Tensor with shape (batch_size, 1).
     """
     move_indices = torch.rand(
-      * x.shape, device=x.device) < move_chance
+      * x.shape, device=x.device, generator=generator) < move_chance
     xt = torch.where(move_indices, self.mask_index, x)
     return xt
 
@@ -1507,8 +1695,8 @@ class Diffusion(L.LightningModule):
                         0)[..., None]
     return edge
 
-  def _sample_t(self, n, device):
-    _eps_t = torch.rand(n, device=device)
+  def _sample_t(self, n, device, *, generator=None):
+    _eps_t = torch.rand(n, device=device, generator=generator)
     if self.antithetic_sampling:
       offset = torch.arange(n, device=device) / n
       _eps_t = (_eps_t / n + offset) % 1
@@ -1609,8 +1797,38 @@ class Diffusion(L.LightningModule):
     optional topology distillation and factorized-unary auxiliary terms.  It
     is intentionally not reported as a diffusion ELBO.
     """
-    t = self._sample_t(x0.shape[0], x0.device)
-    if self.change_of_variables:
+    if record_pairing:
+      corruption_generator = self._structured_validation_generator
+    elif self.training:
+      if self._structured_training_corruption_generator is None:
+        raise RuntimeError(
+          'structured training corruption generator was not initialized')
+      corruption_generator = self._structured_training_corruption_generator
+    else:
+      corruption_generator = None
+    fixed_mask_rate = (
+      self.structured_eval_mask_rate if record_pairing else None)
+    if fixed_mask_rate is not None:
+      # Under LogLinearNoise, q(x_t != x_0) = (1 - eps) * t.  Deriving t
+      # from the requested rate keeps both the corruption and the head's
+      # timestep conditioning on the same pinned forward-process point.
+      t = torch.full(
+        (x0.shape[0],),
+        _loglinear_time_from_mask_rate(
+          fixed_mask_rate, float(self.noise.eps)),
+        device=x0.device,
+        dtype=torch.float32)
+      sigma, _ = self.noise(t)
+      conditioning = sigma[:, None]
+      move_chance = torch.full(
+        (x0.shape[0], 1), fixed_mask_rate,
+        device=x0.device, dtype=torch.float32)
+    else:
+      t = self._sample_t(
+        x0.shape[0], x0.device, generator=corruption_generator)
+    if fixed_mask_rate is not None:
+      pass
+    elif self.change_of_variables:
       conditioning = t[:, None]
       f_T = torch.log1p(-torch.exp(-self.noise.sigma_max))
       f_0 = torch.log1p(-torch.exp(-self.noise.sigma_min))
@@ -1619,7 +1837,8 @@ class Diffusion(L.LightningModule):
       sigma, _ = self.noise(t)
       conditioning = sigma[:, None]
       move_chance = 1 - torch.exp(-sigma[:, None])
-    xt = self.q_xt(x0, move_chance)
+    xt = self.q_xt(
+      x0, move_chance, generator=corruption_generator)
     if attention_mask is None:
       attention_mask = torch.ones_like(x0, dtype=torch.bool)
     else:
@@ -1645,6 +1864,16 @@ class Diffusion(L.LightningModule):
       unary_logits=unary_logits,
       clean_tokens=x0,
       active_mask=active_mask)
+    target_is_explicit = output.candidate_ids.eq(
+      x0[:, :, None]).any(dim=-1)
+    self._last_structured_example_metrics = {
+      'nll_sum': denoising.per_example_nll.detach(),
+      'active_tokens': active_mask.sum(dim=-1).detach(),
+      'candidate_hits': (
+        target_is_explicit & active_mask).sum(dim=-1).detach(),
+      'retained_mass_sum': output.retained_mass.masked_fill(
+        ~active_mask, 0.0).sum(dim=-1).detach(),
+    }
 
     training_cfg = self.structured_training_config
     factorized_auxiliary = structured_training.factorized_denoising_nll(
@@ -1678,7 +1907,11 @@ class Diffusion(L.LightningModule):
       and (self.training
            or bool(training_cfg.get('topology_on_validation', False))))
     if train_topology:
-      sources = structured_training.sample_active_sources(active_mask)
+      topology_generator = (
+        self._structured_training_topology_generator
+        if self.training else None)
+      sources = structured_training.sample_active_sources(
+        active_mask, generator=topology_generator)
       revealed_xt = xt.clone()
       valid_sources = sources >= 0
       batch_index = torch.arange(x0.shape[0], device=x0.device)

@@ -255,6 +255,54 @@ class DataloaderStreamingTest(unittest.TestCase):
     torch.testing.assert_close(
       batch['input_ids'], torch.tensor([[1, 2]]))
 
+  def test_pinned_corruption_generator_replays_identical_masks(self):
+    diffusion = _load_diffusion_module()
+    model = diffusion.Diffusion.__new__(diffusion.Diffusion)
+    model.mask_index = 99
+    clean = torch.arange(32).reshape(4, 8)
+    probability = torch.full((4, 1), 0.5)
+
+    first_generator = torch.Generator().manual_seed(1701)
+    second_generator = torch.Generator().manual_seed(1701)
+    first = model.q_xt(
+      clean, probability, generator=first_generator)
+    second = model.q_xt(
+      clean, probability, generator=second_generator)
+
+    torch.testing.assert_close(first, second)
+    self.assertTrue(bool(first.eq(99).any()))
+    self.assertAlmostEqual(
+      diffusion._loglinear_time_from_mask_rate(0.5, 1e-3),
+      0.5 / 0.999)
+    with self.assertRaisesRegex(ValueError, 'schedule maximum'):
+      diffusion._loglinear_time_from_mask_rate(0.9999, 1e-3)
+
+  def test_training_corruptions_are_isolated_from_topology_rng(self):
+    diffusion = _load_diffusion_module()
+    model = diffusion.Diffusion.__new__(diffusion.Diffusion)
+    model.mask_index = 99
+    corruption_seed, topology_seed = (
+      diffusion._structured_training_rng_seeds(3, 0, 0))
+    self.assertNotEqual(corruption_seed, topology_seed)
+
+    dynamic_corruption = torch.Generator().manual_seed(corruption_seed)
+    static_corruption = torch.Generator().manual_seed(corruption_seed)
+    topology_generator = torch.Generator().manual_seed(topology_seed)
+    clean = torch.arange(32).reshape(4, 8)
+    probability = torch.full((4, 1), 0.5)
+    for _ in range(4):
+      dynamic_mask = model.q_xt(
+        clean, probability, generator=dynamic_corruption)
+      # Dynamic topology consumes its own teacher-selection stream; this must
+      # not shift the next forward corruption relative to a fixed control.
+      torch.rand(17, generator=topology_generator)
+      static_mask = model.q_xt(
+        clean, probability, generator=static_corruption)
+      torch.testing.assert_close(dynamic_mask, static_mask)
+
+    with self.assertRaisesRegex(ValueError, 'non-negative'):
+      diffusion._structured_training_rng_seeds(-1, 0, 0)
+
 
 if __name__ == '__main__':
   unittest.main()

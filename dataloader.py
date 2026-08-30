@@ -1,4 +1,5 @@
 import functools
+import hashlib
 import itertools
 import json
 import math
@@ -16,6 +17,7 @@ import tokenizers
 import torch
 import transformers
 
+import data_provenance
 import utils
 
 LOGGER = utils.get_logger(__name__)
@@ -300,21 +302,198 @@ def _group_texts(examples, block_size, bos, eos):
   return result
 
 
+_WIKITEXT_ARTICLE_HEADING = re.compile(
+  r'^\s*=\s+[^=].*?\s+=\s*$')
+
+
+def _coalesce_wikitext_articles(dataset):
+  """Recover WikiText articles from its line-oriented raw representation."""
+  documents = []
+  current_lines = []
+  current_start = None
+
+  def flush(stop):
+    if not current_lines:
+      return
+    text = ''.join(current_lines)
+    documents.append({
+      'text': text,
+      '_source_start_index': current_start,
+      '_source_stop_index': stop,
+      '_source_document_sha256': hashlib.sha256(
+        text.encode('utf-8')).hexdigest(),
+    })
+
+  for index, example in enumerate(dataset):
+    text = example['text']
+    if _WIKITEXT_ARTICLE_HEADING.match(text) and current_lines:
+      flush(index)
+      current_lines = []
+      current_start = None
+    if text.strip():
+      if current_start is None:
+        current_start = index
+      current_lines.append(text)
+  flush(len(dataset))
+  if not documents:
+    raise ValueError('WikiText split contains no non-empty articles')
+  return datasets.Dataset.from_list(documents)
+
+
+def _source_row_count(dataset, *, streaming):
+  if streaming:
+    return None
+  try:
+    return len(dataset)
+  except TypeError:
+    return None
+
+
+def _select_source_window(dataset, window, *, streaming):
+  if window is None:
+    return dataset
+  start, stop = window
+  if streaming:
+    return dataset.skip(start).take(stop - start)
+  return dataset.select(range(start, stop))
+
+
+def _dataset_fingerprint(dataset):
+  fingerprint = getattr(dataset, '_fingerprint', None)
+  return str(fingerprint) if fingerprint is not None else None
+
+
+def _runtime_provenance_path(provenance_dir, role, key):
+  if not provenance_dir:
+    raise ValueError(
+      'pinned provenance requires a writable provenance_dir')
+  if not role:
+    raise ValueError('pinned provenance requires a non-empty role')
+  return (
+    str(provenance_dir).rstrip('/')
+    + f'/{role}-{key}.json')
+
+
 def get_dataset(
     dataset_name, tokenizer, wrap, mode, cache_dir,
     block_size=1024, num_proc=len(os.sched_getaffinity(0)), streaming=False,
-    revision=None):
+    revision=None, dataset_name_or_path=None, dataset_config_name=None,
+    source_split=None, source_window=None, expected_source_num_rows=None,
+    text_field=None, document_boundary_mode='concatenate',
+    trust_remote_code=False, require_pinned_provenance=False,
+    tokenizer_name_or_path=None, tokenizer_revision=None,
+    provenance_dir=None, provenance_role=None,
+    disjoint_window_proof=None):
+  """Load and tokenize one split under either the legacy or pinned protocol.
+
+  The pinned protocol is enabled by ``require_pinned_provenance``.  It
+  requires immutable Hub commits, an expected source row count, a runtime
+  provenance artifact, and a content-addressed processed cache.  Document
+  mode emits only full model-length windows drawn from one source document;
+  incomplete tails are intentionally dropped rather than padded into a
+  bidirectional backbone that has no padding-attention mask.
+  """
+  if document_boundary_mode not in {
+      'concatenate', 'source_document', 'wikitext_articles'}:
+    raise ValueError(
+      'document_boundary_mode must be concatenate, source_document, or '
+      'wikitext_articles')
+  if document_boundary_mode != 'concatenate' and not wrap:
+    raise ValueError('document-boundary preservation requires wrap=true')
+
+  source_num_rows = None
+  if expected_source_num_rows is not None:
+    source_num_rows = int(expected_source_num_rows)
+    if source_num_rows <= 0:
+      raise ValueError('expected_source_num_rows must be positive')
+  normalized_window = data_provenance.normalize_window(
+    source_window, field=f'{provenance_role or mode}_source_window',
+    source_num_rows=source_num_rows)
+
+  specification = None
+  provenance_key = None
+  if require_pinned_provenance:
+    if not dataset_name_or_path or not source_split:
+      raise ValueError(
+        'pinned provenance requires dataset_name_or_path and source_split')
+    revision = data_provenance.require_commit_revision(
+      revision, field=f'{provenance_role or mode}_revision')
+    tokenizer_revision = data_provenance.require_commit_revision(
+      tokenizer_revision, field='tokenizer_revision')
+    if not tokenizer_name_or_path:
+      raise ValueError(
+        'pinned provenance requires tokenizer_name_or_path')
+    if source_num_rows is None:
+      raise ValueError(
+        'pinned provenance requires expected_source_num_rows')
+    specification = {
+      'logical_dataset_name': dataset_name,
+      'dataset_name_or_path': str(dataset_name_or_path),
+      'dataset_config_name': (
+        None if dataset_config_name is None
+        else str(dataset_config_name)),
+      'source_split': str(source_split),
+      'source_revision': revision,
+      'source_num_rows': source_num_rows,
+      'source_window': (
+        None if normalized_window is None
+        else list(normalized_window)),
+      'text_field': str(text_field or 'text'),
+      'trust_remote_code': bool(trust_remote_code),
+      'tokenizer_name_or_path': str(tokenizer_name_or_path),
+      'tokenizer_revision': tokenizer_revision,
+      'tokenizer_class': type(tokenizer).__name__,
+      'tokenizer_vocab_size': int(tokenizer.vocab_size),
+      'block_size': int(block_size),
+      'wrap': bool(wrap),
+      'document_boundary_mode': document_boundary_mode,
+      'document_remainder_policy': (
+        'drop_incomplete_tail_and_documents_shorter_than_payload'
+        if document_boundary_mode != 'concatenate' else None),
+      'detokenizer': (
+        'wikitext_v1' if dataset_name.startswith('wikitext')
+        else ('scientific_papers_v1'
+              if (dataset_name.startswith('scientific_papers')
+                  or dataset_name_or_path == 'armanc/scientific_papers')
+              else None)),
+      'datasets_version': datasets.__version__,
+      'transformers_version': transformers.__version__,
+      'disjoint_window_proof': disjoint_window_proof,
+    }
+    provenance_key = data_provenance.cache_key(specification)
+
   if wrap:
-    filename = f'{dataset_name}_{mode}_bs{block_size}_wrapped.dat'
+    filename = f'{dataset_name}_{mode}_bs{block_size}_wrapped'
   else:
-    filename = f'{dataset_name}_{mode}_bs{block_size}_unwrapped.dat'
+    filename = f'{dataset_name}_{mode}_bs{block_size}_unwrapped'
+  if provenance_key is not None:
+    filename += f'_{provenance_key}'
+  filename += '.dat'
   _path = os.path.join(cache_dir, filename)
+  cache_provenance_path = _path + '.provenance.json'
   
   # A streaming run must not silently fall back to a previously materialized
   # map-style cache at the same path.
   if not streaming and utils.fsspec_exists(_path):
     LOGGER.info(f'Loading data from: {_path}')
-    return datasets.load_from_disk(_path).with_format('torch')
+    cached = datasets.load_from_disk(_path)
+    if require_pinned_provenance:
+      if not utils.fsspec_exists(cache_provenance_path):
+        raise RuntimeError(
+          f'pinned cache exists without provenance: {_path}')
+      manifest = data_provenance.validate_manifest(
+        data_provenance.read_manifest(cache_provenance_path),
+        expected_specification=specification)
+      expected_fingerprint = manifest['observed'].get(
+        'processed_fingerprint')
+      if (expected_fingerprint is not None
+          and _dataset_fingerprint(cached) != expected_fingerprint):
+        raise RuntimeError(
+          f'processed dataset fingerprint mismatch for {_path}')
+      runtime_path = _runtime_provenance_path(
+        provenance_dir, provenance_role, provenance_key)
+      data_provenance.write_manifest(runtime_path, manifest)
+    return cached.with_format('torch')
   if streaming:
     LOGGER.info(f'Streaming {dataset_name} split {mode}.')
   else:
@@ -325,8 +504,22 @@ def get_dataset(
     # double block size for sub-sampling
     block_size *= 2
   revision_kwargs = {} if revision is None else {'revision': revision}
-  
-  if dataset_name == 'wikitext103':
+
+  if dataset_name_or_path is not None:
+    load_kwargs = {
+      'split': source_split,
+      'cache_dir': cache_dir,
+      'streaming': streaming,
+      **revision_kwargs,
+    }
+    if trust_remote_code:
+      load_kwargs['trust_remote_code'] = True
+    dataset = datasets.load_dataset(
+      dataset_name_or_path,
+      name=dataset_config_name,
+      **load_kwargs)
+    data = dataset
+  elif dataset_name == 'wikitext103':
     dataset = datasets.load_dataset(
       'wikitext',
       name='wikitext-103-raw-v1',
@@ -391,11 +584,37 @@ def get_dataset(
       streaming=streaming,
       **revision_kwargs)
 
-  if dataset_name in ['lambada', 'openwebtext-train',
-                      'openwebtext-valid']:
-    data = dataset
-  else:
-    data = dataset[mode]
+  if dataset_name_or_path is None:
+    if dataset_name in ['lambada', 'openwebtext-train',
+                        'openwebtext-valid']:
+      data = dataset
+    else:
+      data = dataset[mode]
+
+  observed_source_num_rows = _source_row_count(
+    data, streaming=streaming)
+  if (source_num_rows is not None
+      and observed_source_num_rows is not None
+      and observed_source_num_rows != source_num_rows):
+    raise RuntimeError(
+      f'{dataset_name} source row count mismatch at revision {revision}: '
+      f'expected {source_num_rows}, observed {observed_source_num_rows}')
+  raw_fingerprint = _dataset_fingerprint(data)
+  data = _select_source_window(
+    data, normalized_window, streaming=streaming)
+  observed_window_num_rows = _source_row_count(
+    data, streaming=streaming)
+  if (normalized_window is not None
+      and observed_window_num_rows is not None
+      and observed_window_num_rows != (
+        normalized_window[1] - normalized_window[0])):
+    raise RuntimeError(
+      f'{dataset_name} row window did not materialize its pinned size')
+
+  if document_boundary_mode == 'wikitext_articles':
+    if streaming:
+      raise ValueError('wikitext_articles mode requires map-style loading')
+    data = _coalesce_wikitext_articles(data)
 
   if dataset_name.startswith('wikitext'):
     detokenizer = wt_detokenizer
@@ -405,7 +624,8 @@ def get_dataset(
     detokenizer = lm1b_detokenizer
   elif dataset_name == 'lambada':
     detokenizer = lambada_detokenizer
-  elif dataset_name.startswith('scientific_papers'):
+  elif (dataset_name.startswith('scientific_papers')
+        or dataset_name_or_path == 'armanc/scientific_papers'):
     detokenizer = scientific_papers_detokenizer
   else:
     detokenizer = None
@@ -419,6 +639,15 @@ def get_dataset(
   
   EOS = tokenizer.encode(tokenizer.eos_token)[0]
   BOS = tokenizer.encode(tokenizer.bos_token)[0]
+
+  selected_text_field = text_field
+  if selected_text_field is None:
+    if dataset_name == 'ptb':
+      selected_text_field = 'sentence'
+    elif 'scientific_papers' in dataset_name:
+      selected_text_field = 'article'
+    else:
+      selected_text_field = 'text'
 
   def preprocess_and_tokenize(example):
     if dataset_name == 'ptb':
@@ -452,55 +681,147 @@ def get_dataset(
                          return_token_type_ids=True)
     return tokens
 
-  if streaming:
-    tokenized_dataset = data.map(
-      preprocess_and_tokenize,
-      batched=True)
+  def preprocess_document_windows(example, indices):
+    raw_texts = list(example[selected_text_field])
+    texts = list(raw_texts)
+    if detokenizer is not None:
+      texts = _apply_detokenizer(detokenizer)(texts)
+    tokenizer.padding_side = 'right'
+    tokenizer.truncation_side = 'right'
+    encoded = tokenizer(
+      texts,
+      add_special_tokens=False,
+      return_attention_mask=False,
+      return_token_type_ids=False)['input_ids']
+    payload_size = block_size - 2
+    result = {
+      'input_ids': [],
+      'attention_mask': [],
+      'source_document_index': [],
+      'source_document_sha256': [],
+      'source_chunk_index': [],
+      'source_document_token_count': [],
+    }
+    window_start = normalized_window[0] if normalized_window else 0
+    source_starts = example.get('_source_start_index')
+    source_hashes = example.get('_source_document_sha256')
+    for batch_index, token_ids in enumerate(encoded):
+      if source_starts is None:
+        document_index = window_start + int(indices[batch_index])
+      else:
+        document_index = int(source_starts[batch_index])
+      if source_hashes is None:
+        document_hash = hashlib.sha256(
+          raw_texts[batch_index].encode('utf-8')).hexdigest()
+      else:
+        document_hash = str(source_hashes[batch_index])
+      full_chunks = len(token_ids) // payload_size
+      for chunk_index in range(full_chunks):
+        start = chunk_index * payload_size
+        chunk = token_ids[start: start + payload_size]
+        result['input_ids'].append([BOS] + chunk + [EOS])
+        result['attention_mask'].append([1] * block_size)
+        result['source_document_index'].append(document_index)
+        result['source_document_sha256'].append(document_hash)
+        result['source_chunk_index'].append(chunk_index)
+        result['source_document_token_count'].append(len(token_ids))
+    return result
+
+  if document_boundary_mode != 'concatenate':
+    remove_columns = list(data.column_names or [])
+    map_kwargs = {
+      'batched': True,
+      'with_indices': True,
+      'remove_columns': remove_columns,
+    }
+    if not streaming:
+      map_kwargs.update({
+        'num_proc': num_proc,
+        'load_from_cache_file': True,
+        'desc': 'Tokenizing document-local windows',
+      })
+    chunked_dataset = data.map(
+      preprocess_document_windows, **map_kwargs)
+    if not streaming and len(chunked_dataset) == 0:
+      raise RuntimeError(
+        f'{dataset_name} produced no full document-local windows of '
+        f'length {block_size}')
   else:
-    tokenized_dataset = data.map(
-      preprocess_and_tokenize,
-      batched=True,
-      num_proc=num_proc,
-      load_from_cache_file=True,
-      desc='Tokenizing')
-  if dataset_name == 'ptb':
-    tokenized_dataset = tokenized_dataset.remove_columns(
-      'sentence')
-  elif 'scientific_papers' in dataset_name:
-    tokenized_dataset = tokenized_dataset.remove_columns([
-      'article', 'abstract', 'section_names'])
-  elif dataset_name == 'ag_news':
-    tokenized_dataset = tokenized_dataset.remove_columns(
-      ['text', 'label'])
-  else:
-    tokenized_dataset = tokenized_dataset.remove_columns(
-      'text')
+    if streaming:
+      tokenized_dataset = data.map(
+        preprocess_and_tokenize,
+        batched=True)
+    else:
+      tokenized_dataset = data.map(
+        preprocess_and_tokenize,
+        batched=True,
+        num_proc=num_proc,
+        load_from_cache_file=True,
+        desc='Tokenizing')
+    if dataset_name == 'ptb':
+      tokenized_dataset = tokenized_dataset.remove_columns(
+        'sentence')
+    elif 'scientific_papers' in dataset_name:
+      tokenized_dataset = tokenized_dataset.remove_columns([
+        'article', 'abstract', 'section_names'])
+    elif dataset_name == 'ag_news':
+      tokenized_dataset = tokenized_dataset.remove_columns(
+        ['text', 'label'])
+    else:
+      tokenized_dataset = tokenized_dataset.remove_columns(
+        'text')
 
   if not wrap:
     if not streaming:
       tokenized_dataset.save_to_disk(_path)
     return tokenized_dataset.with_format('torch')
 
-  group_texts = functools.partial(
-    _group_texts, block_size=block_size, bos=BOS, eos=EOS)
-  if streaming:
-    chunked_dataset = tokenized_dataset.map(
-      group_texts,
-      batched=True)
-  else:
-    chunked_dataset = tokenized_dataset.map(
-      group_texts,
-      batched=True,
-      num_proc=num_proc,
-      load_from_cache_file=True,
-      desc='Grouping')
+  if document_boundary_mode == 'concatenate':
+    group_texts = functools.partial(
+      _group_texts, block_size=block_size, bos=BOS, eos=EOS)
+    if streaming:
+      chunked_dataset = tokenized_dataset.map(
+        group_texts,
+        batched=True)
+    else:
+      chunked_dataset = tokenized_dataset.map(
+        group_texts,
+        batched=True,
+        num_proc=num_proc,
+        load_from_cache_file=True,
+        desc='Grouping')
+
+  if not streaming:
     chunked_dataset.save_to_disk(_path)
+
+  if require_pinned_provenance:
+    observed = {
+      'source_num_rows': observed_source_num_rows,
+      'window_num_rows': observed_window_num_rows,
+      'document_num_rows_after_boundary_recovery': (
+        _source_row_count(data, streaming=streaming)),
+      'processed_num_sequences': (
+        _source_row_count(chunked_dataset, streaming=streaming)),
+      'raw_fingerprint': raw_fingerprint,
+      'window_fingerprint': _dataset_fingerprint(data),
+      'processed_fingerprint': _dataset_fingerprint(chunked_dataset),
+    }
+    manifest = data_provenance.build_manifest(
+      specification=specification, observed=observed)
+    runtime_path = _runtime_provenance_path(
+      provenance_dir, provenance_role, provenance_key)
+    data_provenance.write_manifest(runtime_path, manifest)
+    if not streaming:
+      data_provenance.write_manifest(cache_provenance_path, manifest)
   chunked_dataset = chunked_dataset.with_format('torch')
   return chunked_dataset
 
 
 def get_tokenizer(config):
   tokenizer_revision = getattr(config.data, 'tokenizer_revision', None)
+  if bool(getattr(config.data, 'require_pinned_provenance', False)):
+    tokenizer_revision = data_provenance.require_commit_revision(
+      tokenizer_revision, field='data.tokenizer_revision')
   revision_kwargs = (
     {} if tokenizer_revision is None
     else {'revision': tokenizer_revision})
@@ -573,6 +894,76 @@ def get_dataloaders(config, tokenizer, skip_train=False,
     raise ValueError(
       f'Eval Batch Size for {config.eval.batch_size} '
       f'not divisible by {num_gpus}.')
+
+  data_cfg = config.data
+
+  def data_option(name, default=None):
+    if hasattr(data_cfg, 'get'):
+      return data_cfg.get(name, default)
+    return getattr(data_cfg, name, default)
+
+  def source_option(role, name, default=None):
+    return data_option(f'{role}_{name}', default)
+
+  require_pinned = bool(
+    data_option('require_pinned_provenance', False))
+  provenance_dir = data_option('provenance_dir', None)
+  if require_pinned and not provenance_dir:
+    provenance_dir = os.path.join(
+      str(config.checkpointing.save_dir), 'data_provenance')
+
+  disjoint_proof = None
+  if bool(data_option('require_disjoint_train_valid_windows', False)):
+    equality_fields = (
+      'dataset_name_or_path', 'dataset_config_name', 'source_split',
+      'revision', 'expected_source_num_rows')
+    mismatches = [
+      field for field in equality_fields
+      if source_option('train', field) != source_option('valid', field)
+    ]
+    if mismatches:
+      raise ValueError(
+        'disjoint row-window proof requires identical train/valid source '
+        f'fields; mismatched: {mismatches}')
+    disjoint_proof = data_provenance.disjoint_window_proof(
+      dataset_name_or_path=source_option('train', 'dataset_name_or_path'),
+      dataset_config_name=source_option('train', 'dataset_config_name'),
+      split=source_option('train', 'source_split'),
+      revision=source_option('train', 'revision'),
+      source_num_rows=int(source_option(
+        'train', 'expected_source_num_rows')),
+      train_window=list(source_option('train', 'source_window')),
+      heldout_window=list(source_option('valid', 'source_window')))
+
+  shared_dataset_kwargs = {
+    'require_pinned_provenance': require_pinned,
+    'tokenizer_name_or_path': data_option(
+      'tokenizer_name_or_path', None),
+    'tokenizer_revision': data_option('tokenizer_revision', None),
+    'provenance_dir': provenance_dir,
+    'disjoint_window_proof': disjoint_proof,
+  }
+
+  def role_dataset_kwargs(role):
+    window = source_option(role, 'source_window', None)
+    return {
+      'dataset_name_or_path': source_option(
+        role, 'dataset_name_or_path', None),
+      'dataset_config_name': source_option(
+        role, 'dataset_config_name', None),
+      'source_split': source_option(role, 'source_split', None),
+      'source_window': None if window is None else list(window),
+      'expected_source_num_rows': source_option(
+        role, 'expected_source_num_rows', None),
+      'text_field': source_option(role, 'text_field', None),
+      'document_boundary_mode': source_option(
+        role, 'document_boundary_mode', 'concatenate'),
+      'trust_remote_code': bool(source_option(
+        role, 'trust_remote_code', False)),
+      'provenance_role': role,
+      **shared_dataset_kwargs,
+    }
+
   if skip_train:
     train_set = None
   else:
@@ -584,7 +975,8 @@ def get_dataloaders(config, tokenizer, skip_train=False,
       cache_dir=config.data.cache_dir,
       block_size=config.model.length,
       streaming=bool(config.data.streaming),
-      revision=getattr(config.data, 'train_revision', None))
+      revision=getattr(config.data, 'train_revision', None),
+      **role_dataset_kwargs('train'))
     if (config.data.streaming
         and not isinstance(
           train_set, torch.utils.data.IterableDataset)):
@@ -608,7 +1000,8 @@ def get_dataloaders(config, tokenizer, skip_train=False,
       cache_dir=config.data.cache_dir,
       block_size=config.model.length,
       streaming=False,
-      revision=getattr(config.data, 'valid_revision', None))
+      revision=getattr(config.data, 'valid_revision', None),
+      **role_dataset_kwargs('valid'))
 
   if skip_train:
     train_loader = None
@@ -624,7 +1017,8 @@ def get_dataloaders(config, tokenizer, skip_train=False,
   if skip_valid:
     valid_loader = None
   else:
-    if valid_seed is None:
+    if (valid_seed is None
+        or not bool(data_option('shuffle_validation', True))):
       shuffle_valid = False
       generator = None
     else:
