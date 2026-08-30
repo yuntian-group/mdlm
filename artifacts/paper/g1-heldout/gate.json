@@ -28,6 +28,6 @@
     ]
   },
   "passed": true,
-  "scientific_scope": "frozen target-independent features with exact synthetic conditional-influence supervision for topology; this is a supervised-topology upper bound, not unsupervised graph discovery",
+  "scientific_scope": "frozen target-independent features with exact synthetic conditional-influence supervision for topology; this is a favorable-supervision diagnostic, not unsupervised graph discovery",
   "screen_passed": true
 }

@@ -233,8 +233,8 @@ def dependency_targets(
   # conditional-influence target: an edge is positive when revealing one
   # endpoint changes the other endpoint's distribution.  Mutual information
   # computes that criterion without reading ``task.true_edges``.  It is still
-  # supervised topology and should be reported as an upper bound, not as
-  # unsupervised graph discovery.
+  # privileged supervised topology and should be reported as a favorable-
+  # supervision diagnostic, not as unsupervised graph discovery.
   if adjacency is None:
     adjacency = dependency_adjacency(task, contexts.device)
   expected = (task.num_contexts, task.length, task.length)
@@ -454,7 +454,7 @@ def evaluate_neural_gate(
     'scientific_scope': (
       'frozen target-independent features with exact synthetic '
       'conditional-influence supervision for topology; this is a '
-      'supervised-topology upper bound, not unsupervised graph discovery'),
+      'favorable-supervision diagnostic, not unsupervised graph discovery'),
     'screen_passed': bool(all(screen_checks.values())),
     'checks': screen_checks,
     'metrics': {

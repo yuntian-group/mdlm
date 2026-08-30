@@ -26,5 +26,5 @@
     ]
   },
   "passed": true,
-  "scientific_scope": "finite-data maximum-likelihood forest projection; not neural-head training evidence"
+  "scientific_scope": "finite-data additively smoothed empirical forest projection; not neural-head training evidence"
 }
