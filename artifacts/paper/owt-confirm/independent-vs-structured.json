@@ -4,7 +4,7 @@
     "treatment": "structured"
   },
   "checkpoints": [],
-  "created_utc": "2026-08-30T11:29:13.356039+00:00",
+  "created_utc": "2026-08-30T11:44:52.042234+00:00",
   "mean_conditional_nll_improvement_per_masked_token": 0.008761655599566076,
   "num_pairs": 5,
   "objective": "conditional_denoising_nll_per_masked_token",
@@ -578,7 +578,16 @@
         "batch_size": 4,
         "component_size_cap": 32,
         "configured_batches_per_seed_arm": 32,
-        "dataset": "WikiText-103 finite validation split",
+        "dataset": {
+          "config": "wikitext-103-raw-v1",
+          "dataset_contents_redistributed": false,
+          "processed_arrow_sha256": "1b0b203628c2f78f545d71e8279aec02a66b7d5c19b58b810f37a9243af31d7c",
+          "processed_arrow_size_bytes": 1886864,
+          "processed_fingerprint": "866bd647e4df8268",
+          "repository": "wikitext",
+          "revision": "b08601e04326c79dfdd32d625aee71d232d685c3",
+          "split": "validation"
+        },
         "experiment_git_sha": "9999a7a8a670fbe323335bd73076db6cefb601cf",
         "paired_bootstrap": {
           "confidence_level": 0.95,
@@ -634,7 +643,18 @@
           "size_bytes": 691932032
         },
         "checkpoint_selection": "final step-1000 checkpoint, not validation-selected best",
-        "dataset": "OpenWebText streaming train split",
+        "dataset": {
+          "config": "plain_text",
+          "data_glob": "plain_text/train-*",
+          "descriptor_sha256": "f474535918192336b269db8941c299c608c53a32b74316a55a0c2502acf34daa",
+          "repository": "openwebtext",
+          "revision": "79d93d786212f7344586290adb811d4ae6a1762c",
+          "shuffle": false,
+          "split": "train",
+          "streaming": true,
+          "total_examples": 8013769,
+          "wrap": true
+        },
         "ema_used": false,
         "experiment_git_sha": "6ca04eb95d02dc229f3fceec8625fe6cf67a023f",
         "final_validation_conditional_nll_per_masked_token": 5.91806,
@@ -647,10 +667,29 @@
           "released_tensors_compared": 131
         },
         "head_learning_rate": 0.0003,
+        "portable_adapter": {
+          "format": "safetensors",
+          "parameter_count": 984417,
+          "seed_201_metrics_byte_identical_to_full_checkpoint": true,
+          "seed_201_pairing_digest_byte_identical_to_full_checkpoint": true,
+          "sha256": "3e1cdc200dba3a46290578e7b62404c0a7d39a63f580693e26ef35855cf64573",
+          "size_bytes": 3939804,
+          "strict_rehydration_verified": true,
+          "tensor_count": 21
+        },
         "processed_sequence_slots": 4000,
         "processed_token_slots": 4096000,
         "seed": 1,
         "sequence_length": 1024,
+        "tokenizer": {
+          "config_sha256": "0daed7749b4f02b8f76240d5444551d7b08712dab4d0adb8239c56ba823bb7b4",
+          "merges_sha256": "1ce1664773c50f3e0cc8842619a93edc4624525b728b188a9e0be33b7726adc5",
+          "repository": "gpt2",
+          "revision": "607a30d783dfa663caf39e06633721c8d4cfcd7e",
+          "tokenizer_config_sha256": "5e04eb606e3a1583530a42e36c2a6b6615c86f34fe77e44d9ddeb43ff940931f",
+          "tokenizer_json_sha256": "8414cab924d8b9b33013f0d221c5862f365ee9be39c5c2bfae8a5a9e970478a6",
+          "vocab_sha256": "196139668be63f3b5d6574427317ae82f612a97c5d1cdaf36ed2256dbf636783"
+        },
         "topology_supervision_weight": 0.1,
         "updates": 1000,
         "warmup_updates": 50
@@ -667,7 +706,7 @@
     "pairing_tolerance": 1e-08
   },
   "repository": {
-    "git_sha": "a8a7bbdc861dc2790ce12fec52d5c6f9e06c235f",
+    "git_sha": "b6466090069373049d3067e182c3006e3f0e3baa",
     "git_worktree_dirty": false
   },
   "schema_version": 1,
