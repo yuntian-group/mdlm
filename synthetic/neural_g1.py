@@ -44,6 +44,7 @@ class NeuralTrainConfig:
   learning_rate: float = 1e-2
   dependency_weight: float = 1.0
   factor_init_std: float = 0.25
+  factor_init_seed: int = 1729
   factor_warmup_steps: int = 0
   gradient_clip: float = 5.0
   eval_samples: int = 20000
@@ -56,6 +57,8 @@ def model_specs(task: ContextSwitchingMatching) -> dict[str, NeuralModelSpec]:
   # matching is deterministic and does not privilege the contextual model.
   static_edges = task.matchings[0]
   return {
+    # Legacy identifier retained for artifact compatibility.  Pair parameters
+    # are inactive, so this is only an architecture-count/no-edge control.
     'parameter_matched_independent': NeuralModelSpec(
       'parameter_matched_independent', 'dynamic', 'dynamic', True),
     'natural_chain': NeuralModelSpec(
@@ -106,7 +109,8 @@ class SyntheticForestAdapter(nn.Module):
 
   def __init__(self, task: ContextSwitchingMatching,
                spec: NeuralModelSpec,
-               factor_init_std: float = 0.25):
+               factor_init_std: float = 0.25,
+               factor_init_seed: int = 1729):
     super().__init__()
     if factor_init_std <= 0.0:
       raise ValueError('factor_init_std must be positive')
@@ -134,9 +138,12 @@ class SyntheticForestAdapter(nn.Module):
     # in this tiny vocabulary.  A generic (label-agnostic) wider random start
     # lets the structural gate test learning rather than symmetry breaking.
     inverse_softplus_one = math.log(math.e - 1.0)
+    factor_generator = torch.Generator(device='cpu').manual_seed(
+      factor_init_seed)
     nn.init.normal_(
       self.head.token_factor_embedding.weight,
-      mean=inverse_softplus_one, std=factor_init_std)
+      mean=inverse_softplus_one, std=factor_init_std,
+      generator=factor_generator)
     if spec.fixed_edges is not None:
       self.register_buffer(
         'fixed_edges', torch.tensor(spec.fixed_edges, dtype=torch.long),
@@ -263,7 +270,9 @@ def train_adapter(
   if config.factor_warmup_steps < 0:
     raise ValueError('factor_warmup_steps must be nonnegative')
   model = SyntheticForestAdapter(
-    task, spec, factor_init_std=config.factor_init_std).to(device)
+    task, spec,
+    factor_init_std=config.factor_init_std,
+    factor_init_seed=config.factor_init_seed).to(device)
   optimizer = torch.optim.AdamW(
     model.head.parameters(), lr=config.learning_rate, weight_decay=1e-4)
   history = []

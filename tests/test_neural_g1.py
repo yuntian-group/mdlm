@@ -32,6 +32,18 @@ class NeuralG1Test(unittest.TestCase):
         config=NeuralTrainConfig(steps=1, factor_warmup_steps=-1),
         device=torch.device('cpu'))
 
+  def test_factor_basis_initialization_is_seed_independent(self):
+    task = ContextSwitchingMatching(vocab_size=3)
+    spec = model_specs(task)['contextual_forest']
+    torch.manual_seed(11)
+    first = SyntheticForestAdapter(task, spec, factor_init_seed=1729)
+    torch.manual_seed(97)
+    second = SyntheticForestAdapter(task, spec, factor_init_seed=1729)
+    torch.testing.assert_close(
+      first.head.token_factor_embedding.weight,
+      second.head.token_factor_embedding.weight,
+      rtol=0.0, atol=0.0)
+
   def test_batch_respects_context_matching(self):
     task = ContextSwitchingMatching(vocab_size=4)
     contexts, tokens, _ = sample_training_batch(
