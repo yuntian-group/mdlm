@@ -128,6 +128,33 @@ class MulticorpusDataTest(unittest.TestCase):
       cache_manifests = list(cache_dir.glob('*.provenance.json'))
       self.assertEqual(len(cache_manifests), 1)
 
+      # A second caller must validate and reuse the persisted Arrow dataset.
+      # Dataset fingerprints can change across save/load, so this specifically
+      # guards against recording the transient pre-save fingerprint.
+      with mock.patch.object(
+          dataloader.datasets, 'load_dataset',
+          side_effect=AssertionError('source dataset should not be reloaded')):
+        cached_result = dataloader.get_dataset(
+          'fake-pinned', tokenizer=tokenizer, wrap=True,
+          mode='validation', cache_dir=str(cache_dir), block_size=6,
+          num_proc=1, streaming=False, revision='a' * 40,
+          dataset_name_or_path='owner/corpus',
+          dataset_config_name='default', source_split='validation',
+          expected_source_num_rows=2, text_field='text',
+          document_boundary_mode='source_document',
+          require_pinned_provenance=True,
+          tokenizer_name_or_path='owner/tokenizer',
+          tokenizer_revision='b' * 40,
+          provenance_dir=str(provenance_dir),
+          provenance_role='valid')
+      self.assertEqual(len(cached_result), len(result))
+      cached_manifest = json.loads(cache_manifests[0].read_text())
+      raw_cached_result = datasets.load_from_disk(
+        str(cache_manifests[0]).removesuffix('.provenance.json'))
+      self.assertEqual(
+        cached_manifest['observed']['processed_fingerprint'],
+        raw_cached_result._fingerprint)
+
       cache_manifests[0].unlink()
       with self.assertRaisesRegex(RuntimeError, 'without provenance'):
         dataloader.get_dataset(

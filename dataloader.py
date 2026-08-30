@@ -23,6 +23,12 @@ import utils
 LOGGER = utils.get_logger(__name__)
 
 
+# Bump this whenever the on-disk representation or its validation semantics
+# change.  In particular, v2 records the fingerprint assigned by
+# ``load_from_disk`` rather than the transient pre-save Dataset fingerprint.
+PINNED_PROCESSED_CACHE_SCHEMA_VERSION = 2
+
+
 def wt_detokenizer(string):
   # contractions
   string = string.replace("s '", "s'")
@@ -447,6 +453,8 @@ def get_dataset(
       'block_size': int(block_size),
       'wrap': bool(wrap),
       'document_boundary_mode': document_boundary_mode,
+      'processed_cache_schema_version': (
+        PINNED_PROCESSED_CACHE_SCHEMA_VERSION),
       'document_remainder_policy': (
         'drop_incomplete_tail_and_documents_shorter_than_payload'
         if document_boundary_mode != 'concatenate' else None),
@@ -793,6 +801,12 @@ def get_dataset(
 
   if not streaming:
     chunked_dataset.save_to_disk(_path)
+    # Hugging Face gives a Dataset a new fingerprint when it is persisted and
+    # loaded back from Arrow.  The provenance record must describe the object
+    # future runs will validate, not the transient in-memory object that wrote
+    # the cache.  Reloading here also makes the first and subsequent callers
+    # observe identical dataset metadata.
+    chunked_dataset = datasets.load_from_disk(_path)
 
   if require_pinned_provenance:
     observed = {
