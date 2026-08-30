@@ -125,6 +125,7 @@ def export_adapter(
     output_path: Path,
     manifest_path: Path,
     *,
+    expected_checkpoint_sha256: str,
     expected_global_step: int | None = None,
     expected_backbone_tensors: int | None = RELEASE_TENSOR_COUNT,
     overwrite: bool = False,
@@ -141,6 +142,19 @@ def export_adapter(
     raise FileExistsError(
       f'{existing[0]} already exists; pass --force to replace outputs')
 
+  if (len(expected_checkpoint_sha256) != 64
+      or any(character not in '0123456789abcdef'
+             for character in expected_checkpoint_sha256.lower())):
+    raise ValueError('expected checkpoint SHA256 must be 64 hex characters')
+  source_checkpoint_sha256 = sha256_file(checkpoint_path)
+  if source_checkpoint_sha256 != expected_checkpoint_sha256.lower():
+    raise ValueError(
+      f'source checkpoint SHA256 mismatch: expected '
+      f'{expected_checkpoint_sha256.lower()}, '
+      f'found {source_checkpoint_sha256}')
+
+  # Lightning checkpoints use pickle.  Byte identity is therefore checked
+  # against a caller-supplied trusted digest before any deserialization.
   checkpoint = torch.load(
     checkpoint_path, map_location='cpu', weights_only=False)
   if not isinstance(checkpoint, Mapping):
@@ -194,7 +208,7 @@ def export_adapter(
       'adapter_namespace_in_source': f'{ADAPTER_PREFIX}*',
       'adapter_namespace_in_file': 'prefix-stripped',
       'tensor_schema': tensor_schema,
-      'source_checkpoint_sha256': sha256_file(checkpoint_path),
+      'source_checkpoint_sha256': source_checkpoint_sha256,
       'source_checkpoint_size_bytes': checkpoint_path.stat().st_size,
       'source_checkpoint_global_step': global_step,
       'source_state_dict_tensor_count': backbone_count + len(adapter),
@@ -230,6 +244,7 @@ def _args(argv=None) -> argparse.Namespace:
   parser.add_argument('--checkpoint', type=Path, required=True)
   parser.add_argument('--output', type=Path, required=True)
   parser.add_argument('--manifest', type=Path, required=True)
+  parser.add_argument('--expected-checkpoint-sha256', required=True)
   parser.add_argument('--expected-global-step', type=int)
   parser.add_argument(
     '--expected-backbone-tensors', type=int, default=RELEASE_TENSOR_COUNT)
@@ -243,6 +258,7 @@ def main() -> int:
     args.checkpoint,
     args.output,
     args.manifest,
+    expected_checkpoint_sha256=args.expected_checkpoint_sha256,
     expected_global_step=args.expected_global_step,
     expected_backbone_tensors=args.expected_backbone_tensors,
     overwrite=args.force)

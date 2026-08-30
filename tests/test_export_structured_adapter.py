@@ -1,4 +1,5 @@
 from pathlib import Path
+import hashlib
 import tempfile
 import unittest
 
@@ -13,6 +14,9 @@ from scripts.export_structured_adapter import (
 
 
 class ExportStructuredAdapterTest(unittest.TestCase):
+
+  def _sha256(self, path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
   def _checkpoint(self, path: Path) -> dict[str, torch.Tensor]:
     adapter = {
@@ -43,6 +47,7 @@ class ExportStructuredAdapterTest(unittest.TestCase):
         checkpoint,
         output,
         manifest_path,
+        expected_checkpoint_sha256=self._sha256(checkpoint),
         expected_global_step=7,
         expected_backbone_tensors=1)
 
@@ -67,6 +72,7 @@ class ExportStructuredAdapterTest(unittest.TestCase):
       with self.assertRaisesRegex(ValueError, 'global-step mismatch'):
         export_adapter(
           checkpoint, output, manifest,
+          expected_checkpoint_sha256=self._sha256(checkpoint),
           expected_global_step=8, expected_backbone_tensors=1)
 
       payload = torch.load(
@@ -76,6 +82,7 @@ class ExportStructuredAdapterTest(unittest.TestCase):
       with self.assertRaisesRegex(ValueError, 'outside backbone'):
         export_adapter(
           checkpoint, output, manifest,
+          expected_checkpoint_sha256=self._sha256(checkpoint),
           expected_global_step=7, expected_backbone_tensors=1)
 
   def test_hash_verification_and_overwrite_protection(self):
@@ -87,13 +94,29 @@ class ExportStructuredAdapterTest(unittest.TestCase):
       manifest = root / 'manifest.json'
       export_adapter(
         checkpoint, output, manifest,
+        expected_checkpoint_sha256=self._sha256(checkpoint),
         expected_global_step=7, expected_backbone_tensors=1)
       with self.assertRaisesRegex(FileExistsError, '--force'):
         export_adapter(
           checkpoint, output, manifest,
+          expected_checkpoint_sha256=self._sha256(checkpoint),
           expected_global_step=7, expected_backbone_tensors=1)
       with self.assertRaisesRegex(ValueError, 'SHA256 mismatch'):
         load_adapter_state(output, expected_sha256='0' * 64)
+
+  def test_checkpoint_hash_is_checked_before_deserialization(self):
+    with tempfile.TemporaryDirectory() as directory:
+      root = Path(directory)
+      checkpoint = root / 'untrusted.ckpt'
+      checkpoint.write_bytes(b'not a pickle checkpoint')
+      with self.assertRaisesRegex(ValueError, 'checkpoint SHA256 mismatch'):
+        export_adapter(
+          checkpoint,
+          root / 'adapter.safetensors',
+          root / 'manifest.json',
+          expected_checkpoint_sha256='0' * 64,
+          expected_global_step=7,
+          expected_backbone_tensors=1)
 
 
 if __name__ == '__main__':
