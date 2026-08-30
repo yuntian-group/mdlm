@@ -1,0 +1,28 @@
+name: contextual-forest-small
+type: ddit
+hidden_size: 768
+cond_dim: 128
+length: 1024
+n_blocks: 12
+n_heads: 12
+scale_by_sigma: True
+dropout: 0.1
+tie_word_embeddings: False
+
+# Fixed/dynamic topology and factor modes are orthogonal ablations.  Setting
+# independent_mode=true leaves the full head instantiated but neutralizes all
+# pair factors, providing the parameter-matched independent control.
+structured_decoder:
+  enabled: true
+  top_k: 64
+  rank: 16
+  time_embed_dim: 64
+  topology_dim: 128
+  local_window: 2
+  num_anchor_slots: 16
+  contextual_neighbors: 4
+  component_size_cap: 32
+  topology_mode: dynamic
+  factor_mode: dynamic
+  independent_mode: false
+  min_edge_score: null

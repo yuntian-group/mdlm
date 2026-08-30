@@ -1,0 +1,27 @@
+name: contextual-forest-tiny
+type: ddit
+hidden_size: 512
+cond_dim: 128
+length: 256
+n_blocks: 6
+n_heads: 8
+scale_by_sigma: True
+dropout: 0.1
+tie_word_embeddings: False
+
+# The DIT integration constructs ContextualCouplingForestHead from this block.
+# Switching independent_mode changes no parameter shapes or counts.
+structured_decoder:
+  enabled: true
+  top_k: 32
+  rank: 8
+  time_embed_dim: 64
+  topology_dim: 64
+  local_window: 2
+  num_anchor_slots: 8
+  contextual_neighbors: 2
+  component_size_cap: 16
+  topology_mode: dynamic
+  factor_mode: dynamic
+  independent_mode: false
+  min_edge_score: null

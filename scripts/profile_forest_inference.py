@@ -1,0 +1,208 @@
+#!/usr/bin/env python3
+"""Profile dense versus endpoint-factor exact forest inference."""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+from pathlib import Path
+import platform
+import subprocess
+import sys
+import time
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT))
+
+import torch  # noqa: E402
+
+import structured_utils  # noqa: E402
+
+
+def bounded_chain_edges(
+    length: int,
+    component_size: int,
+    device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+  if length < 1 or component_size < 1:
+    raise ValueError('length and component_size must be positive')
+  edges = []
+  for start in range(0, length, component_size):
+    stop = min(start + component_size, length)
+    edges.extend((position, position + 1)
+                 for position in range(start, stop - 1))
+  padded = torch.zeros(
+    max(length - 1, 0), 2, dtype=torch.long, device=device)
+  mask = torch.zeros(
+    max(length - 1, 0), dtype=torch.bool, device=device)
+  if edges:
+    padded[:len(edges)] = torch.tensor(edges, dtype=torch.long, device=device)
+    mask[:len(edges)] = True
+  return padded, mask
+
+
+def _elapsed_ms(callable_, device: torch.device, repetitions: int) -> float:
+  if device.type == 'cuda':
+    torch.cuda.synchronize(device)
+  start = time.perf_counter()
+  for _ in range(repetitions):
+    callable_()
+  if device.type == 'cuda':
+    torch.cuda.synchronize(device)
+  return 1000.0 * (time.perf_counter() - start) / repetitions
+
+
+def profile_shape(
+    length: int,
+    candidate_count: int,
+    rank: int,
+    component_size: int,
+    warmup: int,
+    repetitions: int,
+    device: torch.device) -> dict[str, object]:
+  generator = torch.Generator(device=device).manual_seed(
+    1000 + length + candidate_count)
+  node = torch.randn(
+    1, length, candidate_count + 1,
+    device=device, generator=generator, dtype=torch.float32)
+  left = torch.rand(
+    1, max(length - 1, 0), candidate_count, rank,
+    device=device, generator=generator) + 0.25
+  right = torch.rand(
+    1, max(length - 1, 0), candidate_count, rank,
+    device=device, generator=generator) + 0.25
+  edges, edge_mask = bounded_chain_edges(
+    length, component_size, device)
+  state_mask = torch.ones_like(node, dtype=torch.bool)
+
+  def low_rank_call():
+    return structured_utils.forest_sum_product_low_rank(
+      node, left, right, edges,
+      edge_mask=edge_mask, state_mask=state_mask,
+      max_component_size=component_size)
+
+  for _ in range(warmup):
+    low_rank_call()
+  if device.type == 'cuda':
+    torch.cuda.reset_peak_memory_stats(device)
+  low_rank_ms = _elapsed_ms(low_rank_call, device, repetitions)
+  low_rank_peak = (
+    int(torch.cuda.max_memory_allocated(device))
+    if device.type == 'cuda' else None)
+
+  result = {
+    'length': length,
+    'k': candidate_count,
+    'rank': rank,
+    'active_edges': int(edge_mask.sum()),
+    'component_size': component_size,
+    'low_rank_ms': low_rank_ms,
+    'low_rank_peak_bytes': low_rank_peak,
+    'dense_ms': None,
+    'dense_peak_bytes': None,
+    'dense_over_low_rank_time': None,
+  }
+  try:
+    dense = structured_utils.materialize_low_rank_pair_factors(
+      left, right, edge_mask=edge_mask)
+    log_dense = dense.log()
+
+    def dense_call():
+      return structured_utils.forest_sum_product(
+        node, log_dense, edges,
+        edge_mask=edge_mask, state_mask=state_mask,
+        max_component_size=component_size)
+
+    for _ in range(warmup):
+      dense_call()
+    if device.type == 'cuda':
+      torch.cuda.reset_peak_memory_stats(device)
+    dense_ms = _elapsed_ms(dense_call, device, repetitions)
+    dense_peak = (
+      int(torch.cuda.max_memory_allocated(device))
+      if device.type == 'cuda' else None)
+    result.update({
+      'dense_ms': dense_ms,
+      'dense_peak_bytes': dense_peak,
+      'dense_over_low_rank_time': dense_ms / low_rank_ms,
+    })
+  except RuntimeError as error:
+    result['dense_error'] = str(error)
+    if device.type == 'cuda':
+      torch.cuda.empty_cache()
+  return result
+
+
+def verify_dense_low_rank_agreement() -> dict[str, float]:
+  torch.manual_seed(72)
+  node = torch.randn(1, 6, 5, dtype=torch.float64)
+  left = torch.rand(1, 5, 4, 3, dtype=torch.float64) + 0.2
+  right = torch.rand(1, 5, 4, 3, dtype=torch.float64) + 0.2
+  edges, mask = bounded_chain_edges(6, 3, torch.device('cpu'))
+  dense = structured_utils.materialize_low_rank_pair_factors(
+    left, right, edge_mask=mask)
+  dense_result = structured_utils.forest_sum_product(
+    node, dense.log(), edges, edge_mask=mask)
+  low_rank_result = structured_utils.forest_sum_product_low_rank(
+    node, left, right, edges, edge_mask=mask)
+  return {
+    'max_log_partition_error': float((
+      dense_result.log_partition
+      - low_rank_result.log_partition).abs().max()),
+    'max_node_marginal_error': float((
+      dense_result.node_marginals
+      - low_rank_result.node_marginals).abs().max()),
+  }
+
+
+def _args():
+  parser = argparse.ArgumentParser()
+  parser.add_argument('--output', type=Path, required=True)
+  parser.add_argument('--shape', action='append', default=[],
+                      help='LENGTH,K; repeat for multiple shapes')
+  parser.add_argument('--rank', type=int, default=16)
+  parser.add_argument('--component-size', type=int, default=32)
+  parser.add_argument('--warmup', type=int, default=3)
+  parser.add_argument('--repetitions', type=int, default=10)
+  parser.add_argument('--device', default='cuda' if torch.cuda.is_available()
+                      else 'cpu')
+  return parser.parse_args()
+
+
+def main() -> int:
+  args = _args()
+  shapes = args.shape or ['256,32', '256,64', '512,64',
+                          '1024,64', '1024,128']
+  parsed_shapes = [tuple(map(int, shape.split(','))) for shape in shapes]
+  device = torch.device(args.device)
+  rows = [profile_shape(
+    length, k, args.rank, args.component_size,
+    args.warmup, args.repetitions, device)
+          for length, k in parsed_shapes]
+  try:
+    git_sha = subprocess.check_output(
+      ['git', 'rev-parse', 'HEAD'], cwd=REPO_ROOT, text=True).strip()
+  except (OSError, subprocess.CalledProcessError):
+    git_sha = 'unknown'
+  payload = {
+    'benchmark': 'forest_inference_profile',
+    'git_sha': git_sha,
+    'timestamp_utc': dt.datetime.now(dt.timezone.utc).isoformat(),
+    'device': str(device),
+    'gpu': (torch.cuda.get_device_name(device)
+            if device.type == 'cuda' else None),
+    'torch': torch.__version__,
+    'cuda': torch.version.cuda,
+    'python': platform.python_version(),
+    'agreement': verify_dense_low_rank_agreement(),
+    'rows': rows,
+  }
+  args.output.resolve().parent.mkdir(parents=True, exist_ok=True)
+  args.output.resolve().write_text(
+    json.dumps(payload, indent=2, sort_keys=True) + '\n')
+  print(json.dumps(payload, indent=2, sort_keys=True))
+  return 0
+
+
+if __name__ == '__main__':
+  raise SystemExit(main())

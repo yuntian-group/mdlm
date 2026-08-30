@@ -101,8 +101,10 @@ class DitSdpaFallbackTest(unittest.TestCase):
     try:
       with stub_optional_dependencies():
         package = importlib.import_module('models')
-        self.assertIn('crf_decoder', vars(package))
+        self.assertNotIn('crf_decoder', vars(package))
         self.assertNotIn('autoregressive', vars(package))
+        self.assertIsNotNone(package.crf_decoder)
+        self.assertIn('crf_decoder', vars(package))
         self.assertFalse(package.dit.FLASH_ATTN_AVAILABLE)
     finally:
       for name in list(sys.modules):

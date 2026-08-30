@@ -1,17 +1,15 @@
 import importlib
 
-from . import dit
-from . import ema
-from . import crf_decoder
-
-
 def __getattr__(name):
-  """Load optional backbones only when selected.
+  """Load model modules only when selected.
 
-  In particular, the autoregressive backbone still requires FlashAttention,
-  but importing the CRF backbone no longer imports it as a side effect.
+  This keeps the exact structured utilities usable in a minimal Torch-only
+  environment.  In particular, importing the coupling head does not require
+  OmegaConf, Transformers, FlashAttention, or the Mamba kernels.
   """
-  if name in {'dimamba', 'autoregressive'}:
+  if name in {
+      'dit', 'ema', 'crf_decoder', 'structured_decoder',
+      'dimamba', 'autoregressive'}:
     module = importlib.import_module(f'{__name__}.{name}')
     globals()[name] = module
     return module
