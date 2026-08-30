@@ -11,6 +11,7 @@ from scripts.compile_experiment_matrix import (
   DEFAULT_MANIFEST,
   JOB_SCHEMA_VERSION,
   REPO_ROOT,
+  TRUSTED_CANDIDATE_K_PROMOTION_TEMPLATES,
   compile_matrix,
   sha256_file,
 )
@@ -161,6 +162,48 @@ class ExperimentMatrixTest(unittest.TestCase):
           artifact_root_override=artifact_root,
           output_dir=artifact_root / 'plan',
           promotion_evidence={'candidate_k_128_pilot': evidence})
+
+  def test_candidate_k_source_uses_frozen_candidate_k_verifier(self):
+    with tempfile.TemporaryDirectory() as directory:
+      root = Path(directory)
+      artifact_root = root / 'artifacts'
+      evidence_path = root / 'candidate-k-promotion.json'
+      evidence_path.write_text('{}')
+      verified = {
+        'source_suite': 'candidate_k_128_pilot',
+        'route_name': 'confirmation',
+        'commitments': {
+          'canonical_decision_sha256': 'a' * 64,
+          'source_compiled_plan_sha256': 'b' * 64,
+        },
+      }
+      with mock.patch(
+          'scripts.evaluate_candidate_k_promotion.'
+          'verify_candidate_compiler_evidence',
+          return_value=verified) as candidate_verifier, mock.patch(
+          'scripts.evaluate_experiment_promotion.verify_compiler_evidence'
+      ) as pilot_verifier:
+        plan, _, _ = compile_matrix(
+          DEFAULT_MANIFEST,
+          selected_suites=['candidate_k_128_confirmation'],
+          allowed_artifact_root=root,
+          artifact_root_override=artifact_root,
+          output_dir=artifact_root / 'plan',
+          promotion_evidence={
+            'candidate_k_128_confirmation': evidence_path})
+
+    pilot_verifier.assert_not_called()
+    candidate_verifier.assert_called_once()
+    call = candidate_verifier.call_args
+    self.assertEqual(call.args, ({},))
+    self.assertEqual(
+      call.kwargs['trusted_template_path'],
+      TRUSTED_CANDIDATE_K_PROMOTION_TEMPLATES[
+        'contextual-forest-expansion-v1']['candidate_k_128_pilot'])
+    self.assertEqual(
+      plan['promotion_evidence']['candidate_k_128_confirmation'][
+        'source_suite'],
+      'candidate_k_128_pilot')
 
   def test_plan_identity_changes_with_clean_repository_revision(self):
     with tempfile.TemporaryDirectory() as directory:

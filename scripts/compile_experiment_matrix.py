@@ -35,6 +35,13 @@ TRUSTED_PROMOTION_POLICIES = {
     REPO_ROOT / 'configs/experiment'
     / 'contextual-forest-expansion-v1-promotion-policy.yaml'),
 }
+TRUSTED_CANDIDATE_K_PROMOTION_TEMPLATES = {
+  'contextual-forest-expansion-v1': {
+    'candidate_k_128_pilot': (
+      REPO_ROOT / 'configs/experiment'
+      / 'contextual-forest-k128-promotion-policy-template.yaml'),
+  },
+}
 
 
 def _exact_keys(
@@ -883,24 +890,43 @@ def compile_matrix(
         f'suite {suite_name} is gated on {source_suite}; provide '
         f'--promotion-evidence {suite_name} PATH')
     resolved_evidence = evidence_path.expanduser().resolve()
-    trusted_policy = TRUSTED_PROMOTION_POLICIES.get(manifest['protocol_id'])
-    if trusted_policy is None:
-      raise ValueError(
-        f'no trusted promotion policy is registered for '
-        f'{manifest["protocol_id"]}')
-    # Import lazily because the evaluator reuses this module's manifest
-    # validator.  The compiler never trusts arbitrary all-true JSON: it reads
-    # the registered policy and deterministically recomputes the decision.
-    from scripts.evaluate_experiment_promotion import (  # pylint: disable=import-outside-toplevel
-      verify_compiler_evidence,
-    )
-    evidence = verify_compiler_evidence(
-      _read_yaml_or_json(resolved_evidence),
-      evidence_path=resolved_evidence,
-      promoted_suite=suite_name,
-      manifest_path=manifest_path,
-      trusted_policy_path=trusted_policy,
-      repo_root=repo_root)
+    protocol_id = manifest['protocol_id']
+    # Import lazily because both evaluators reuse this module's manifest
+    # validator.  Evidence is dispatched by its manifest-declared source
+    # suite, never by a schema or policy path supplied inside the evidence.
+    if source_suite == 'pilot':
+      trusted_policy = TRUSTED_PROMOTION_POLICIES.get(protocol_id)
+      if trusted_policy is None:
+        raise ValueError(
+          f'no trusted pilot promotion policy is registered for '
+          f'{protocol_id}')
+      from scripts.evaluate_experiment_promotion import (  # pylint: disable=import-outside-toplevel
+        verify_compiler_evidence,
+      )
+      evidence = verify_compiler_evidence(
+        _read_yaml_or_json(resolved_evidence),
+        evidence_path=resolved_evidence,
+        promoted_suite=suite_name,
+        manifest_path=manifest_path,
+        trusted_policy_path=trusted_policy,
+        repo_root=repo_root)
+    else:
+      trusted_template = TRUSTED_CANDIDATE_K_PROMOTION_TEMPLATES.get(
+        protocol_id, {}).get(source_suite)
+      if trusted_template is None:
+        raise ValueError(
+          f'no trusted promotion verifier is registered for protocol '
+          f'{protocol_id} and source suite {source_suite}')
+      from scripts.evaluate_candidate_k_promotion import (  # pylint: disable=import-outside-toplevel
+        verify_candidate_compiler_evidence,
+      )
+      evidence = verify_candidate_compiler_evidence(
+        _read_yaml_or_json(resolved_evidence),
+        evidence_path=resolved_evidence,
+        promoted_suite=suite_name,
+        manifest_path=manifest_path,
+        trusted_template_path=trusted_template,
+        repo_root=repo_root)
     if evidence['source_suite'] != source_suite:
       raise ValueError(
         f'promotion evidence source suite {evidence["source_suite"]!r}; '
