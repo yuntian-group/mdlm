@@ -256,6 +256,14 @@ class TensorTrainBaselineTest(unittest.TestCase):
         'tokenizers': '0.20.3',
         'flash-attn': '2.7.4.post1',
         'packaging': '23.2',
+        'lightning': '2.2.1',
+        'pytorch-lightning': '2.2.1',
+        'torchmetrics': '1.3.2',
+        'lightning-utilities': '0.15.3',
+        'fsspec': '2024.2.0',
+        'setuptools': '69.5.1',
+        'timm': '0.9.16',
+        'torchvision': '0.18.1',
       },
       'precision_policy': 'upstream_float32_no_autocast',
     }
@@ -442,6 +450,21 @@ class TensorTrainBaselineTest(unittest.TestCase):
     self.assertEqual(protocol['source']['revision'], OFFICIAL_SOURCE_REVISION)
     self.assertEqual(
       protocol['checkpoints']['revision'], OFFICIAL_CHECKPOINT_REVISION)
+    self.assertEqual(protocol['runtime']['critical_packages'], {
+      'torch': '2.3.1',
+      'transformers': '4.46.2',
+      'tokenizers': '0.20.3',
+      'flash-attn': '2.7.4.post1',
+      'packaging': '23.2',
+      'lightning': '2.2.1',
+      'pytorch-lightning': '2.2.1',
+      'torchmetrics': '1.3.2',
+      'lightning-utilities': '0.15.3',
+      'fsspec': '2024.2.0',
+      'setuptools': '69.5.1',
+      'timm': '0.9.16',
+      'torchvision': '0.18.1',
+    })
     with tempfile.TemporaryDirectory() as directory:
       root = Path(directory)
       plan, jobs = self._compile(root)
@@ -479,6 +502,14 @@ class TensorTrainBaselineTest(unittest.TestCase):
 
     payload = yaml.safe_load(DEFAULT_PROTOCOL.read_text())
     payload['generation']['unregistered_option'] = True
+    with tempfile.TemporaryDirectory() as directory:
+      path = Path(directory) / 'protocol.yaml'
+      path.write_text(yaml.safe_dump(payload))
+      with self.assertRaisesRegex(ValueError, 'schema mismatch'):
+        load_protocol(path)
+
+    payload = yaml.safe_load(DEFAULT_PROTOCOL.read_text())
+    del payload['runtime']['critical_packages']['lightning']
     with tempfile.TemporaryDirectory() as directory:
       path = Path(directory) / 'protocol.yaml'
       path.write_text(yaml.safe_dump(payload))

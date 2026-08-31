@@ -39,6 +39,18 @@ Use a dedicated Python 3.12 environment containing exactly the versions in
 checkout and downloaded checkpoints on the persistent experiment disk. Both
 the official checkout and this harness repository must be clean commits.
 
+The audited upstream source imports `lightning` from its dataset utilities,
+although the upstream environment file does not declare that package. The
+frozen harness therefore pins Lightning 2.2.1 and its directly relevant
+dependency closure (`pytorch-lightning`, `torchmetrics`,
+`lightning-utilities`, and `fsspec`) as runtime-critical packages. A preflight
+also pins `setuptools`, because this Lightning release imports
+`pkg_resources`. It must reject an environment that omits or changes any of
+those versions. The same upstream utility imports `timm`; the harness pins the
+repository's established `timm` 0.9.16 dependency and its PyTorch-2.3.1-matched
+`torchvision` 0.18.1 runtime rather than allowing a resolver to select a newer
+incompatible Torch stack.
+
 ```bash
 python scripts/compile_tensor_train_feasibility.py \
   --source-root /mnt/contextual-forest/third_party/tensor-train-9d0087a \

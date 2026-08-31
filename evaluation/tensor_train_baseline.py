@@ -339,12 +339,20 @@ def load_protocol(path: Path) -> dict[str, Any]:
     'tokenizers': '0.20.3',
     'flash-attn': '2.7.4.post1',
     'packaging': '23.2',
+    'lightning': '2.2.1',
+    'pytorch-lightning': '2.2.1',
+    'torchmetrics': '1.3.2',
+    'lightning-utilities': '0.15.3',
+    'fsspec': '2024.2.0',
+    'setuptools': '69.5.1',
+    'timm': '0.9.16',
+    'torchvision': '0.18.1',
   }
   packages = _exact_keys(
     runtime['critical_packages'], expected_packages,
     context='runtime.critical_packages')
   if dict(packages) != expected_packages:
-    raise ValueError('runtime.critical_packages differs from official pins')
+    raise ValueError('runtime.critical_packages differs from audited pins')
   if runtime['device'] != 'cuda':
     raise ValueError('runtime.device must equal cuda')
   if runtime['precision_policy'] != 'upstream_float32_no_autocast':
