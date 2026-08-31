@@ -62,6 +62,18 @@ class FactorizedConfidenceGatedTest(unittest.TestCase):
     self.assertEqual(int(updated[0, 0]), 3)
     self.assertEqual(int(updated[0, 3]), 2)
 
+  def test_singleton_batch_accepts_broadcast_diffusion_probabilities(self):
+    mask_index = 4
+    x = torch.full((1, 4), mask_index, dtype=torch.long)
+    torch.manual_seed(789)
+    updated = factorized_confidence_gated_update(
+      x=x,
+      probabilities=_probabilities(),
+      mask_index=mask_index,
+      move_chance_t=torch.full((1, 1, 1), 0.8),
+      move_chance_s=torch.full((1, 1, 1), 0.4))
+    self.assertEqual(int(updated.ne(mask_index).sum()), 2)
+
 
 if __name__ == '__main__':
   unittest.main()

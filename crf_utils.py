@@ -88,11 +88,11 @@ def confident_reveal_mask(x, probabilities, mask_index,
   chance_s = torch.as_tensor(
     move_chance_s, device=x.device, dtype=probabilities.dtype)
   if chance_t.numel() == 1:
-    chance_t = chance_t.expand(batch)
+    chance_t = chance_t.reshape(1).expand(batch)
   else:
     chance_t = chance_t.reshape(batch, -1)[:, 0]
   if chance_s.numel() == 1:
-    chance_s = chance_s.expand(batch)
+    chance_s = chance_s.reshape(1).expand(batch)
   else:
     chance_s = chance_s.reshape(batch, -1)[:, 0]
 
