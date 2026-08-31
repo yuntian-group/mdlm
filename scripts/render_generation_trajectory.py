@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
+import subprocess
 import textwrap
 from typing import Any, Mapping, Sequence
 
@@ -20,6 +21,7 @@ from transformers import AutoTokenizer  # noqa: E402
 EXPECTED_MODES = ('structured_marginal', 'structured_joint')
 DISPLAY_CALLS = (0, 16, 32, 48, 63)
 ROW_SELECTION_POLICY = 'first_row_of_hash_min_full_source_batch_v1'
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 def _parse_args(argv=None) -> argparse.Namespace:
@@ -44,6 +46,16 @@ def _sha256_file(path: Path) -> str:
 def _canonical_sha256(payload: Any) -> str:
   return hashlib.sha256(json.dumps(
     payload, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+
+
+def _clean_repository_identity() -> dict[str, Any]:
+  git_sha = subprocess.check_output(
+    ['git', 'rev-parse', 'HEAD'], cwd=REPO_ROOT, text=True).strip()
+  status = subprocess.check_output(
+    ['git', 'status', '--porcelain'], cwd=REPO_ROOT, text=True).splitlines()
+  if status:
+    raise RuntimeError('refusing to render from a dirty repository')
+  return {'git_sha': git_sha, 'dirty': False}
 
 
 def _validate_artifact(payload: Mapping[str, Any], row_index: int) -> None:
@@ -197,6 +209,7 @@ def render(
     'schema_version': 1,
     'artifact': 'generation_trajectory_figure_provenance',
     'figure_filename': output.name,
+    'renderer_repository': _clean_repository_identity(),
     'trajectory_input_file_sha256': trajectory_file_sha256,
     'trajectory_artifact_sha256': payload['artifact_sha256'],
     'source_selection_policy': payload['selection']['policy'],
