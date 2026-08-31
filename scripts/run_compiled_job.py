@@ -400,19 +400,25 @@ def run_job(
   completed = _validated_marker(job, required=False)
   if completed is not None:
     return 'skipped'
-  for dependency_id in job['dependencies']:
-    _validated_marker(jobs[dependency_id], required=True)
   _validate_external_inputs(job['external_inputs'])
-
   if dry_run:
+    # A whole-plan dry run must be possible before any dependency has run.
+    # Preserve dependency-output placeholders (whose paths and hashes do not
+    # exist yet), while still showing the exact interpreter and attempt path.
     preview_dir = (
       artifact_dir if job['execution_mode'] == 'resume_in_place'
       else artifact_dir / 'attempts' / 'attempt-NNNN')
     argv = [
-      _resolve_token(token, run_dir=preview_dir, jobs=jobs)
+      token.replace('{python}', sys.executable).replace(
+        '{artifact_dir}', str(preview_dir))
       for token in job['argv']]
+    if any('{python}' in token or '{artifact_dir}' in token for token in argv):
+      raise ValueError('dry-run preview contains an unresolved local token')
     print(json.dumps({'job_id': job_id, 'argv': argv}, indent=2))
     return 'dry-run'
+
+  for dependency_id in job['dependencies']:
+    _validated_marker(jobs[dependency_id], required=True)
 
   lock_path = _acquire_lock(artifact_dir, job_id)
   start = dt.datetime.now(dt.timezone.utc)

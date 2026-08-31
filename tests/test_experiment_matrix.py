@@ -329,6 +329,53 @@ class ExperimentMatrixTest(unittest.TestCase):
 
 class CompiledJobRunnerTest(unittest.TestCase):
 
+  def test_whole_plan_dry_run_does_not_require_dependency_outputs(self):
+    with tempfile.TemporaryDirectory() as directory:
+      root = Path(directory)
+      artifact_root = root / 'artifacts'
+      parent_dir = artifact_root / 'runs' / 'parent'
+      child_dir = artifact_root / 'runs' / 'child'
+      plan = {
+        'artifact_root': str(artifact_root),
+        'plan_id': 'a' * 64,
+        'repository': {'sha': 'd' * 40, 'dirty': False},
+      }
+      parent = {
+        'schema_version': JOB_SCHEMA_VERSION,
+        'protocol_id': 'test-protocol',
+        'source_manifest_sha256': 'b' * 64,
+        'source_repository_sha': 'd' * 40,
+        'plan_id': 'a' * 64,
+        'job_id': 'parent',
+        'kind': 'train',
+        'artifact_dir': str(parent_dir),
+        'suites': ['pilot'],
+        'dependencies': [],
+        'identity': {},
+        'argv': ['{python}', '--output', '{artifact_dir}/model.bin'],
+        'execution_mode': 'fresh_attempt',
+        'external_inputs': [],
+        'required_outputs': [{
+          'name': 'model', 'pattern': 'model.bin', 'exactly_one': True}],
+      }
+      child = dict(
+        parent,
+        job_id='child',
+        kind='export',
+        artifact_dir=str(child_dir),
+        dependencies=['parent'],
+        argv=['{python}', '--input', '${parent:model:path}',
+              '--sha256', '${parent:model:sha256}',
+              '--output', '{artifact_dir}/adapter.bin'],
+        required_outputs=[{
+          'name': 'adapter', 'pattern': 'adapter.bin', 'exactly_one': True}],
+      )
+      jobs = {'parent': parent, 'child': child}
+      self.assertEqual(
+        run_job('parent', plan=plan, jobs=jobs, dry_run=True), 'dry-run')
+      self.assertEqual(
+        run_job('child', plan=plan, jobs=jobs, dry_run=True), 'dry-run')
+
   def test_success_marker_is_hash_verified_and_resumable(self):
     with tempfile.TemporaryDirectory() as directory:
       root = Path(directory)
