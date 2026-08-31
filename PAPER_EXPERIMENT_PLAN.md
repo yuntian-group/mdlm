@@ -1,6 +1,6 @@
 # Paper and Experiment Strategy
 
-Status: implementation and verified-evidence snapshot, 2026-08-30. This
+Status: implementation and verified-evidence snapshot, 2026-08-31. This
 document is the contract between the paper claims and the experiments. It must
 be revised whenever evidence contradicts the current story.
 
@@ -26,11 +26,28 @@ Completed and usable as evidence:
 - two-step text8 train/resume and structured-sampling plumbing checks; and
 - a strict full-length structured pass using the pinned released raw MDLM-OWT
   export (no EMA), with finite logits/marginals and normalized nodes.
+- a paired frozen-backbone K=64 pilot on held-out OpenWebText, arXiv, PubMed,
+  and WikiText-103, with a pooled conditional-NLL improvement of 0.00692
+  (95% document-hierarchical paired-bootstrap CI [0.00624, 0.00760]); all
+  eight mask-0.75/0.90 dataset intervals favor the contextual adapter, while
+  mask-0.25 effects are mixed;
+- a separately prespecified K=128 candidate pilot on arXiv and WikiText-103,
+  with a pooled improvement of 0.00998 (95% CI [0.00934, 0.01060]) and all
+  four dataset--mask intervals favoring the contextual adapter; and
+- frozen routing decisions that promote both broader replicated K=128
+  confirmation and a K=256 support pilot. K=128 candidate recall and retained
+  mass remain limited (0.6531 and 0.6555 overall), so this is not evidence that
+  candidate support is sufficient.
 
 Not yet evidence and therefore not a current paper claim:
 
-- a trained OpenWebText adapter improvement on paired fixed validation data;
-- generated-text quality or matched-quality end-to-end latency;
+- generated-text quality or matched-quality end-to-end latency (a frozen,
+  paired WikiText-103 generation run is active but remains non-evidence until
+  its complete 32-shard union passes fail-closed aggregation);
+- a replicated adapter-training-seed effect, broader K=128 confirmation, or a
+  K=256 result;
+- the planned real-text 2x2 topology/factor decomposition and K sweep (its
+  compiled smoke plan has passed a complete 20-job dry run only);
 - CoDD, scheduler, and modern 7--8B comparisons; and
 - any diffusion ELBO, data likelihood, MAUVE, reference-model perplexity, or
   state-of-the-art result for the contextual forest.
@@ -198,8 +215,8 @@ held-out seeds 9--13. The broader ambiguous-pair, adjustable Markov, and XOR
 learned-task matrix remains pending; oracle/table-fit checks are mechanism
 sanity evidence and must not be conflated with learned-adapter results.
 
-### Stage C: MDLM-scale controlled language modeling (plumbing complete;
-quality pending)
+### Stage C: MDLM-scale controlled language modeling (quality pilots complete;
+confirmation and generation active)
 
 Use the released `kuleshov-group/mdlm-owt` checkpoint in the
 `yuntian-group/mdlm` codebase, pinned to revision
@@ -245,6 +262,13 @@ Decision gates:
 - contextual structure beats a static prior, especially at high mask ratios;
 - per-step cost remains below 4x and yields a better matched-quality latency.
 
+The first recall target above was an aspirational scale target, not the frozen
+pilot routing policy. The measured K=64 support was far below it, so the
+prespecified support route promoted K=128 rather than terminating the study.
+K=128 improved the paired conditional-NLL result but still did not establish
+support sufficiency; the next matched support point is therefore K=256. The
+quality and support routes remain separate throughout analysis.
+
 ### Stage D: modern transfer experiment (pending)
 
 Primary target: Dream-7B; secondary target: LLaDA-8B. Freeze the backbone and
@@ -280,12 +304,16 @@ GPQA is optional because it is costly and weakly diagnostic of the mechanism.
 
 ## 6. Measured evidence and unresolved hypotheses
 
-The only current learned quality result is the frozen-protocol synthetic
-held-out experiment described in Section 0. The optimized forest profile is a
-kernel-only measurement: it excludes candidate/factor and forest construction,
-so it cannot be presented as end-to-end decoding latency. The released-backbone
-and text8 runs are plumbing checks and cannot be presented as language-quality
-evidence.
+The current learned-quality evidence comprises the frozen-protocol synthetic
+held-out experiment and the conditional-denoising K=64/K=128 real-text pilots
+described in Section 0. The real-text intervals are conditional on one trained
+adapter per arm and therefore do not quantify training-run variability. The
+optimized forest profile is a kernel-only measurement: it excludes
+candidate/factor and forest construction, so it cannot be presented as
+end-to-end decoding latency. The released-backbone and text8 runs are plumbing
+checks and cannot be presented as language-quality evidence. Until the active
+generation union is complete and verified, none of these results supports a
+generated-text-quality claim.
 
 The earlier numerical targets for MAUVE, reference-model perplexity,
 dependency/repetition error, end-to-end overhead, and denoiser-call regimes
@@ -322,21 +350,57 @@ No predicted numeric result may be inserted into a submission table or prose.
   profile provenance, and paired artifact aggregation; large data and
   checkpoints belong on a dedicated persistent experiment volume.
 
-The branch now contains paper-usable exact-inference, held-out synthetic, and
-kernel-profile evidence. The original 32-example recovery smoke remains only a
-historical mechanics check, and real-data plumbing still supports no positive
-language-quality claim.
+The branch now contains paper-usable exact-inference, held-out synthetic,
+conditional-denoising K=64/K=128, and kernel-profile evidence. The original
+32-example recovery smoke remains only a historical mechanics check. Generation,
+replicated-training, causal-decomposition, and K=256 claims remain pending.
 
-## 8. Compute order
+## 8. Submission-critical execution order (frozen 2026-08-31)
 
-1. **Complete:** CPU/GPU unit tests and the frozen-protocol held-out synthetic
-   task.
-2. **Complete:** bounded GPU text8 and released-backbone plumbing checks.
-3. **Next:** a short frozen MDLM-OWT adapter screen with paired fixed
-   validation artifacts and its factorized control.
-4. **Conditional:** only after that gate passes, the full MDLM-scale matrix.
-5. **Conditional:** only after the real-data main effect survives, a modern
-   7--8B transfer and expensive baseline reproduction.
+The next experiments are ordered by the paper claim they unlock, not by code
+convenience. A failed gate changes the paper claim before it triggers more
+compute.
+
+1. **Paired end-to-end WikiText-103 infilling generation.** Evaluate 197
+   revision-pinned prompts with four paired draws per prompt (788 draws), a
+   document-local contiguous 32-token span inside a length-256 sequence, and
+   NFE budgets 8/16/32/64. For the dynamic adapter compare the factorized
+   backbone, independent samples from exact structured marginals, and exact
+   joint forest samples. Compare the latter with exact joint samples from the
+   paired static/static adapter. The primary causal contrast is joint versus
+   independent sampling from the same checkpoint and exact node marginals.
+   Report reference-span accuracy/exact match, GPT-2-large reference NLL, and
+   repetition. Use paired-draw and prompt-cluster bootstrap intervals. The
+   current run uses 16 atomic shards per adapter arm and two concurrent L4
+   workers, so its timing is descriptive and cannot support a quality--latency
+   claim.
+2. **Real-text causal decomposition.** Run the already compiled 20-job smoke
+   plan before scaling. It contains the four topology/factor arms, an
+   algebraically no-edge control without extra active pair capacity, a
+   degree/component-preserving permuted-topology diagnostic, and a one-pass
+   K=32/64/128/256 support sweep. Only a passing topology-change and integrity
+   gate may promote the multi-seed primary suite.
+3. **Replication before breadth.** Add independent adapter-training seeds to
+   the K=128 confirmation so uncertainty covers training-run variability.
+   Then run the promoted K=256 support pilot. Do not pool K=64, K=128, and
+   K=256 estimates as a causal K curve unless their strata, corruption draws,
+   training protocol, and evaluation depth are matched.
+4. **Cross-domain generation.** If the WikiText generation contrast is
+   informative, repeat the frozen paired protocol on revision-pinned arXiv and
+   PubMed prompts already declared in the manifest. This is the highest-value
+   dataset expansion because it tests whether joint sampling helps outside the
+   adapter's general-web validation domain without changing the metric stack.
+5. **Uncontended end-to-end timing.** After the quality matrix finishes, replay
+   a small fixed set of identical batches one process at a time, with explicit
+   warmups and repeated measurements. Only this replay may support an
+   end-to-end quality--latency claim; the concurrent paper-scale collection may
+   not.
+6. **Modern transfer/baselines.** Run a batch-1 L4 feasibility gate for the
+   pinned Dream-7B checkpoint and official CoDD, DAPD, and ParallelBench code
+   before promising a 7B-scale result. If memory, tokenizer, or output-interface
+   incompatibility blocks a controlled comparison, report that boundary and
+   prioritize the replicated MDLM-scale evidence instead of an incomparable
+   headline number.
 
 Remote runs use an experiment-dedicated persistent volume, explicit run labels,
 resumable checkpoints, immutable source revisions, and a hard stop. Public

@@ -108,3 +108,42 @@ Add both `--reference-lm gpt2-large` and
 optional causal-reference-LM hook. The runner rejects an unpinned reference
 model. Reference-LM NLL and perplexity are descriptive generation metrics;
 they are not diffusion likelihoods or ELBO estimates.
+
+## Frozen WikiText two-worker queue
+
+`scripts/run_wikitext_generation_queue.py` is the fail-closed controller for
+the active K=128 WikiText paper run. It is intentionally not a general launch
+template. It binds the complete scientific argv, artifact hashes, immutable
+runner commit `09f89c00bbf8c65f679cd40b92609754608817b8`, runner and protocol
+file hashes, live PID mapping, and exact 32-shard grid.
+
+The controller first adopts PID 5226 as dynamic shard 00 and PID 5958 as
+dynamic shard 01, or validates those completed directories if the processes
+have already exited. It then runs dynamic shards 02--15 in pairs, waits at a
+phase barrier, and runs static shards 00--15 in pairs. A zero process exit is
+not sufficient: the complete shard is cryptographically reloaded and checked
+against the frozen paper protocol before the next pair starts. A failed peer
+does not kill the other peer; the controller waits for and validates that peer
+before halting.
+
+Deploy the controller outside the immutable runner checkout. Copying it into
+the checkout would make Git dirty, which is rejected before any new shard is
+started. The durable invocation is:
+
+```bash
+ROOT=/mnt/contextual-forest/experiments/contextual-forest-generation-paper-v1
+PY=/mnt/contextual-forest/venv/bin/python
+test ! -e "$ROOT/run-wikitext-queue.py"
+test ! -e "$ROOT/logs/wikitext-queue.log"
+cp scripts/run_wikitext_generation_queue.py "$ROOT/run-wikitext-queue.py"
+set -o noclobber
+nohup "$PY" "$ROOT/run-wikitext-queue.py" \
+  >"$ROOT/logs/wikitext-queue.log" 2>&1 </dev/null &
+```
+
+Before using that redirection, require that the controller log path does not
+already exist. Every shard also has its own exclusively created log. Existing
+complete directories are revalidated and skipped; any pre-existing directory
+without a valid completion manifest, or any orphan log, stops the queue and is
+preserved. Retries therefore require a separately reviewed fresh suffixed
+directory rather than deletion or reuse.
