@@ -147,3 +147,29 @@ complete directories are revalidated and skipped; any pre-existing directory
 without a valid completion manifest, or any orphan log, stops the queue and is
 preserved. Retries therefore require a separately reviewed fresh suffixed
 directory rather than deletion or reuse.
+
+## Frozen cross-domain continuation
+
+`scripts/run_cross_domain_generation_queue.py` implements the same two-worker,
+phase-barrier protocol for the already-pinned arXiv and PubMed prompt bundles.
+It is limited to those two named bundles and authenticates the prompt JSONL,
+prompt manifest, builder provenance, data configuration, immutable runner,
+backbone, adapter pair, scorer, and exact 32-shard task grid before launching.
+Each completed shard is then cryptographically and semantically revalidated.
+
+Cross-domain work is a conditional continuation: do not run it concurrently
+with the WikiText queue, and do not launch it before the complete WikiText
+union and prompt-cluster analysis have been reviewed. From a separate clean
+checkout containing the controller, while leaving the immutable generation
+runner at its frozen revision, use exactly one of:
+
+```bash
+python scripts/run_cross_domain_generation_queue.py --dataset arxiv
+python scripts/run_cross_domain_generation_queue.py --dataset pubmed
+```
+
+The arXiv and PubMed queues each contain 16 dynamic-adapter shards followed by
+16 static-adapter shards. They use 1,024 paired draws, base seeds 92001 and
+93001 respectively, and otherwise retain the WikiText sequence length, span,
+batch size, NFE grid, candidate support, sampling modes, and reference scorer.
+Existing incomplete output directories or logs are never reused.

@@ -93,10 +93,11 @@ class ShardTask:
   log_path: Path
   command: tuple[str, ...]
   adopted_pid: int | None = None
+  dataset_slug: str = 'wikitext'
 
   @property
   def task_id(self) -> str:
-    return f'wikitext-{self.arm.name}-shard-{self.shard_index:02d}'
+    return f'{self.dataset_slug}-{self.arm.name}-shard-{self.shard_index:02d}'
 
 
 @dataclass(frozen=True)
@@ -248,6 +249,7 @@ def _make_task(
     log_path=log_path,
     command=_task_command(paths, arm, shard_index, output_dir),
     adopted_pid=adopted_pid,
+    dataset_slug='wikitext',
   )
 
 
