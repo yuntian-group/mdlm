@@ -31,6 +31,12 @@ _V2_SUPPORT_METRICS = (
   'candidate_support_hits',
   'candidate_support_retained_mass_sum',
 )
+_V2_TOPOLOGY_SIGNATURE_METRICS = (
+  'selected_degree_sequence',
+  'permuted_degree_sequence',
+  'selected_component_sizes',
+  'permuted_component_sizes',
+)
 
 
 def _sha256_file(path: Path) -> str:
@@ -128,6 +134,7 @@ class ConditionalDenoisingRecordWriter:
     if self.schema_version == CAUSAL_RECORD_SCHEMA_VERSION:
       required_metrics.extend(_V2_EXTRA_SCALAR_METRICS)
       required_metrics.extend(_V2_SUPPORT_METRICS)
+      required_metrics.extend(_V2_TOPOLOGY_SIGNATURE_METRICS)
     missing_metrics = [
       field for field in required_metrics if field not in metrics]
     if missing_metrics:
@@ -168,6 +175,9 @@ class ConditionalDenoisingRecordWriter:
                for row in values[name]):
           raise ValueError(
             f'{name} width differs from support_candidate_ks')
+      topology_signatures = {
+        name: _as_cpu_list(metrics[name], name=name, batch_size=batch_size)
+        for name in _V2_TOPOLOGY_SIGNATURE_METRICS}
 
     for example_index in range(batch_size):
       masked_tokens = int(values['active_tokens'][example_index])
@@ -213,6 +223,41 @@ class ConditionalDenoisingRecordWriter:
           }
           for index, candidate_k in enumerate(self.support_candidate_ks)
         ]
+        for name in _V2_TOPOLOGY_SIGNATURE_METRICS:
+          signature = topology_signatures[name][example_index]
+          if torch.is_tensor(signature):
+            signature = signature.detach().cpu().tolist()
+          if (not isinstance(signature, (list, tuple))
+              or any(not isinstance(value, int) or isinstance(value, bool)
+                     for value in signature)):
+            raise ValueError(
+              f'{name}[{example_index}] must be an integer sequence')
+          row[name] = [int(value) for value in signature]
+        for name in _V2_TOPOLOGY_SIGNATURE_METRICS:
+          if not row[name] or row[name] != sorted(row[name]):
+            raise ValueError(
+              f'{name}[{example_index}] must be non-empty and sorted')
+        for name in (
+            'selected_degree_sequence', 'permuted_degree_sequence'):
+          if (len(row[name]) != masked_tokens
+              or any(value < 0 for value in row[name])
+              or sum(row[name]) != 2 * row['selected_edges']):
+            raise ValueError(
+              f'{name}[{example_index}] is inconsistent with the forest')
+        for name in (
+            'selected_component_sizes', 'permuted_component_sizes'):
+          if (any(value <= 0 for value in row[name])
+              or sum(row[name]) != masked_tokens):
+            raise ValueError(
+              f'{name}[{example_index}] is inconsistent with active tokens')
+        if (row['selected_degree_sequence']
+            != row['permuted_degree_sequence']):
+          raise ValueError(
+            'matched permutation does not preserve the degree sequence')
+        if (row['selected_component_sizes']
+            != row['permuted_component_sizes']):
+          raise ValueError(
+            'matched permutation does not preserve component sizes')
       self._handle.write(json.dumps(
         row, sort_keys=True, separators=(',', ':'), allow_nan=False) + '\n')
       self.num_records += 1

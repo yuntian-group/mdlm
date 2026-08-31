@@ -128,6 +128,12 @@ class CausalDenoisingTest(unittest.TestCase):
       metrics.factorized_backbone_nll_sum)
     self.assertEqual(metrics.candidate_support.candidate_ks, (1, 3, 6))
     self.assertEqual(metrics.matched_permuted_topology_nll_sum.shape, (2,))
+    self.assertEqual(
+      metrics.selected_degree_sequences,
+      metrics.permuted_degree_sequences)
+    self.assertEqual(
+      metrics.selected_component_sizes,
+      metrics.permuted_component_sizes)
 
 
 if __name__ == '__main__':

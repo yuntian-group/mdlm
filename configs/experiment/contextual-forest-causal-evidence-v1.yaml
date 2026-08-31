@@ -95,7 +95,11 @@ evaluation:
 suites:
   causal_smoke:
     promotion_from: null
-    controls: [dynamic_dynamic, static_static]
+    controls:
+      - dynamic_dynamic
+      - fixed_dynamic
+      - dynamic_fixed
+      - static_static
     train_seeds: [1]
     datasets: [wikitext103, scientific_papers_arxiv]
     corruption_seeds: [301, 302]
@@ -103,7 +107,7 @@ suites:
     candidate_ks: [128]
     validation_batches: 64
   causal_primary:
-    promotion_from: null
+    promotion_from: causal_smoke
     controls:
       - dynamic_dynamic
       - fixed_dynamic

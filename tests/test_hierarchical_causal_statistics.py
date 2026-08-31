@@ -4,6 +4,7 @@ from evaluation.hierarchical_causal_statistics import (
   ContrastTerm,
   aggregate_candidate_support,
   aggregate_causal_contrast,
+  aggregate_technical_diagnostics,
   aggregate_topology_permutation_diagnostic,
 )
 
@@ -43,8 +44,12 @@ class HierarchicalCausalStatisticsTest(unittest.TestCase):
               'factorized_backbone_nll_sum': 5.0 * masked_tokens,
               'parameter_matched_no_edge_nll_sum': 5.0 * masked_tokens,
               'matched_permuted_topology_nll_sum': 3.7 * masked_tokens,
-              'selected_edges': 10,
+              'selected_edges': 9,
               'permuted_changed_edges': 9,
+              'selected_degree_sequence': [1, 1] + [2] * 8,
+              'permuted_degree_sequence': [1, 1] + [2] * 8,
+              'selected_component_sizes': [10],
+              'permuted_component_sizes': [10],
               'candidate_support': [
                 {'candidate_k': 32, 'candidate_hits': 5,
                  'retained_mass_sum': 6.0},
@@ -102,7 +107,7 @@ class HierarchicalCausalStatisticsTest(unittest.TestCase):
       minimum_pooled_changed_edge_fraction=0.85,
       minimum_condition_changed_edge_fraction=0.85)
     self.assertAlmostEqual(
-      result['pooled']['changed_edge_fraction'], 0.9)
+      result['pooled']['changed_edge_fraction'], 1.0)
     self.assertTrue(result['gate']['passed'])
 
   def test_topology_permutation_diagnostic_rejects_noop(self):
@@ -114,6 +119,90 @@ class HierarchicalCausalStatisticsTest(unittest.TestCase):
       minimum_pooled_changed_edge_fraction=0.85,
       minimum_condition_changed_edge_fraction=0.85)
     self.assertFalse(result['gate']['passed'])
+
+  def test_technical_diagnostics_cover_all_four_arms_without_direction_gate(self):
+    result = aggregate_technical_diagnostics(
+      self._records(),
+      expected_arms=[
+        'dynamic_dynamic', 'fixed_dynamic',
+        'dynamic_fixed', 'static_static'],
+      expected_train_seeds=[1, 2],
+      expected_support_ks=[32, 64, 128, 256])
+    self.assertTrue(result['finite_statistics']['passed'])
+    self.assertTrue(result['pairing']['passed'])
+    self.assertTrue(result['no_edge_identity']['passed'])
+    self.assertTrue(result['candidate_support']['grid_complete'])
+    self.assertTrue(
+      result['candidate_support']['monotone_within_tolerance'])
+    self.assertTrue(result['topology_structure']['passed'])
+    self.assertEqual(len(result['topology_structure']['conditions']), 4)
+
+  def test_technical_diagnostics_detect_pairing_and_support_failures(self):
+    records = self._records()
+    records[0]['pairing_digest_sha256'] = 'c' * 64
+    records[0]['candidate_support'][2]['candidate_hits'] = 1
+    result = aggregate_technical_diagnostics(
+      records,
+      expected_arms=[
+        'dynamic_dynamic', 'fixed_dynamic',
+        'dynamic_fixed', 'static_static'],
+      expected_train_seeds=[1, 2],
+      expected_support_ks=[32, 64, 128, 256])
+    self.assertFalse(result['pairing']['passed'])
+    self.assertFalse(
+      result['candidate_support']['monotone_within_tolerance'])
+
+  def test_technical_diagnostics_reject_masked_token_pairing_drift(self):
+    records = self._records()
+    records[0]['masked_tokens'] = 11
+    result = aggregate_technical_diagnostics(
+      records,
+      expected_arms=[
+        'dynamic_dynamic', 'fixed_dynamic',
+        'dynamic_fixed', 'static_static'],
+      expected_train_seeds=[1, 2],
+      expected_support_ks=[32, 64, 128, 256])
+    self.assertEqual(result['pairing']['masked_token_mismatched_units'], 1)
+    self.assertFalse(result['pairing']['passed'])
+
+  def test_topology_permutation_rejects_signature_drift(self):
+    records = self._records()
+    records[0]['permuted_degree_sequence'] = [0, 2] + [2] * 8
+    result = aggregate_topology_permutation_diagnostic(
+      records, arm='dynamic_dynamic',
+      minimum_pooled_changed_edge_fraction=0.85,
+      minimum_condition_changed_edge_fraction=0.85)
+    self.assertFalse(
+      result['gate']['degree_sequence_preserved_every_record'])
+    self.assertFalse(result['gate']['passed'])
+
+  def test_technical_tolerances_are_explicit_inputs(self):
+    records = self._records()
+    records[0]['parameter_matched_no_edge_nll_sum'] += 5e-8
+    records[0]['candidate_support'][1]['retained_mass_sum'] = 5.9999995
+    common = {
+      'expected_arms': [
+        'dynamic_dynamic', 'fixed_dynamic',
+        'dynamic_fixed', 'static_static'],
+      'expected_train_seeds': [1, 2],
+      'expected_support_ks': [32, 64, 128, 256],
+    }
+    permissive = aggregate_technical_diagnostics(
+      records,
+      no_edge_absolute_tolerance=1e-7,
+      support_monotonicity_tolerance=1e-6,
+      **common)
+    strict = aggregate_technical_diagnostics(
+      records,
+      no_edge_absolute_tolerance=1e-9,
+      support_monotonicity_tolerance=1e-8,
+      **common)
+    self.assertTrue(permissive['no_edge_identity']['passed'])
+    self.assertTrue(
+      permissive['candidate_support']['monotone_within_tolerance'])
+    self.assertFalse(strict['no_edge_identity']['passed'])
+    self.assertFalse(
+      strict['candidate_support']['monotone_within_tolerance'])
 
 
 if __name__ == '__main__':

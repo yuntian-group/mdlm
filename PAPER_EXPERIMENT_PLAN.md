@@ -46,8 +46,10 @@ Not yet evidence and therefore not a current paper claim:
   its complete 32-shard union passes fail-closed aggregation);
 - a replicated adapter-training-seed effect, broader K=128 confirmation, or a
   K=256 result;
-- the planned real-text 2x2 topology/factor decomposition and K sweep (its
-  compiled smoke plan has passed a complete 20-job dry run only);
+- the planned real-text 2x2 topology/factor decomposition and K sweep (the
+  earlier 20-job, two-arm cloud dry-run plan is superseded and non-executable;
+  the four-arm smoke will contain 40 jobs once compiled: 4 train, 4 export,
+  and 32 evaluation jobs);
 - CoDD, scheduler, and modern 7--8B comparisons; and
 - any diffusion ELBO, data likelihood, MAUVE, reference-model perplexity, or
   state-of-the-art result for the contextual forest.
@@ -374,12 +376,16 @@ compute.
    current run uses 16 atomic shards per adapter arm and two concurrent L4
    workers, so its timing is descriptive and cannot support a quality--latency
    claim.
-2. **Real-text causal decomposition.** Run the already compiled 20-job smoke
-   plan before scaling. It contains the four topology/factor arms, an
+2. **Real-text causal decomposition.** From a clean committed revision,
+   compile and run the replacement 40-job smoke plan before scaling: 4 train,
+   4 export, and 32 evaluation jobs. It contains the four topology/factor arms, an
    algebraically no-edge control without extra active pair capacity, a
    degree/component-preserving permuted-topology diagnostic, and a one-pass
-   K=32/64/128/256 support sweep. Only a passing topology-change and integrity
-   gate may promote the multi-seed primary suite.
+   K=32/64/128/256 support sweep. The old 20-job cloud dry-run is superseded
+   and cannot satisfy the manifest or promotion-policy commitments. Only the
+   frozen technical-validity route may promote the multi-seed primary suite;
+   no NLL sign, effect magnitude, p-value, or confidence-interval position is
+   a promotion criterion.
 3. **Replication before breadth.** Add independent adapter-training seeds to
    the K=128 confirmation so uncertainty covers training-run variability.
    Then run the promoted K=256 support pilot. Do not pool K=64, K=128, and
@@ -406,3 +412,61 @@ Remote runs use an experiment-dedicated persistent volume, explicit run labels,
 resumable checkpoints, immutable source revisions, and a hard stop. Public
 artifacts record hardware/software provenance without private account,
 funding, project, instance, or resource identifiers.
+
+### Fail-closed causal smoke-to-primary route
+
+The source plan ID necessarily commits the repository revision that contains
+the frozen template, so promotion uses two pre-result stages. First commit the
+manifest, template, compiler, evaluator, and tests. Then compile the smoke plan
+and immediately finalize the template against that exact, still-unstarted
+plan. The finalizer refuses any non-empty source job directory.
+
+```bash
+python scripts/compile_experiment_matrix.py \
+  --manifest configs/experiment/contextual-forest-causal-evidence-v1.yaml \
+  --suite causal_smoke \
+  --artifact-root /mnt/contextual-forest/experiments/contextual-forest-causal-evidence-v1 \
+  --output-dir /mnt/contextual-forest/experiments/contextual-forest-causal-evidence-v1/plans/causal-smoke
+
+python scripts/finalize_causal_smoke_policy.py \
+  --plan-dir /mnt/contextual-forest/experiments/contextual-forest-causal-evidence-v1/plans/causal-smoke \
+  --output /mnt/contextual-forest/experiments/contextual-forest-causal-evidence-v1/plans/causal-smoke/promotion-policy.json
+```
+
+After all 40 jobs finish successfully, the causal aggregate binds the union of
+all success markers and output hashes and is deterministically replayable from
+the raw schema-v2 records. The evaluator checks the full four-arm factorial,
+pairing digests and identical masked-token counts for every arm/seed-paired
+window, finite and ordered statistics, the algebraic no-edge identity within
+its frozen absolute tolerance, the complete support grid with monotonicity
+checked at its frozen tolerance, and non-empty forests. Every raw schema-v2
+record carries independently recomputed original/permuted degree sequences and
+component-size multisets; both must match per record and per condition before
+the predeclared topology-change thresholds are consulted. It emits compiler
+evidence only if all of those technical checks pass.
+
+```bash
+python scripts/aggregate_causal_denoising_eval.py \
+  --plan-dir /mnt/contextual-forest/experiments/contextual-forest-causal-evidence-v1/plans/causal-smoke \
+  --manifest configs/experiment/contextual-forest-causal-evidence-v1.yaml \
+  --suite causal_smoke \
+  --output /mnt/contextual-forest/experiments/contextual-forest-causal-evidence-v1/plans/causal-smoke/analysis.json
+
+python scripts/evaluate_causal_promotion.py \
+  --policy /mnt/contextual-forest/experiments/contextual-forest-causal-evidence-v1/plans/causal-smoke/promotion-policy.json \
+  --analysis /mnt/contextual-forest/experiments/contextual-forest-causal-evidence-v1/plans/causal-smoke/analysis.json \
+  --source-plan /mnt/contextual-forest/experiments/contextual-forest-causal-evidence-v1/plans/causal-smoke/compiled-plan.json \
+  --output /mnt/contextual-forest/experiments/contextual-forest-causal-evidence-v1/plans/causal-smoke/routing-decision.json \
+  --compiler-evidence-dir /mnt/contextual-forest/experiments/contextual-forest-causal-evidence-v1/plans/causal-smoke
+
+python scripts/compile_experiment_matrix.py \
+  --manifest configs/experiment/contextual-forest-causal-evidence-v1.yaml \
+  --suite causal_primary \
+  --promotion-evidence causal_primary /mnt/contextual-forest/experiments/contextual-forest-causal-evidence-v1/plans/causal-smoke/causal_primary-promotion.json
+```
+
+The primary compiler selects its causal verifier from a repository-trusted
+template registry, replays the source analysis from marker-bound records, and
+requires the current checkout to be the exact clean source-plan HEAD while it
+checks the policy, plan, repository, job-spec, output, analysis, decision, and
+evidence hashes. It never trusts a boolean supplied by the evidence file.

@@ -10,6 +10,7 @@ from evaluation.conditional_denoising_records import (
   ConditionalDenoisingRecordWriter,
   write_record_manifest,
 )
+from scripts.aggregate_hierarchical_document_eval import validate_record
 
 
 class ConditionalDenoisingRecordsTest(unittest.TestCase):
@@ -119,6 +120,10 @@ class ConditionalDenoisingRecordsTest(unittest.TestCase):
             [[1.0, 2.0, 3.0, 3.8]]),
           'selected_edges': torch.tensor([3]),
           'permuted_changed_edges': torch.tensor([2]),
+          'selected_degree_sequence': [[1, 1, 2, 2]],
+          'permuted_degree_sequence': [[1, 1, 2, 2]],
+          'selected_component_sizes': [[4]],
+          'permuted_component_sizes': [[4]],
         },
         batch_index=0)
       summary = writer.finalize(pairing_digest_sha256='c' * 64)
@@ -129,6 +134,8 @@ class ConditionalDenoisingRecordsTest(unittest.TestCase):
         [item['candidate_k'] for item in rows[0]['candidate_support']],
         [32, 64, 128, 256])
       self.assertEqual(rows[0]['factorized_backbone_nll_sum'], 5.0)
+      self.assertEqual(rows[0]['selected_degree_sequence'], [1, 1, 2, 2])
+      self.assertEqual(rows[0]['permuted_component_sizes'], [4])
       manifest_path = write_record_manifest(
         output_dir=directory,
         metadata=self._metadata(),
@@ -137,6 +144,15 @@ class ConditionalDenoisingRecordsTest(unittest.TestCase):
         schema_version=2)
       self.assertEqual(
         json.loads(Path(manifest_path).read_text())['schema_version'], 2)
+      validate_record(rows[0])
+      degree_tamper = dict(rows[0])
+      degree_tamper['permuted_degree_sequence'] = [0, 2, 2, 2]
+      with self.assertRaisesRegex(ValueError, 'preserve degree sequence'):
+        validate_record(degree_tamper)
+      component_tamper = dict(rows[0])
+      component_tamper['permuted_component_sizes'] = [1, 3]
+      with self.assertRaisesRegex(ValueError, 'preserve component sizes'):
+        validate_record(component_tamper)
 
 
 if __name__ == '__main__':

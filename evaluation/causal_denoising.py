@@ -56,6 +56,10 @@ class CausalDenoisingMetrics:
   candidate_support: CandidateSupportSweep
   selected_edges: torch.Tensor
   permuted_changed_edges: torch.Tensor
+  selected_degree_sequences: tuple[tuple[int, ...], ...]
+  permuted_degree_sequences: tuple[tuple[int, ...], ...]
+  selected_component_sizes: tuple[tuple[int, ...], ...]
+  permuted_component_sizes: tuple[tuple[int, ...], ...]
 
   def as_record_metrics(self) -> dict[str, object]:
     """Return the schema-v2 fields consumed by the streaming writer."""
@@ -76,6 +80,10 @@ class CausalDenoisingMetrics:
         self.candidate_support.retained_mass_sum),
       'selected_edges': self.selected_edges,
       'permuted_changed_edges': self.permuted_changed_edges,
+      'selected_degree_sequence': self.selected_degree_sequences,
+      'permuted_degree_sequence': self.permuted_degree_sequences,
+      'selected_component_sizes': self.selected_component_sizes,
+      'permuted_component_sizes': self.permuted_component_sizes,
     }
 
 
@@ -205,6 +213,77 @@ def matched_permuted_forest_edges(
   return result.detach(), edge_mask.detach().clone(), changed
 
 
+def _forest_structure_signatures(
+    edge_index: torch.Tensor,
+    edge_mask: torch.Tensor,
+    active_mask: torch.Tensor,
+) -> tuple[tuple[tuple[int, ...], ...], tuple[tuple[int, ...], ...]]:
+  """Return sorted degree sequences and component sizes for each forest.
+
+  This deliberately recomputes the two invariants from edge endpoints rather
+  than inferring them from the node-permutation construction.  The signatures
+  are persisted in schema-v2 records so later promotion replay can verify the
+  matched-topology claim independently of the control's NLL.
+  """
+  if edge_index.ndim != 3 or edge_index.shape[-1] != 2:
+    raise ValueError('edge_index must have shape [B,E,2]')
+  if edge_mask.shape != edge_index.shape[:2] or edge_mask.dtype != torch.bool:
+    raise ValueError('edge_mask must be boolean with shape [B,E]')
+  if (active_mask.ndim != 2 or active_mask.dtype != torch.bool
+      or active_mask.shape[0] != edge_index.shape[0]):
+    raise ValueError('active_mask must be boolean with shape [B,L]')
+
+  degree_signatures = []
+  component_signatures = []
+  for batch_index in range(edge_index.shape[0]):
+    active_nodes = torch.nonzero(
+      active_mask[batch_index], as_tuple=False).squeeze(-1).cpu().tolist()
+    if not active_nodes:
+      raise ValueError('forest structure signature requires active nodes')
+    active_set = set(active_nodes)
+    parent = {node: node for node in active_nodes}
+    size = {node: 1 for node in active_nodes}
+    degree = {node: 0 for node in active_nodes}
+    seen_edges: set[tuple[int, int]] = set()
+
+    def find(node: int) -> int:
+      while parent[node] != node:
+        parent[node] = parent[parent[node]]
+        node = parent[node]
+      return node
+
+    for edge_slot in torch.nonzero(
+        edge_mask[batch_index], as_tuple=False).squeeze(-1).cpu().tolist():
+      left, right = (
+        int(value) for value in edge_index[batch_index, edge_slot].cpu().tolist())
+      if left not in active_set or right not in active_set:
+        raise ValueError('selected edge references an inactive node')
+      if left == right:
+        raise ValueError('forest structure signature encountered a self-loop')
+      edge = tuple(sorted((left, right)))
+      if edge in seen_edges:
+        raise ValueError('forest structure signature encountered a duplicate edge')
+      seen_edges.add(edge)
+      left_root = find(left)
+      right_root = find(right)
+      if left_root == right_root:
+        raise ValueError('forest structure signature encountered a cycle')
+      if size[left_root] < size[right_root]:
+        left_root, right_root = right_root, left_root
+      parent[right_root] = left_root
+      size[left_root] += size[right_root]
+      degree[left] += 1
+      degree[right] += 1
+
+    components: dict[int, int] = {}
+    for node in active_nodes:
+      root = find(node)
+      components[root] = components.get(root, 0) + 1
+    degree_signatures.append(tuple(sorted(degree.values())))
+    component_signatures.append(tuple(sorted(components.values())))
+  return tuple(degree_signatures), tuple(component_signatures)
+
+
 @torch.no_grad()
 def causal_denoising_metrics(
     *,
@@ -262,6 +341,12 @@ def causal_denoising_metrics(
     unary_logits=unary_logits,
     token_ids=clean_tokens,
     active_mask=active_mask)
+  selected_degree_sequences, selected_component_sizes = (
+    _forest_structure_signatures(
+      primary_output.edge_index, primary_output.edge_mask, active_mask))
+  permuted_degree_sequences, permuted_component_sizes = (
+    _forest_structure_signatures(
+      permuted_output.edge_index, permuted_output.edge_mask, active_mask))
 
   support = candidate_support_sweep(
     unary_logits=unary_logits,
@@ -281,4 +366,8 @@ def causal_denoising_metrics(
     active_tokens=active_mask.sum(dim=-1).detach(),
     candidate_support=support,
     selected_edges=primary_output.edge_mask.sum(dim=-1).detach(),
-    permuted_changed_edges=changed_edges.detach())
+    permuted_changed_edges=changed_edges.detach(),
+    selected_degree_sequences=selected_degree_sequences,
+    permuted_degree_sequences=permuted_degree_sequences,
+    selected_component_sizes=selected_component_sizes,
+    permuted_component_sizes=permuted_component_sizes)

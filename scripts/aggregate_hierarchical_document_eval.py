@@ -59,6 +59,8 @@ CAUSAL_ROW_FIELDS = ROW_FIELDS | {
   'parameter_matched_no_edge_nll_sum',
   'matched_permuted_topology_nll_sum', 'selected_edges',
   'permuted_changed_edges', 'candidate_support',
+  'selected_degree_sequence', 'permuted_degree_sequence',
+  'selected_component_sizes', 'permuted_component_sizes',
 }
 
 # This is deliberately an exact protocol-v1 allowlist rather than a heuristic
@@ -187,6 +189,43 @@ def validate_record(
     if result['permuted_changed_edges'] > result['selected_edges']:
       raise ValueError(
         f'{source}.permuted_changed_edges exceeds selected_edges')
+    topology_sequences = {}
+    for field, positive in (
+        ('selected_degree_sequence', False),
+        ('permuted_degree_sequence', False),
+        ('selected_component_sizes', True),
+        ('permuted_component_sizes', True)):
+      raw_sequence = result[field]
+      if not isinstance(raw_sequence, list) or not raw_sequence:
+        raise ValueError(f'{source}.{field} must be a non-empty list')
+      sequence = []
+      for index, value in enumerate(raw_sequence):
+        validator = _positive_int if positive else _nonnegative_int
+        sequence.append(validator(
+          value, context=f'{source}.{field}[{index}]'))
+      if sequence != sorted(sequence):
+        raise ValueError(f'{source}.{field} must be sorted')
+      topology_sequences[field] = sequence
+      result[field] = sequence
+    for field in ('selected_degree_sequence', 'permuted_degree_sequence'):
+      if len(topology_sequences[field]) != result['masked_tokens']:
+        raise ValueError(
+          f'{source}.{field} length differs from masked_tokens')
+      if sum(topology_sequences[field]) != 2 * result['selected_edges']:
+        raise ValueError(
+          f'{source}.{field} sum differs from twice selected_edges')
+    for field in ('selected_component_sizes', 'permuted_component_sizes'):
+      if sum(topology_sequences[field]) != result['masked_tokens']:
+        raise ValueError(
+          f'{source}.{field} sum differs from masked_tokens')
+    if (topology_sequences['selected_degree_sequence']
+        != topology_sequences['permuted_degree_sequence']):
+      raise ValueError(
+        f'{source} matched permutation does not preserve degree sequence')
+    if (topology_sequences['selected_component_sizes']
+        != topology_sequences['permuted_component_sizes']):
+      raise ValueError(
+        f'{source} matched permutation does not preserve component sizes')
     support = result['candidate_support']
     if not isinstance(support, list) or not support:
       raise ValueError(f'{source}.candidate_support must be non-empty')
@@ -493,6 +532,7 @@ def _load_plan_for_analysis(
     expected_legacy_plan_sha256: str = PINNED_LEGACY_PLAN_SHA256,
     expected_legacy_repository_sha: str = PINNED_LEGACY_REPOSITORY_SHA,
     require_current_repository_match: bool = True,
+    repo_root: Path = REPO_ROOT,
 ) -> tuple[dict[str, Any], dict[str, dict[str, Any]], str, bool]:
   """Load a current plan or the one explicitly grandfathered legacy plan.
 
@@ -514,7 +554,7 @@ def _load_plan_for_analysis(
   if raw_plan.get('schema_version') != 1:
     plan, jobs = _load_plan(plan_dir)
     if require_current_repository_match:
-      _validate_repository_checkout(plan)
+      _validate_repository_checkout(plan, repo_root=repo_root)
     return plan, jobs, plan_sha256, False
 
   _lower_hex(
@@ -699,16 +739,18 @@ def load_plan_records(
     comparison_name: str,
     expected_legacy_plan_sha256: str = PINNED_LEGACY_PLAN_SHA256,
     expected_legacy_repository_sha: str = PINNED_LEGACY_REPOSITORY_SHA,
+    repo_root: Path = REPO_ROOT,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
   plan_dir = plan_dir.expanduser().resolve()
   plan, jobs, plan_sha256, legacy = _load_plan_for_analysis(
     plan_dir,
     expected_legacy_plan_sha256=expected_legacy_plan_sha256,
-    expected_legacy_repository_sha=expected_legacy_repository_sha)
+    expected_legacy_repository_sha=expected_legacy_repository_sha,
+    repo_root=repo_root)
   manifest_path = manifest_path.expanduser().resolve()
   if sha256_file(manifest_path) != plan['source_manifest_sha256']:
     raise ValueError('protocol manifest SHA256 differs from compiled plan')
-  manifest = load_and_validate_manifest(manifest_path)
+  manifest = load_and_validate_manifest(manifest_path, repo_root=repo_root)
   if suite_name not in plan['selected_suites']:
     raise ValueError(f'suite {suite_name} is not in the compiled plan')
   comparison = manifest['evaluation']['comparisons'].get(comparison_name)
@@ -784,7 +826,7 @@ def load_plan_records(
     if not isinstance(pairing_payload, dict):
       raise ValueError(f'{pairing_path} must contain a JSON object')
     data_config_path = (
-      REPO_ROOT / 'configs/data'
+      repo_root / 'configs/data'
       / f'{manifest["datasets"][job["identity"]["dataset"]]["data_config"]}.yaml')
     import yaml
     with data_config_path.open() as handle:

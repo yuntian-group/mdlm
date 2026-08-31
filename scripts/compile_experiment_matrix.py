@@ -42,6 +42,13 @@ TRUSTED_CANDIDATE_K_PROMOTION_TEMPLATES = {
       / 'contextual-forest-k128-promotion-policy-template.yaml'),
   },
 }
+TRUSTED_CAUSAL_PROMOTION_TEMPLATES = {
+  'contextual-forest-causal-evidence-v1': {
+    'causal_smoke': (
+      REPO_ROOT / 'configs/experiment'
+      / 'contextual-forest-causal-smoke-promotion-policy-template.yaml'),
+  },
+}
 
 
 def _exact_keys(
@@ -916,7 +923,20 @@ def compile_matrix(
     # Import lazily because both evaluators reuse this module's manifest
     # validator.  Evidence is dispatched by its manifest-declared source
     # suite, never by a schema or policy path supplied inside the evidence.
-    if source_suite == 'pilot':
+    causal_template = TRUSTED_CAUSAL_PROMOTION_TEMPLATES.get(
+      protocol_id, {}).get(source_suite)
+    if causal_template is not None:
+      from scripts.evaluate_causal_promotion import (  # pylint: disable=import-outside-toplevel
+        verify_causal_compiler_evidence,
+      )
+      evidence = verify_causal_compiler_evidence(
+        _read_yaml_or_json(resolved_evidence),
+        evidence_path=resolved_evidence,
+        promoted_suite=suite_name,
+        manifest_path=manifest_path,
+        trusted_template_path=causal_template,
+        repo_root=repo_root)
+    elif source_suite == 'pilot':
       trusted_policy = TRUSTED_PROMOTION_POLICIES.get(protocol_id)
       if trusted_policy is None:
         raise ValueError(

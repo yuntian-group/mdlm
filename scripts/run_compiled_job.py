@@ -162,7 +162,11 @@ def _load_plan(plan_dir: Path) -> tuple[dict[str, Any], dict[str, dict[str, Any]
   return plan, jobs
 
 
-def _validate_repository_checkout(plan: Mapping[str, Any]) -> None:
+def _validate_repository_checkout(
+    plan: Mapping[str, Any],
+    *,
+    repo_root: Path = REPO_ROOT,
+) -> None:
   expected = plan.get('repository')
   if not isinstance(expected, Mapping) or set(expected) != {'sha', 'dirty'}:
     raise ValueError('compiled plan lacks exact repository metadata')
@@ -170,7 +174,7 @@ def _validate_repository_checkout(plan: Mapping[str, Any]) -> None:
     raise ValueError(
       'compiled jobs are executable only from a clean committed repository; '
       'recompile the plan after committing the experiment code')
-  actual = _git_metadata(REPO_ROOT)
+  actual = _git_metadata(repo_root)
   if actual != dict(expected):
     raise ValueError(
       f'repository checkout differs from compiled plan: expected '

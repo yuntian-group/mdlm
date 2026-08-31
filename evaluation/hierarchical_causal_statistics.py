@@ -447,20 +447,56 @@ def aggregate_topology_permutation_diagnostic(
         or selected_edges < 0 or changed_edges < 0
         or changed_edges > selected_edges):
       raise ValueError('invalid selected/permuted changed-edge counts')
+    selected_degrees = row.get('selected_degree_sequence')
+    permuted_degrees = row.get('permuted_degree_sequence')
+    selected_components = row.get('selected_component_sizes')
+    permuted_components = row.get('permuted_component_sizes')
+    for name, signature, positive in (
+        ('selected_degree_sequence', selected_degrees, False),
+        ('permuted_degree_sequence', permuted_degrees, False),
+        ('selected_component_sizes', selected_components, True),
+        ('permuted_component_sizes', permuted_components, True)):
+      if (not isinstance(signature, (list, tuple)) or not signature
+          or any(not isinstance(value, int) or isinstance(value, bool)
+                 or value < int(positive) for value in signature)
+          or list(signature) != sorted(signature)):
+        raise ValueError(f'invalid {name} in causal record')
+    masked_tokens = row.get('masked_tokens')
+    if (not isinstance(masked_tokens, int) or isinstance(masked_tokens, bool)
+        or masked_tokens <= 0):
+      raise ValueError('invalid masked_tokens in causal record')
+    if (len(selected_degrees) != masked_tokens
+        or len(permuted_degrees) != masked_tokens
+        or sum(selected_degrees) != 2 * selected_edges
+        or sum(permuted_degrees) != 2 * selected_edges
+        or sum(selected_components) != masked_tokens
+        or sum(permuted_components) != masked_tokens):
+      raise ValueError('causal record topology signatures are inconsistent')
+    degree_preserved = list(selected_degrees) == list(permuted_degrees)
+    components_preserved = (
+      list(selected_components) == list(permuted_components))
     key = (
       row['dataset'], row['dataset_revision'], float(row['mask_rate']),
       row['candidate_k'])
-    cell = totals.setdefault(key, [0, 0, 0])
+    cell = totals.setdefault(key, [0, 0, 0, 0, 0])
     cell[0] += selected_edges
     cell[1] += changed_edges
     cell[2] += 1
+    cell[3] += int(degree_preserved)
+    cell[4] += int(components_preserved)
 
   conditions = {}
   pooled_selected = 0
   pooled_changed = 0
   condition_passes = []
+  condition_degree_passes = []
+  condition_component_passes = []
+  pooled_records = 0
+  pooled_degree_preserved = 0
+  pooled_components_preserved = 0
   for (dataset, revision, mask_rate, adapter_k), (
-      selected_edges, changed_edges, num_records) in sorted(totals.items()):
+      selected_edges, changed_edges, num_records, degree_preserved_records,
+      component_preserved_records) in sorted(totals.items()):
     if selected_edges <= 0:
       raise ValueError(
         'topology permutation diagnostic encountered a condition with no '
@@ -468,6 +504,10 @@ def aggregate_topology_permutation_diagnostic(
     fraction = changed_edges / selected_edges
     passed = fraction >= minimum_condition_changed_edge_fraction
     condition_passes.append(passed)
+    degree_passed = degree_preserved_records == num_records
+    component_passed = component_preserved_records == num_records
+    condition_degree_passes.append(degree_passed)
+    condition_component_passes.append(component_passed)
     key = f'{dataset}|mask={mask_rate:.6f}|adapter_k={adapter_k}'
     conditions[key] = {
       'dataset': dataset,
@@ -475,6 +515,10 @@ def aggregate_topology_permutation_diagnostic(
       'mask_rate': mask_rate,
       'adapter_candidate_k': adapter_k,
       'num_records': num_records,
+      'degree_sequence_preserved_records': degree_preserved_records,
+      'component_sizes_preserved_records': component_preserved_records,
+      'degree_sequence_preserved_every_record': degree_passed,
+      'component_sizes_preserved_every_record': component_passed,
       'selected_edges': selected_edges,
       'changed_edges': changed_edges,
       'changed_edge_fraction': fraction,
@@ -484,6 +528,9 @@ def aggregate_topology_permutation_diagnostic(
     }
     pooled_selected += selected_edges
     pooled_changed += changed_edges
+    pooled_records += num_records
+    pooled_degree_preserved += degree_preserved_records
+    pooled_components_preserved += component_preserved_records
   if pooled_selected <= 0:
     raise ValueError('topology permutation diagnostic has no selected edges')
   pooled_fraction = pooled_changed / pooled_selected
@@ -492,6 +539,13 @@ def aggregate_topology_permutation_diagnostic(
     'arm': arm,
     'estimand': 'edge_weighted_fraction_of_selected_edges_reassigned',
     'pooled': {
+      'num_records': pooled_records,
+      'degree_sequence_preserved_records': pooled_degree_preserved,
+      'component_sizes_preserved_records': pooled_components_preserved,
+      'degree_sequence_preserved_every_record': (
+        pooled_degree_preserved == pooled_records),
+      'component_sizes_preserved_every_record': (
+        pooled_components_preserved == pooled_records),
       'selected_edges': pooled_selected,
       'changed_edges': pooled_changed,
       'changed_edge_fraction': pooled_fraction,
@@ -501,8 +555,188 @@ def aggregate_topology_permutation_diagnostic(
     },
     'conditions': conditions,
     'gate': {
+      'degree_sequence_preserved_every_record': (
+        bool(condition_degree_passes) and all(condition_degree_passes)),
+      'component_sizes_preserved_every_record': (
+        bool(condition_component_passes) and all(condition_component_passes)),
       'pooled_fraction_passed': pooled_passed,
       'every_condition_fraction_passed': all(condition_passes),
-      'passed': pooled_passed and all(condition_passes),
+      'passed': (
+        pooled_passed
+        and all(condition_passes)
+        and bool(condition_degree_passes)
+        and all(condition_degree_passes)
+        and all(condition_component_passes)),
+    },
+  }
+
+
+def aggregate_technical_diagnostics(
+    records: Iterable[Mapping[str, Any]],
+    *,
+    expected_arms: Sequence[str],
+    expected_train_seeds: Sequence[int],
+    expected_support_ks: Sequence[int],
+    no_edge_absolute_tolerance: float = 1e-10,
+    support_monotonicity_tolerance: float = 1e-6,
+) -> dict[str, Any]:
+  """Summarize result-direction-neutral validity checks for causal routing.
+
+  These checks establish that the four-arm paired experiment produced a
+  numerically usable, structurally non-degenerate artifact. They never test
+  whether any NLL contrast is positive, negative, large, or significant.
+  """
+  rows = _deduplicated_v2_records(records)
+  arms = list(expected_arms)
+  if not arms or len(arms) != len(set(arms)):
+    raise ValueError('expected_arms must be non-empty and unique')
+  observed_arms = sorted({row['arm'] for row in rows})
+  if set(observed_arms) != set(arms):
+    raise ValueError(
+      f'causal technical diagnostics expected arms {sorted(arms)}, '
+      f'found {observed_arms}')
+  train_seeds = list(expected_train_seeds)
+  if (not train_seeds or train_seeds != sorted(set(train_seeds))
+      or any(not isinstance(value, int) or isinstance(value, bool)
+             or value <= 0 for value in train_seeds)):
+    raise ValueError(
+      'expected_train_seeds must be increasing positive integers')
+  observed_train_seeds = sorted({row['train_seed'] for row in rows})
+  if observed_train_seeds != train_seeds:
+    raise ValueError(
+      f'causal technical diagnostics expected train seeds {train_seeds}, '
+      f'found {observed_train_seeds}')
+  support_ks = list(expected_support_ks)
+  if (not support_ks or support_ks != sorted(set(support_ks))
+      or any(not isinstance(value, int) or isinstance(value, bool)
+             or value <= 0 for value in support_ks)):
+    raise ValueError('expected_support_ks must be increasing positive integers')
+  for name, value in (
+      ('no_edge_absolute_tolerance', no_edge_absolute_tolerance),
+      ('support_monotonicity_tolerance', support_monotonicity_tolerance)):
+    if (not isinstance(value, (int, float)) or isinstance(value, bool)
+        or not math.isfinite(float(value)) or float(value) < 0.0):
+      raise ValueError(f'{name} must be finite and non-negative')
+
+  pairing: dict[tuple[Any, ...], set[str]] = {}
+  paired_units: dict[tuple[Any, ...], dict[tuple[str, int], int]] = {}
+  topology: dict[tuple[str, str, str, float, int], list[int]] = {}
+  maximum_no_edge_error = 0.0
+  support_grid_complete = True
+  support_monotone = True
+  finite_statistics = True
+  for row in rows:
+    pairing_key = (
+      row['corruption_seed'], row['dataset'], row['dataset_revision'],
+      float(row['mask_rate']), row['candidate_k'])
+    pairing.setdefault(pairing_key, set()).add(
+      row['pairing_digest_sha256'])
+    paired_unit_key = (
+      row['corruption_seed'], row['dataset'], row['dataset_revision'],
+      float(row['mask_rate']), row['candidate_k'], row['document_id'],
+      row['document_index'], row['document_sha256'], row['chunk_index'])
+    arm_seed = (row['arm'], row['train_seed'])
+    unit = paired_units.setdefault(paired_unit_key, {})
+    previous_masked = unit.get(arm_seed)
+    if previous_masked is not None and previous_masked != row['masked_tokens']:
+      raise ValueError(
+        'conflicting masked-token counts within a paired arm/seed unit')
+    unit[arm_seed] = int(row['masked_tokens'])
+    topology_key = (
+      row['arm'], row['dataset'], row['dataset_revision'],
+      float(row['mask_rate']), row['candidate_k'])
+    topology_totals = topology.setdefault(topology_key, [0, 0, 0])
+    topology_totals[0] += int(row['selected_edges'])
+    topology_totals[1] += int(row['masked_tokens'])
+    topology_totals[2] += 1
+
+    no_edge_error = abs(
+      float(row['factorized_backbone_nll_sum'])
+      - float(row['parameter_matched_no_edge_nll_sum']))
+    maximum_no_edge_error = max(maximum_no_edge_error, no_edge_error)
+    finite_statistics = finite_statistics and all(math.isfinite(float(
+      row[field])) for field in NLL_METRICS | {
+        'masked_tokens', 'selected_edges', 'permuted_changed_edges'})
+
+    support = row['candidate_support']
+    observed_support_ks = [entry['candidate_k'] for entry in support]
+    support_grid_complete = (
+      support_grid_complete and observed_support_ks == support_ks)
+    for previous, current in zip(support, support[1:]):
+      if current['candidate_hits'] < previous['candidate_hits']:
+        support_monotone = False
+      if (float(current['retained_mass_sum'])
+          + float(support_monotonicity_tolerance)
+          < float(previous['retained_mass_sum'])):
+        support_monotone = False
+
+  mismatched_pairing = [
+    key for key, digests in pairing.items() if len(digests) != 1]
+  expected_arm_seed_cells = {
+    (arm, train_seed) for arm in arms for train_seed in train_seeds}
+  incomplete_paired_units = [
+    key for key, values in paired_units.items()
+    if set(values) != expected_arm_seed_cells]
+  masked_token_mismatched_units = [
+    key for key, values in paired_units.items()
+    if len(set(values.values())) != 1]
+  topology_conditions = {}
+  nonempty_conditions = []
+  for (arm, dataset, revision, mask_rate, adapter_k), (
+      selected_edges, masked_tokens, num_records) in sorted(topology.items()):
+    if masked_tokens <= 0:
+      raise ValueError('topology diagnostic condition has no masked tokens')
+    nonempty = selected_edges > 0
+    nonempty_conditions.append(nonempty)
+    key = (
+      f'{arm}|{dataset}|mask={mask_rate:.6f}|adapter_k={adapter_k}')
+    topology_conditions[key] = {
+      'arm': arm,
+      'dataset': dataset,
+      'dataset_revision': revision,
+      'mask_rate': mask_rate,
+      'adapter_candidate_k': adapter_k,
+      'num_records': num_records,
+      'masked_tokens': masked_tokens,
+      'selected_edges': selected_edges,
+      'selected_edges_per_masked_token': selected_edges / masked_tokens,
+      'nonempty': nonempty,
+    }
+
+  return {
+    'expected_arms': arms,
+    'observed_arms': observed_arms,
+    'num_records': len(rows),
+    'finite_statistics': {'passed': finite_statistics},
+    'pairing': {
+      'expected_train_seeds': train_seeds,
+      'observed_train_seeds': observed_train_seeds,
+      'num_conditions': len(pairing),
+      'mismatched_conditions': len(mismatched_pairing),
+      'num_paired_units': len(paired_units),
+      'expected_arm_train_cells_per_unit': len(expected_arm_seed_cells),
+      'incomplete_paired_units': len(incomplete_paired_units),
+      'masked_token_mismatched_units': len(masked_token_mismatched_units),
+      'passed': (
+        not mismatched_pairing
+        and not incomplete_paired_units
+        and not masked_token_mismatched_units),
+    },
+    'no_edge_identity': {
+      'maximum_absolute_error': maximum_no_edge_error,
+      'absolute_tolerance': float(no_edge_absolute_tolerance),
+      'passed': maximum_no_edge_error <= float(no_edge_absolute_tolerance),
+    },
+    'candidate_support': {
+      'expected_candidate_ks': support_ks,
+      'grid_complete': support_grid_complete,
+      'monotonicity_absolute_tolerance': float(
+        support_monotonicity_tolerance),
+      'monotone_within_tolerance': support_monotone,
+    },
+    'topology_structure': {
+      'conditions': topology_conditions,
+      'every_condition_nonempty': all(nonempty_conditions),
+      'passed': bool(nonempty_conditions) and all(nonempty_conditions),
     },
   }

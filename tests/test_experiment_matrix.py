@@ -11,11 +11,12 @@ from scripts.compile_experiment_matrix import (
   DEFAULT_MANIFEST,
   JOB_SCHEMA_VERSION,
   REPO_ROOT,
+  TRUSTED_CAUSAL_PROMOTION_TEMPLATES,
   TRUSTED_CANDIDATE_K_PROMOTION_TEMPLATES,
   compile_matrix,
   sha256_file,
 )
-from scripts.run_compiled_job import run_job
+from scripts.run_compiled_job import _job_execution_digest, run_job
 
 
 CAUSAL_MANIFEST = (
@@ -142,7 +143,12 @@ class ExperimentMatrixTest(unittest.TestCase):
         output_dir=artifact_root / 'plan')
 
     self.assertEqual(plan['job_counts'], {
-      'eval': 16, 'export': 2, 'train': 2})
+      'eval': 32, 'export': 4, 'train': 4})
+    self.assertEqual({
+      job['identity']['control'] for job in jobs.values()
+      if job['kind'] == 'train'}, {
+        'dynamic_dynamic', 'fixed_dynamic',
+        'dynamic_fixed', 'static_static'})
     evaluation = next(job for job in jobs.values() if job['kind'] == 'eval')
     self.assertIn(
       'eval.conditional_records.schema_version=2', evaluation['argv'])
@@ -150,6 +156,74 @@ class ExperimentMatrixTest(unittest.TestCase):
       'eval.conditional_records.support_candidate_ks=[32,64,128,256]',
       evaluation['argv'])
     self.assertEqual(evaluation['identity']['candidate_k'], 128)
+
+  def test_causal_primary_requires_technical_smoke_evidence(self):
+    with tempfile.TemporaryDirectory() as directory:
+      root = Path(directory)
+      with self.assertRaisesRegex(ValueError, 'is gated on causal_smoke'):
+        compile_matrix(
+          CAUSAL_MANIFEST,
+          selected_suites=['causal_primary'],
+          allowed_artifact_root=root,
+          artifact_root_override=root / 'artifacts',
+          output_dir=root / 'artifacts/plan')
+
+  def test_causal_primary_uses_trusted_causal_verifier_and_reuses_smoke(self):
+    with tempfile.TemporaryDirectory() as directory:
+      root = Path(directory)
+      artifact_root = root / 'artifacts'
+      _, smoke_jobs, _ = compile_matrix(
+        CAUSAL_MANIFEST,
+        selected_suites=['causal_smoke'],
+        allowed_artifact_root=root,
+        artifact_root_override=artifact_root,
+        output_dir=artifact_root / 'smoke-plan')
+      evidence_path = root / 'causal-smoke-promotion.json'
+      evidence_path.write_text('{}')
+      verified = {
+        'source_suite': 'causal_smoke',
+        'route_name': 'primary',
+        'commitments': {
+          'canonical_decision_sha256': 'a' * 64,
+          'source_compiled_plan_sha256': 'b' * 64,
+        },
+      }
+      with mock.patch(
+          'scripts.evaluate_causal_promotion.verify_causal_compiler_evidence',
+          return_value=verified) as causal_verifier, mock.patch(
+          'scripts.evaluate_candidate_k_promotion.'
+          'verify_candidate_compiler_evidence') as candidate_verifier, \
+          mock.patch(
+          'scripts.evaluate_experiment_promotion.verify_compiler_evidence'
+      ) as pilot_verifier:
+        plan, primary_jobs, _ = compile_matrix(
+          CAUSAL_MANIFEST,
+          selected_suites=['causal_primary'],
+          allowed_artifact_root=root,
+          artifact_root_override=artifact_root,
+          output_dir=artifact_root / 'primary-plan',
+          promotion_evidence={'causal_primary': evidence_path})
+
+    pilot_verifier.assert_not_called()
+    candidate_verifier.assert_not_called()
+    causal_verifier.assert_called_once()
+    call = causal_verifier.call_args
+    self.assertEqual(call.args, ({},))
+    self.assertEqual(
+      call.kwargs['trusted_template_path'],
+      TRUSTED_CAUSAL_PROMOTION_TEMPLATES[
+        'contextual-forest-causal-evidence-v1']['causal_smoke'])
+    self.assertEqual(
+      plan['promotion_evidence']['causal_primary']['source_suite'],
+      'causal_smoke')
+    for job_id in (
+        'train--dynamic_dynamic--s001--k128',
+        'export--dynamic_dynamic--s001--k128',
+        'train--static_static--s001--k128',
+        'export--static_static--s001--k128'):
+      self.assertEqual(
+        _job_execution_digest(smoke_jobs[job_id]),
+        _job_execution_digest(primary_jobs[job_id]))
 
   def test_gated_suite_requires_matching_promotion_evidence(self):
     with tempfile.TemporaryDirectory() as directory:

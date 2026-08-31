@@ -8,7 +8,7 @@ import datetime as dt
 import json
 from pathlib import Path
 import sys
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -20,6 +20,7 @@ from evaluation.hierarchical_causal_statistics import (  # noqa: E402
   ContrastTerm,
   aggregate_candidate_support,
   aggregate_causal_contrast,
+  aggregate_technical_diagnostics,
   aggregate_topology_permutation_diagnostic,
 )
 from scripts.aggregate_hierarchical_document_eval import (  # noqa: E402
@@ -90,6 +91,62 @@ def _deduplicate_records(records):
   return list(keyed.values())
 
 
+def _merge_source_integrity(
+    contexts: Mapping[str, Mapping[str, Any]],
+) -> dict[str, Any]:
+  """Commit the union of all jobs used by the three causal source views."""
+  first_context = next(iter(contexts.values()))
+  plan = first_context['plan']
+  fixed_fields = {
+    'schema_version': 1,
+    'source_compiled_plan_path': str(
+      (Path(first_context['source_integrity'][
+        'source_compiled_plan_path']).expanduser().resolve())),
+    'source_compiled_plan_sha256': first_context['plan_sha256'],
+    'source_plan_id': plan['plan_id'],
+    'source_manifest_sha256': plan['source_manifest_sha256'],
+    'source_repository_sha': plan['repository']['sha'],
+    'source_repository_clean': plan['repository']['dirty'] is False,
+  }
+  jobs = {}
+  for comparison_name, context in contexts.items():
+    if context['plan'] != plan or context['plan_sha256'] != \
+        first_context['plan_sha256']:
+      raise ValueError(
+        f'causal source view {comparison_name} uses a different plan')
+    integrity = context['source_integrity']
+    for field, expected in fixed_fields.items():
+      observed = integrity[field]
+      if field == 'source_compiled_plan_path':
+        observed = str(Path(observed).expanduser().resolve())
+      if observed != expected:
+        raise ValueError(
+          f'causal source view {comparison_name} has conflicting {field}')
+    if set(integrity['jobs']) != set(integrity['validated_job_ids']):
+      raise ValueError(
+        f'causal source view {comparison_name} has inconsistent job IDs')
+    for job_id in integrity['validated_job_ids']:
+      job = dict(integrity['jobs'][job_id])
+      previous = jobs.get(job_id)
+      if previous is not None and previous != job:
+        raise ValueError(
+          f'causal source views disagree about job {job_id}')
+      jobs[job_id] = job
+  expected_job_ids = sorted(plan['job_ids'])
+  if sorted(jobs) != expected_job_ids:
+    missing = sorted(set(expected_job_ids) - set(jobs))
+    extra = sorted(set(jobs) - set(expected_job_ids))
+    raise ValueError(
+      'causal source views do not cover the complete compiled plan: '
+      f'missing={missing}, extra={extra}')
+  body = {
+    **fixed_fields,
+    'validated_job_ids': expected_job_ids,
+    'jobs': {job_id: jobs[job_id] for job_id in expected_job_ids},
+  }
+  return {**body, 'commitment_sha256': canonical_sha256(body)}
+
+
 def build_analysis(
     *,
     plan_dir: Path,
@@ -98,18 +155,37 @@ def build_analysis(
     num_resamples: int | None = None,
     rng_seed: int | None = None,
     confidence_level: float | None = None,
+    timestamp_utc: str | None = None,
+    technical_gates: Mapping[str, Any] | None = None,
+    repo_root: Path = REPO_ROOT,
 ) -> dict[str, Any]:
+  if technical_gates is None:
+    # Import lazily to avoid a module cycle: the finalizer imports the compiler,
+    # while the promotion evaluator imports this authoritative aggregator.
+    from scripts.finalize_causal_smoke_policy import (
+      DEFAULT_TEMPLATE,
+      _read_mapping,
+      _validate_template,
+    )
+    template = _validate_template(
+      _read_mapping(DEFAULT_TEMPLATE, context='causal policy template'),
+      manifest_path=manifest_path,
+      repo_root=repo_root)
+    technical_gates = template['technical_gates']
+  technical_gates = dict(technical_gates)
   records = []
   contexts = {}
   # Load the primary pair first, then only those extra views whose arms are
-  # present in the selected suite. This lets the two-arm smoke suite produce
-  # all within-adapter causal checks without pretending to be a full 2x2.
+  # present in the selected suite. Every current causal suite contains the
+  # complete 2x2; retaining the subset logic makes incomplete legacy plans
+  # explicit rather than silently inventing missing factorial cells.
   comparison_names = ['contextual_vs_static']
   primary_records, primary_context = load_plan_records(
     plan_dir,
     manifest_path=manifest_path,
     suite_name=suite_name,
-    comparison_name='contextual_vs_static')
+    comparison_name='contextual_vs_static',
+    repo_root=repo_root)
   available_arms = set(primary_context['suite']['controls'])
   if (primary_context['manifest']['analysis'][
       'document_record_schema_version'] != 2):
@@ -124,7 +200,8 @@ def build_analysis(
       plan_dir,
       manifest_path=manifest_path,
       suite_name=suite_name,
-      comparison_name=comparison_name)
+      comparison_name=comparison_name,
+      repo_root=repo_root)
     if context['manifest']['analysis']['document_record_schema_version'] != 2:
       raise ValueError('causal analysis requires document record schema v2')
     records.extend(comparison_records)
@@ -156,14 +233,23 @@ def build_analysis(
     num_resamples=num_resamples,
     rng_seed=rng_seed + 10_000,
     confidence_level=confidence_level)
-  permutation_gate = analysis_cfg['permutation_control_gate']
   topology_permutation = aggregate_topology_permutation_diagnostic(
     records,
     arm='dynamic_dynamic',
     minimum_pooled_changed_edge_fraction=(
-      permutation_gate['minimum_pooled_changed_edge_fraction']),
+      technical_gates['minimum_pooled_changed_edge_fraction']),
     minimum_condition_changed_edge_fraction=(
-      permutation_gate['minimum_condition_changed_edge_fraction']))
+      technical_gates['minimum_condition_changed_edge_fraction']))
+  technical_diagnostics = aggregate_technical_diagnostics(
+    records,
+    expected_arms=list(primary_context['suite']['controls']),
+    expected_train_seeds=list(primary_context['suite']['train_seeds']),
+    expected_support_ks=list(
+      primary_context['manifest']['evaluation']['candidate_ks']),
+    no_edge_absolute_tolerance=(
+      technical_gates['no_edge_absolute_tolerance']),
+    support_monotonicity_tolerance=(
+      technical_gates['support_monotonicity_absolute_tolerance']))
 
   source_views = {}
   for comparison_name, context in contexts.items():
@@ -174,10 +260,13 @@ def build_analysis(
       'source_integrity_commitment_sha256': (
         context['source_integrity']['commitment_sha256']),
     }
+  source_integrity = _merge_source_integrity(contexts)
+  plan = primary_context['plan']
   payload = {
-    'schema_version': 1,
+    'schema_version': 2,
     'artifact': 'contextual_forest_causal_denoising_analysis',
-    'created_utc': dt.datetime.now(dt.timezone.utc).isoformat(),
+    'created_utc': timestamp_utc or dt.datetime.now(
+      dt.timezone.utc).isoformat(),
     'protocol_id': next(iter(contexts.values()))['manifest']['protocol_id'],
     'suite': suite_name,
     'objective': 'paired_conditional_denoising_nll_per_masked_token',
@@ -188,6 +277,17 @@ def build_analysis(
     'contrasts': contrast_results,
     'candidate_support': support,
     'topology_permutation_diagnostic': topology_permutation,
+    'technical_diagnostics': technical_diagnostics,
+    'compiled_plan': {
+      'plan_id': plan['plan_id'],
+      'source_manifest_sha256': plan['source_manifest_sha256'],
+      'source_compiled_plan_sha256': primary_context['plan_sha256'],
+      'source_repository_sha': plan['repository']['sha'],
+      'source_repository_clean': plan['repository']['dirty'] is False,
+      'job_artifact_commitment_sha256': source_integrity[
+        'commitment_sha256'],
+    },
+    'source_integrity': source_integrity,
   }
   payload['analysis_sha256'] = canonical_sha256(payload)
   return payload
