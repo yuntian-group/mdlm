@@ -433,6 +433,7 @@ def _validate_trusted_protocol_path(
 def validate_compiled_topology_plan_lineage(
     plan: Mapping[str, Any],
     *,
+    jobs: Mapping[str, Mapping[str, Any]],
     plan_dir: Path,
     protocol_path: Path,
     protocol: Mapping[str, Any],
@@ -489,6 +490,33 @@ def validate_compiled_topology_plan_lineage(
       or source_plan.get('promotion_evidence', {}).get(
         'candidate_k_128_confirmation') != promotion_entry):
     raise ValueError('source compiled plan identity differs from derived plan')
+
+  # The derived plan lives outside Git, so its internal job-spec hashes are
+  # not an independent authenticity boundary. Re-run the repository compiler
+  # from the hash-bound parent and compare every plan field and job byte-for-
+  # byte. This binds copied train/export jobs to the promoted parent and binds
+  # each eval job to the reviewed emitter argv, dependency, inputs, and output
+  # contract.
+  from scripts.compile_topology_diagnostics import (  # noqa: PLC0415
+    derive_topology_plan,
+  )
+  expected_plan, expected_jobs, expected_dir = derive_topology_plan(
+    source_plan_dir=source_path.parent,
+    output_dir=plan_dir,
+    protocol_path=protocol_path)
+  if expected_dir != plan_dir:
+    raise AssertionError('canonical topology compiler output path drifted')
+  if set(jobs) != set(expected_jobs):
+    raise ValueError(
+      'compiled topology job set differs from canonical compiler reconstruction')
+  for job_id in expected_jobs:
+    if canonical_json(jobs[job_id]) != canonical_json(expected_jobs[job_id]):
+      raise ValueError(
+        f'compiled topology job {job_id!r} differs from canonical compiler '
+        'reconstruction')
+  if canonical_json(plan) != canonical_json(expected_plan):
+    raise ValueError(
+      'compiled topology plan differs from canonical compiler reconstruction')
   return source
 
 
@@ -1083,6 +1111,11 @@ def evaluate_topology_head_interventions(
 
   emitted = []
   for batch_index in range(batch_size):
+    # Persist the canonical JSON-grid value, not a float32 tensor round-trip.
+    # Values such as 0.1 and 0.9 are not exactly representable in float32 and
+    # must still satisfy the protocol's exact requested/effective-time pairing.
+    requested_value = protocol['time_points'][
+      requested_time_indices[batch_index]]
     active_nodes = active_mask[batch_index].nonzero(
       as_tuple=False).flatten().detach().cpu().tolist()
     learned_edges = _canonical_output_edges(learned_output, batch_index)
@@ -1100,13 +1133,13 @@ def evaluate_topology_head_interventions(
         'deterministic fixed-time anchor did not reproduce learned topology')
     emitted.append({
       'learned': {
-        'effective_time': float(requested[batch_index].item()),
+        'effective_time': requested_value,
         'selected_edges': learned_edges,
         'node_permutation': None,
         'time_donor_index': None,
       },
       'matched_permuted': {
-        'effective_time': float(requested[batch_index].item()),
+        'effective_time': requested_value,
         'selected_edges': permuted_edges,
         'node_permutation': permutation,
         'time_donor_index': None,
@@ -2628,6 +2661,7 @@ def load_trusted_plan_bundles(
   _validate_repository_checkout(plan, repo_root=REPO_ROOT)
   validate_compiled_topology_plan_lineage(
     plan,
+    jobs=jobs,
     plan_dir=plan_dir,
     protocol_path=protocol_path,
     protocol=protocol,

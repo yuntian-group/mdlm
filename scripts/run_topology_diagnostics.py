@@ -107,6 +107,7 @@ def _validate_runtime_job(
   _validate_repository_checkout(plan, repo_root=REPO_ROOT)
   validate_compiled_topology_plan_lineage(
     plan,
+    jobs=jobs,
     plan_dir=plan_dir,
     protocol_path=args.protocol,
     protocol=protocol,

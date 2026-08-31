@@ -867,17 +867,16 @@ def write_plan(
       _atomic_write(path, text)
 
 
-def compile_matrix(
+def derive_matrix_plan(
     manifest_path: Path,
     *,
     selected_suites: Sequence[str],
     allowed_artifact_root: Path = DEFAULT_ALLOWED_ARTIFACT_ROOT,
     artifact_root_override: Path | None = None,
-    output_dir: Path | None = None,
     repo_root: Path = REPO_ROOT,
     promotion_evidence: Mapping[str, Path] | None = None,
-    resume: bool = False,
 ) -> tuple[dict[str, Any], dict[str, dict[str, Any]], Path]:
+  """Derive the canonical matrix plan entirely in memory."""
   manifest_path = manifest_path.expanduser().resolve()
   manifest = load_and_validate_manifest(manifest_path, repo_root=repo_root)
   configured_root = (
@@ -885,18 +884,6 @@ def compile_matrix(
     else Path(manifest['artifact_root']))
   artifact_root = _safe_root(
     configured_root, allowed_artifact_root, context='artifact root')
-  resolved_output = (
-    output_dir.expanduser().resolve() if output_dir is not None
-    else artifact_root / 'plans' / '--'.join(sorted(set(selected_suites))))
-  try:
-    resolved_output.relative_to(artifact_root)
-  except ValueError as error:
-    raise ValueError(
-      f'output directory {resolved_output} must be within artifact root '
-      f'{artifact_root}') from error
-  if resolved_output == artifact_root:
-    raise ValueError('output directory must not equal artifact root')
-
   repository = _clean_repository_identity(repo_root)
   source_manifest_sha256 = sha256_file(manifest_path)
   evidence_paths = dict(promotion_evidence or {})
@@ -1015,6 +1002,38 @@ def compile_matrix(
       job_id: _sha256_text(_canonical_json(job))
       for job_id, job in jobs.items()},
   }
+  return plan, jobs, artifact_root
+
+
+def compile_matrix(
+    manifest_path: Path,
+    *,
+    selected_suites: Sequence[str],
+    allowed_artifact_root: Path = DEFAULT_ALLOWED_ARTIFACT_ROOT,
+    artifact_root_override: Path | None = None,
+    output_dir: Path | None = None,
+    repo_root: Path = REPO_ROOT,
+    promotion_evidence: Mapping[str, Path] | None = None,
+    resume: bool = False,
+) -> tuple[dict[str, Any], dict[str, dict[str, Any]], Path]:
+  plan, jobs, artifact_root = derive_matrix_plan(
+    manifest_path,
+    selected_suites=selected_suites,
+    allowed_artifact_root=allowed_artifact_root,
+    artifact_root_override=artifact_root_override,
+    repo_root=repo_root,
+    promotion_evidence=promotion_evidence)
+  resolved_output = (
+    output_dir.expanduser().resolve() if output_dir is not None
+    else artifact_root / 'plans' / '--'.join(sorted(set(selected_suites))))
+  try:
+    resolved_output.relative_to(artifact_root)
+  except ValueError as error:
+    raise ValueError(
+      f'output directory {resolved_output} must be within artifact root '
+      f'{artifact_root}') from error
+  if resolved_output == artifact_root:
+    raise ValueError('output directory must not equal artifact root')
   write_plan(resolved_output, plan, jobs, resume=resume)
   return plan, jobs, resolved_output
 

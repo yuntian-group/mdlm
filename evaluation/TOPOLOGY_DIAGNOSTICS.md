@@ -70,7 +70,12 @@ directory, not an arbitrary list of manifests. The dedicated compiler derives
 that plan from the authenticated K=128 confirmation plan and copies only the
 three required train/export dependency pairs. Their execution digests are
 unchanged, so completed adapters are reused, while six new topology jobs are
-added. The aggregator:
+added. Runtime validation and aggregation first reconstruct the K=128 parent
+in memory from the repository-trusted manifest through its registered
+promotion verifier. They then rerun the topology derivation and require
+canonical-JSON equality for the complete parent and derived plans and every
+job, including argv, dependencies, external inputs, and outputs. Neither
+authoritative replay step writes or replaces plan artifacts. The aggregator:
 
 1. validates the current clean checkout, dedicated plan, frozen protocol, and
    rehashed parent K=128 compiled plan;

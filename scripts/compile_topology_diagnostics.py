@@ -26,6 +26,7 @@ from scripts.compile_experiment_matrix import (  # noqa: E402
   PLAN_SCHEMA_VERSION,
   _canonical_json,
   _job,
+  derive_matrix_plan,
   write_plan,
 )
 from scripts.run_compiled_job import (  # noqa: E402
@@ -65,6 +66,40 @@ def _validate_source_promotion(plan: Mapping[str, Any]) -> dict[str, Any]:
       or evidence['route_name'] != 'confirmation'):
     raise ValueError('source K=128 promotion evidence is not authentic')
   return dict(evidence)
+
+
+def _validate_canonical_source_plan(
+    plan: Mapping[str, Any],
+    jobs: Mapping[str, Mapping[str, Any]],
+) -> None:
+  """Rebuild the promoted K=128 parent through the trusted compiler."""
+  if plan.get('selected_suites') != [SOURCE_SUITE]:
+    raise ValueError(
+      f'topology parent must contain exactly the {SOURCE_SUITE} suite')
+  promotion = _validate_source_promotion(plan)
+  artifact_root = Path(plan.get('artifact_root', '')).expanduser().resolve()
+  expected_plan, expected_jobs, expected_root = derive_matrix_plan(
+    DEFAULT_MANIFEST,
+    selected_suites=[SOURCE_SUITE],
+    artifact_root_override=artifact_root,
+    repo_root=REPO_ROOT,
+    promotion_evidence={SOURCE_SUITE: Path(promotion['path'])})
+  if expected_root != artifact_root:
+    raise AssertionError('canonical parent compiler artifact root drifted')
+  if set(jobs) != set(expected_jobs):
+    raise ValueError(
+      'K=128 topology parent job set differs from canonical compiler '
+      'reconstruction')
+  for job_id in expected_jobs:
+    if _canonical_json(jobs[job_id]) != _canonical_json(
+        expected_jobs[job_id]):
+      raise ValueError(
+        f'K=128 topology parent job {job_id!r} differs from canonical '
+        'compiler reconstruction')
+  if _canonical_json(plan) != _canonical_json(expected_plan):
+    raise ValueError(
+      'K=128 topology parent plan differs from canonical compiler '
+      'reconstruction')
 
 
 def _source_job_pair(
@@ -109,13 +144,13 @@ def _source_job_pair(
   return train, export
 
 
-def compile_topology_plan(
+def derive_topology_plan(
     *,
     source_plan_dir: Path,
     output_dir: Path | None = None,
     protocol_path: Path = DEFAULT_PROTOCOL,
-    resume: bool = False,
 ) -> tuple[dict[str, Any], dict[str, dict[str, Any]], Path]:
+  """Return the one canonical derived plan without writing any artifacts."""
   protocol_path = protocol_path.expanduser().resolve()
   protocol, protocol_sha = read_protocol(protocol_path)
   _validate_trusted_protocol_path(protocol_path, protocol)
@@ -127,6 +162,7 @@ def compile_topology_plan(
       DEFAULT_MANIFEST):
     raise ValueError(
       'source plan was not compiled from the repository-trusted manifest')
+  _validate_canonical_source_plan(source_plan, source_jobs)
   source_promotion = _validate_source_promotion(source_plan)
   artifact_root = Path(source_plan['artifact_root']).expanduser().resolve()
   if output_dir is None:
@@ -265,8 +301,23 @@ def compile_topology_plan(
     'job_spec_sha256': {
       job_id: _sha256_canonical(job) for job_id, job in jobs.items()},
   }
-  write_plan(output_dir, plan, jobs, resume=resume)
   return plan, jobs, output_dir
+
+
+def compile_topology_plan(
+    *,
+    source_plan_dir: Path,
+    output_dir: Path | None = None,
+    protocol_path: Path = DEFAULT_PROTOCOL,
+    resume: bool = False,
+) -> tuple[dict[str, Any], dict[str, dict[str, Any]], Path]:
+  """Derive and atomically write the canonical topology plan."""
+  plan, jobs, resolved_output = derive_topology_plan(
+    source_plan_dir=source_plan_dir,
+    output_dir=output_dir,
+    protocol_path=protocol_path)
+  write_plan(resolved_output, plan, jobs, resume=resume)
+  return plan, jobs, resolved_output
 
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:

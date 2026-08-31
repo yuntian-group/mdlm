@@ -14,6 +14,7 @@ from scripts.compile_experiment_matrix import (
   TRUSTED_CAUSAL_PROMOTION_TEMPLATES,
   TRUSTED_CANDIDATE_K_PROMOTION_TEMPLATES,
   compile_matrix,
+  derive_matrix_plan,
   sha256_file,
 )
 from scripts.run_compiled_job import _job_execution_digest, run_job
@@ -130,6 +131,27 @@ class ExperimentMatrixTest(unittest.TestCase):
         'conditional_record_manifest', 'dataset_provenance'})
     self.assertTrue(
       str(evaluation['artifact_dir']).startswith(str(artifact_root.resolve())))
+
+  def test_in_memory_derivation_does_not_write_or_replace_artifacts(self):
+    with tempfile.TemporaryDirectory() as directory:
+      root = Path(directory)
+      artifact_root = root / 'artifacts'
+      artifact_root.mkdir()
+      sentinel = artifact_root / 'preexisting-artifact.txt'
+      sentinel.write_text('preserve exactly\n')
+      plan, jobs, observed_root = derive_matrix_plan(
+        DEFAULT_MANIFEST,
+        selected_suites=['pilot'],
+        allowed_artifact_root=root,
+        artifact_root_override=artifact_root)
+
+      self.assertEqual(observed_root, artifact_root.resolve())
+      self.assertEqual(plan['num_jobs'], len(jobs))
+      self.assertEqual(sentinel.read_text(), 'preserve exactly\n')
+      self.assertEqual(
+        sorted(path.relative_to(artifact_root).as_posix()
+               for path in artifact_root.rglob('*')),
+        ['preexisting-artifact.txt'])
 
   def test_causal_smoke_compiles_schema_v2_paired_metrics(self):
     with tempfile.TemporaryDirectory() as directory:

@@ -32,6 +32,7 @@ from evaluation.topology_diagnostics import (
   source_units_from_ordered_dataset,
   topology_metrics,
   validate_analysis,
+  validate_compiled_topology_plan_lineage,
   validate_gpu_exclusivity_evidence,
   write_record_bundle,
   write_source_selection_manifest,
@@ -43,7 +44,10 @@ from scripts.compile_experiment_matrix import (
   _job,
   write_plan,
 )
-from scripts.compile_topology_diagnostics import compile_topology_plan
+from scripts.compile_topology_diagnostics import (
+  compile_topology_plan,
+  derive_topology_plan,
+)
 from scripts.run_compiled_job import (
   SUCCESS_MARKER,
   _job_digest,
@@ -1113,6 +1117,9 @@ class TopologyDiagnosticsTest(unittest.TestCase):
           torch.zeros(batch, length, 100, device=tokens.device))
 
     protocol = _protocol()
+    # Exercise the production grid values that are not exactly representable
+    # after a float32 tensor round-trip.
+    protocol['time_points'] = [0.1, 0.9]
     tokens = [1] * 64
     attention = [True] * 64
     source = {
@@ -1149,6 +1156,9 @@ class TopologyDiagnosticsTest(unittest.TestCase):
     self.assertEqual(model.structured_head.calls, 16)
     self.assertTrue(model.force_no_grad)
     self.assertEqual(model.structured_head.assert_dynamic, 'dynamic')
+    for record in records:
+      if record['intervention'] in {'learned', 'matched_permuted'}:
+        self.assertEqual(record['effective_time'], record['requested_time'])
     learned = [
       record for record in records if record['intervention'] == 'learned']
     for corruption_seed in protocol['corruption_seeds']:
@@ -1260,7 +1270,10 @@ class TopologyDiagnosticsTest(unittest.TestCase):
       output_dir = artifact_root / 'plans' / 'topology'
       with mock.patch(
           'scripts.compile_topology_diagnostics.'
-          '_validate_repository_checkout'):
+          '_validate_repository_checkout'), \
+          mock.patch(
+            'scripts.compile_topology_diagnostics.'
+            '_validate_canonical_source_plan'):
         plan, jobs, observed_output = compile_topology_plan(
           source_plan_dir=source_dir, output_dir=output_dir)
       self.assertEqual(observed_output, output_dir.resolve())
@@ -1294,6 +1307,169 @@ class TopologyDiagnosticsTest(unittest.TestCase):
             _job_execution_digest(jobs[job_id]),
             _job_execution_digest(source_jobs[job_id]))
 
+  def test_canonical_plan_reconstruction_rejects_argv_and_dependency_drift(self):
+    protocol_path = (
+      Path(__file__).resolve().parents[1] / 'configs' / 'evaluation'
+      / 'contextual-forest-topology-diagnostics-v1.json')
+    protocol = json.loads(protocol_path.read_text())
+    protocol_sha = canonical_sha256(protocol)
+    with tempfile.TemporaryDirectory() as directory:
+      root = Path(directory)
+      source_dir, _, _, artifact_root = _k128_source_plan_fixture(root)
+      output_dir = artifact_root / 'plans' / 'topology'
+      with mock.patch(
+          'scripts.compile_topology_diagnostics.'
+          '_validate_repository_checkout'), \
+          mock.patch(
+            'scripts.compile_topology_diagnostics.'
+            '_validate_canonical_source_plan'):
+        plan, jobs, _ = compile_topology_plan(
+          source_plan_dir=source_dir, output_dir=output_dir)
+        validate_compiled_topology_plan_lineage(
+          plan,
+          jobs=jobs,
+          plan_dir=output_dir,
+          protocol_path=protocol_path,
+          protocol=protocol,
+          protocol_sha256=protocol_sha)
+
+        topology_job_id = next(
+          job_id for job_id, job in jobs.items()
+          if job['identity'].get('diagnostic') == 'topology'
+          and job['identity']['train_seed'] == 1)
+        mutations = {}
+
+        argv_jobs = copy.deepcopy(jobs)
+        argv_jobs[topology_job_id]['argv'][1] = 'scripts/forged_emitter.py'
+        mutations['argv'] = argv_jobs
+
+        dependency_jobs = copy.deepcopy(jobs)
+        dependency_jobs[topology_job_id]['dependencies'] = [
+          'export--dynamic_dynamic--s002--k128']
+        mutations['dependency'] = dependency_jobs
+
+        numeric_jobs = copy.deepcopy(jobs)
+        numeric_jobs[topology_job_id]['identity']['num_records'] = float(
+          numeric_jobs[topology_job_id]['identity']['num_records'])
+        mutations['numeric_type'] = numeric_jobs
+
+        boolean_jobs = copy.deepcopy(jobs)
+        boolean_jobs[topology_job_id]['required_outputs'][0][
+          'exactly_one'] = 1
+        mutations['boolean_type'] = boolean_jobs
+
+        for label, tampered_jobs in mutations.items():
+          with self.subTest(label=label):
+            tampered_plan = copy.deepcopy(plan)
+            tampered_plan['job_spec_sha256'][topology_job_id] = _job_digest(
+              tampered_jobs[topology_job_id])
+            with self.assertRaisesRegex(
+                ValueError, 'canonical compiler reconstruction'):
+              validate_compiled_topology_plan_lineage(
+                tampered_plan,
+                jobs=tampered_jobs,
+                plan_dir=output_dir,
+                protocol_path=protocol_path,
+                protocol=protocol,
+                protocol_sha256=protocol_sha)
+
+        numeric_plan = copy.deepcopy(plan)
+        numeric_plan['num_jobs'] = float(numeric_plan['num_jobs'])
+        with self.assertRaisesRegex(
+            ValueError, 'canonical compiler reconstruction'):
+          validate_compiled_topology_plan_lineage(
+            numeric_plan,
+            jobs=jobs,
+            plan_dir=output_dir,
+            protocol_path=protocol_path,
+            protocol=protocol,
+            protocol_sha256=protocol_sha)
+
+  def test_parent_and_derived_coordinated_argv_tampering_is_rejected(self):
+    protocol_path = (
+      Path(__file__).resolve().parents[1] / 'configs' / 'evaluation'
+      / 'contextual-forest-topology-diagnostics-v1.json')
+    protocol = json.loads(protocol_path.read_text())
+    protocol_sha = canonical_sha256(protocol)
+    mutations = {
+      'train': 'train--dynamic_dynamic--s001--k128',
+      'export': 'export--dynamic_dynamic--s001--k128',
+    }
+    for label, tampered_job_id in mutations.items():
+      with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        source_dir, source_plan, source_jobs, artifact_root = \
+          _k128_source_plan_fixture(root)
+        output_dir = artifact_root / 'plans' / 'topology'
+        promotion_path = Path(
+          source_plan['promotion_evidence'][
+            'candidate_k_128_confirmation']['path'])
+
+        tampered_source_plan = copy.deepcopy(source_plan)
+        tampered_source_jobs = copy.deepcopy(source_jobs)
+        tampered_source_jobs[tampered_job_id]['argv'].append(
+          '--coordinated-forged-argument')
+        tampered_source_plan['job_spec_sha256'][tampered_job_id] = \
+          _job_digest(tampered_source_jobs[tampered_job_id])
+        (source_dir / 'jobs' / f'{tampered_job_id}.json').write_text(
+          json.dumps(
+            tampered_source_jobs[tampered_job_id], indent=2,
+            sort_keys=True) + '\n')
+        (source_dir / 'compiled-plan.json').write_text(
+          json.dumps(tampered_source_plan, indent=2, sort_keys=True) + '\n')
+
+        reconstructed_parent = (
+          copy.deepcopy(source_plan), copy.deepcopy(source_jobs),
+          artifact_root.resolve())
+        with mock.patch(
+            'scripts.compile_topology_diagnostics.'
+            '_validate_repository_checkout'), \
+            mock.patch(
+              'scripts.compile_topology_diagnostics.derive_matrix_plan',
+              return_value=reconstructed_parent) as reconstruct_parent:
+          # Model a coordinated attacker: re-run the derived compiler after
+          # changing the parent, so the source hash, derived plan ID, copied
+          # job, and every derived job commitment are internally consistent.
+          with mock.patch(
+              'scripts.compile_topology_diagnostics.'
+              '_validate_canonical_source_plan'):
+            tampered_plan, tampered_jobs, observed_output = \
+              derive_topology_plan(
+                source_plan_dir=source_dir,
+                output_dir=output_dir,
+                protocol_path=protocol_path)
+
+          self.assertEqual(observed_output, output_dir.resolve())
+          self.assertFalse(output_dir.exists())
+          self.assertEqual(
+            tampered_plan['source_compiled_plan']['sha256'],
+            _sha_file(source_dir / 'compiled-plan.json'))
+          self.assertEqual(
+            tampered_jobs[tampered_job_id]['argv'],
+            tampered_source_jobs[tampered_job_id]['argv'])
+          with self.assertRaisesRegex(
+              ValueError, 'K=128 topology parent job.*canonical compiler'):
+            validate_compiled_topology_plan_lineage(
+              tampered_plan,
+              jobs=tampered_jobs,
+              plan_dir=output_dir,
+              protocol_path=protocol_path,
+              protocol=protocol,
+              protocol_sha256=protocol_sha)
+          self.assertFalse(output_dir.exists())
+
+        reconstruct_parent.assert_called_once()
+        call = reconstruct_parent.call_args
+        self.assertEqual(call.args, (DEFAULT_MANIFEST,))
+        self.assertEqual(
+          call.kwargs['selected_suites'],
+          ['candidate_k_128_confirmation'])
+        self.assertEqual(
+          call.kwargs['artifact_root_override'], artifact_root.resolve())
+        self.assertEqual(
+          call.kwargs['promotion_evidence'], {
+            'candidate_k_128_confirmation': promotion_path.resolve()})
+
   def test_trusted_plan_authenticates_outputs_and_post_run_marker(self):
     protocol = _protocol()
     protocol['source_selection']['datasets']['wiki-pinned'].update({
@@ -1308,7 +1484,12 @@ class TopologyDiagnosticsTest(unittest.TestCase):
             'evaluation.topology_diagnostics._validate_trusted_protocol_path'), \
           mock.patch(
             'evaluation.topology_diagnostics._validate_adapter_export',
-            return_value={}):
+            return_value={}), \
+          mock.patch(
+            'scripts.compile_topology_diagnostics.derive_topology_plan',
+            return_value=(
+              json.loads(fixture['plan_path'].read_text()),
+              fixture['jobs'], fixture['plan_dir'].resolve())):
         analysis = aggregate_plan(
           plan_dir=fixture['plan_dir'],
           protocol_path=fixture['protocol_path'])
@@ -1330,7 +1511,12 @@ class TopologyDiagnosticsTest(unittest.TestCase):
             'evaluation.topology_diagnostics._validate_trusted_protocol_path'), \
           mock.patch(
             'evaluation.topology_diagnostics._validate_adapter_export',
-            return_value={}):
+            return_value={}), \
+          mock.patch(
+            'scripts.compile_topology_diagnostics.derive_topology_plan',
+            return_value=(
+              json.loads(fixture['plan_path'].read_text()),
+              fixture['jobs'], fixture['plan_dir'].resolve())):
         with self.assertRaisesRegex(ValueError, 'outputs drifted'):
           aggregate_plan(
             plan_dir=fixture['plan_dir'],
@@ -1400,7 +1586,10 @@ class TopologyDiagnosticsTest(unittest.TestCase):
             'evaluation.topology_diagnostics._validate_trusted_protocol_path'), \
           mock.patch(
             'evaluation.topology_diagnostics._validate_adapter_export',
-            return_value={}):
+            return_value={}), \
+          mock.patch(
+            'scripts.compile_topology_diagnostics.derive_topology_plan',
+            return_value=(plan, fixture['jobs'], fixture['plan_dir'].resolve())):
         with self.assertRaisesRegex(ValueError, 'compiled job'):
           aggregate_plan(
             plan_dir=fixture['plan_dir'],
