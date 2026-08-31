@@ -4,6 +4,7 @@ from evaluation.hierarchical_causal_statistics import (
   ContrastTerm,
   aggregate_candidate_support,
   aggregate_causal_contrast,
+  aggregate_topology_permutation_diagnostic,
 )
 
 
@@ -42,6 +43,8 @@ class HierarchicalCausalStatisticsTest(unittest.TestCase):
               'factorized_backbone_nll_sum': 5.0 * masked_tokens,
               'parameter_matched_no_edge_nll_sum': 5.0 * masked_tokens,
               'matched_permuted_topology_nll_sum': 3.7 * masked_tokens,
+              'selected_edges': 10,
+              'permuted_changed_edges': 9,
               'candidate_support': [
                 {'candidate_k': 32, 'candidate_hits': 5,
                  'retained_mass_sum': 6.0},
@@ -92,6 +95,25 @@ class HierarchicalCausalStatisticsTest(unittest.TestCase):
     self.assertAlmostEqual(
       result['by_candidate_k']['64']['candidate_recall']['pooled']['estimate'],
       0.7)
+
+  def test_topology_permutation_diagnostic_is_gated(self):
+    result = aggregate_topology_permutation_diagnostic(
+      self._records(), arm='dynamic_dynamic',
+      minimum_pooled_changed_edge_fraction=0.85,
+      minimum_condition_changed_edge_fraction=0.85)
+    self.assertAlmostEqual(
+      result['pooled']['changed_edge_fraction'], 0.9)
+    self.assertTrue(result['gate']['passed'])
+
+  def test_topology_permutation_diagnostic_rejects_noop(self):
+    records = self._records()
+    for row in records:
+      row['permuted_changed_edges'] = 0
+    result = aggregate_topology_permutation_diagnostic(
+      records, arm='dynamic_dynamic',
+      minimum_pooled_changed_edge_fraction=0.85,
+      minimum_condition_changed_edge_fraction=0.85)
+    self.assertFalse(result['gate']['passed'])
 
 
 if __name__ == '__main__':

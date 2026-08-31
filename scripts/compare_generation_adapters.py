@@ -66,7 +66,7 @@ def main(argv=None) -> int:
     'output': str(output),
     'dataset_id': result['dataset_id'],
     'candidate_top_k': result['identity']['candidate_top_k'],
-    'num_nfe_budgets': len(result['comparisons']),
+    'num_nfe_budgets': len(result['identity']['nfe_budgets']),
   }, indent=2, sort_keys=True))
   return 0
 

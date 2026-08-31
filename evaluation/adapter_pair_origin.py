@@ -555,7 +555,11 @@ def _source_snapshot(
   train_seed = _positive_int(train_seed, context='train_seed')
   if not isinstance(suite, str) or not suite:
     raise ValueError('suite must be a non-empty string')
-  plan, jobs, plan_sha256, legacy = _load_plan_for_analysis(plan_dir)
+  # This is a provenance replay, not execution of the historical plan.  The
+  # plan's clean source SHA remains committed below, while the generation
+  # runner separately commits and checks its current clean builder SHA.
+  plan, jobs, plan_sha256, legacy = _load_plan_for_analysis(
+    plan_dir, require_current_repository_match=False)
   selected_suites = plan.get('selected_suites')
   if not isinstance(selected_suites, list) or suite not in selected_suites:
     raise ValueError(f'compiled plan does not select suite {suite!r}')

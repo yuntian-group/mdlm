@@ -422,13 +422,17 @@ def load_and_validate_manifest(
       if promotion_from == suite_name:
         raise ValueError(f'suite {suite_name} cannot promote itself')
 
-  analysis = _exact_keys(manifest['analysis'], {
+  analysis_fields = {
     'document_record_schema_version', 'primary_comparison',
     'bootstrap_unit_order', 'average_corruptions_within_document',
     'equal_weight_datasets', 'equal_weight_mask_rates',
     'bootstrap_resamples', 'bootstrap_seed', 'confidence_level',
     'reject_incomplete_factorial_cells',
-  }, context='analysis')
+  }
+  if manifest['analysis'].get('document_record_schema_version') == 2:
+    analysis_fields.add('permutation_control_gate')
+  analysis = _exact_keys(
+    manifest['analysis'], analysis_fields, context='analysis')
   if analysis['document_record_schema_version'] not in {1, 2}:
     raise ValueError('document_record_schema_version must equal 1 or 2')
   if analysis['primary_comparison'] not in comparisons:
@@ -447,6 +451,17 @@ def load_and_validate_manifest(
   if (not isinstance(confidence, (int, float)) or isinstance(confidence, bool)
       or not 0.0 < float(confidence) < 1.0):
     raise ValueError('analysis.confidence_level must be in (0,1)')
+  if analysis['document_record_schema_version'] == 2:
+    permutation_gate = _exact_keys(analysis['permutation_control_gate'], {
+      'minimum_pooled_changed_edge_fraction',
+      'minimum_condition_changed_edge_fraction',
+    }, context='analysis.permutation_control_gate')
+    for field, value in permutation_gate.items():
+      if (not isinstance(value, (int, float)) or isinstance(value, bool)
+          or not math.isfinite(float(value))
+          or not 0.0 <= float(value) <= 1.0):
+        raise ValueError(
+          f'analysis.permutation_control_gate.{field} must be in [0,1]')
 
   return dict(manifest, protocol_id=protocol_id)
 

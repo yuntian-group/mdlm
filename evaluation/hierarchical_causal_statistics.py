@@ -410,3 +410,99 @@ def aggregate_candidate_support(
     'support_candidate_ks': list(support_ks),
     'by_candidate_k': by_k,
   }
+
+
+def aggregate_topology_permutation_diagnostic(
+    records: Iterable[Mapping[str, Any]],
+    *,
+    arm: str,
+    minimum_pooled_changed_edge_fraction: float,
+    minimum_condition_changed_edge_fraction: float,
+) -> dict[str, Any]:
+  """Gate that the matched topology permutation actually changes edges.
+
+  Fractions are edge-weighted because the scientific question is how many
+  selected pair factors were reassigned.  Results are reported both pooled
+  and for every frozen dataset/mask-rate stratum; an empty forest fails closed.
+  """
+  for name, value in (
+      ('minimum_pooled_changed_edge_fraction',
+       minimum_pooled_changed_edge_fraction),
+      ('minimum_condition_changed_edge_fraction',
+       minimum_condition_changed_edge_fraction)):
+    if (not isinstance(value, (int, float)) or isinstance(value, bool)
+        or not math.isfinite(float(value)) or not 0.0 <= float(value) <= 1.0):
+      raise ValueError(f'{name} must be finite and lie in [0,1]')
+  records = _deduplicated_v2_records(records)
+  selected = [row for row in records if row['arm'] == arm]
+  if not selected:
+    raise ValueError(f'causal records have no arm {arm!r}')
+
+  totals: dict[tuple[str, str, float, int], list[int]] = {}
+  for row in selected:
+    selected_edges = row.get('selected_edges')
+    changed_edges = row.get('permuted_changed_edges')
+    if (not isinstance(selected_edges, int) or isinstance(selected_edges, bool)
+        or not isinstance(changed_edges, int) or isinstance(changed_edges, bool)
+        or selected_edges < 0 or changed_edges < 0
+        or changed_edges > selected_edges):
+      raise ValueError('invalid selected/permuted changed-edge counts')
+    key = (
+      row['dataset'], row['dataset_revision'], float(row['mask_rate']),
+      row['candidate_k'])
+    cell = totals.setdefault(key, [0, 0, 0])
+    cell[0] += selected_edges
+    cell[1] += changed_edges
+    cell[2] += 1
+
+  conditions = {}
+  pooled_selected = 0
+  pooled_changed = 0
+  condition_passes = []
+  for (dataset, revision, mask_rate, adapter_k), (
+      selected_edges, changed_edges, num_records) in sorted(totals.items()):
+    if selected_edges <= 0:
+      raise ValueError(
+        'topology permutation diagnostic encountered a condition with no '
+        'selected edges')
+    fraction = changed_edges / selected_edges
+    passed = fraction >= minimum_condition_changed_edge_fraction
+    condition_passes.append(passed)
+    key = f'{dataset}|mask={mask_rate:.6f}|adapter_k={adapter_k}'
+    conditions[key] = {
+      'dataset': dataset,
+      'dataset_revision': revision,
+      'mask_rate': mask_rate,
+      'adapter_candidate_k': adapter_k,
+      'num_records': num_records,
+      'selected_edges': selected_edges,
+      'changed_edges': changed_edges,
+      'changed_edge_fraction': fraction,
+      'minimum_changed_edge_fraction': (
+        minimum_condition_changed_edge_fraction),
+      'passed': passed,
+    }
+    pooled_selected += selected_edges
+    pooled_changed += changed_edges
+  if pooled_selected <= 0:
+    raise ValueError('topology permutation diagnostic has no selected edges')
+  pooled_fraction = pooled_changed / pooled_selected
+  pooled_passed = pooled_fraction >= minimum_pooled_changed_edge_fraction
+  return {
+    'arm': arm,
+    'estimand': 'edge_weighted_fraction_of_selected_edges_reassigned',
+    'pooled': {
+      'selected_edges': pooled_selected,
+      'changed_edges': pooled_changed,
+      'changed_edge_fraction': pooled_fraction,
+      'minimum_changed_edge_fraction': (
+        minimum_pooled_changed_edge_fraction),
+      'passed': pooled_passed,
+    },
+    'conditions': conditions,
+    'gate': {
+      'pooled_fraction_passed': pooled_passed,
+      'every_condition_fraction_passed': all(condition_passes),
+      'passed': pooled_passed and all(condition_passes),
+    },
+  }

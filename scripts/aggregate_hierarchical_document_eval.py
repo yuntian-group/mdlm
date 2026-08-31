@@ -492,6 +492,7 @@ def _load_plan_for_analysis(
     *,
     expected_legacy_plan_sha256: str = PINNED_LEGACY_PLAN_SHA256,
     expected_legacy_repository_sha: str = PINNED_LEGACY_REPOSITORY_SHA,
+    require_current_repository_match: bool = True,
 ) -> tuple[dict[str, Any], dict[str, dict[str, Any]], str, bool]:
   """Load a current plan or the one explicitly grandfathered legacy plan.
 
@@ -499,15 +500,21 @@ def _load_plan_for_analysis(
   markers. They are therefore accepted only when a trusted caller supplies the
   exact compiled-plan file and clean source-repository commitments. The normal
   command-line path uses the constants frozen above; the promotion evaluator
-  supplies the same values from its trusted policy.
+  supplies the same values from its trusted policy. Provenance-only callers
+  may replay an immutable completed plan from a newer clean checkout by
+  setting ``require_current_repository_match=False``; this skips only the
+  executable-checkout equality test, not plan, job, marker, or output checks.
   """
+  if type(require_current_repository_match) is not bool:
+    raise TypeError('require_current_repository_match must be boolean')
   plan_dir = plan_dir.expanduser().resolve()
   plan_path = plan_dir / 'compiled-plan.json'
   plan_sha256 = sha256_file(plan_path)
   raw_plan = _read_json(plan_path)
   if raw_plan.get('schema_version') != 1:
     plan, jobs = _load_plan(plan_dir)
-    _validate_repository_checkout(plan)
+    if require_current_repository_match:
+      _validate_repository_checkout(plan)
     return plan, jobs, plan_sha256, False
 
   _lower_hex(

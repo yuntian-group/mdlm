@@ -20,6 +20,7 @@ from evaluation.hierarchical_causal_statistics import (  # noqa: E402
   ContrastTerm,
   aggregate_candidate_support,
   aggregate_causal_contrast,
+  aggregate_topology_permutation_diagnostic,
 )
 from scripts.aggregate_hierarchical_document_eval import (  # noqa: E402
   load_plan_records,
@@ -130,9 +131,13 @@ def build_analysis(
     contexts[comparison_name] = context
   records = _deduplicate_records(records)
   analysis_cfg = next(iter(contexts.values()))['manifest']['analysis']
-  num_resamples = num_resamples or analysis_cfg['bootstrap_resamples']
-  rng_seed = rng_seed or analysis_cfg['bootstrap_seed']
-  confidence_level = confidence_level or analysis_cfg['confidence_level']
+  num_resamples = (
+    analysis_cfg['bootstrap_resamples']
+    if num_resamples is None else num_resamples)
+  rng_seed = analysis_cfg['bootstrap_seed'] if rng_seed is None else rng_seed
+  confidence_level = (
+    analysis_cfg['confidence_level']
+    if confidence_level is None else confidence_level)
 
   contrast_results = {}
   for index, (name, terms) in enumerate(_contrasts()):
@@ -151,6 +156,14 @@ def build_analysis(
     num_resamples=num_resamples,
     rng_seed=rng_seed + 10_000,
     confidence_level=confidence_level)
+  permutation_gate = analysis_cfg['permutation_control_gate']
+  topology_permutation = aggregate_topology_permutation_diagnostic(
+    records,
+    arm='dynamic_dynamic',
+    minimum_pooled_changed_edge_fraction=(
+      permutation_gate['minimum_pooled_changed_edge_fraction']),
+    minimum_condition_changed_edge_fraction=(
+      permutation_gate['minimum_condition_changed_edge_fraction']))
 
   source_views = {}
   for comparison_name, context in contexts.items():
@@ -174,6 +187,7 @@ def build_analysis(
     'source_views': source_views,
     'contrasts': contrast_results,
     'candidate_support': support,
+    'topology_permutation_diagnostic': topology_permutation,
   }
   payload['analysis_sha256'] = canonical_sha256(payload)
   return payload

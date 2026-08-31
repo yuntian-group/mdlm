@@ -406,7 +406,8 @@ class AdapterPairOriginTest(unittest.TestCase):
           candidate_k=64,
           train_seed=1,
         )
-      loader.assert_called_once_with(fixture.plan_dir.resolve())
+      loader.assert_called_once_with(
+        fixture.plan_dir.resolve(), require_current_repository_match=False)
       self.assertTrue(payload['source']['legacy_plan_schema'])
 
   def test_validates_exact_legacy_adapter_manifest_schema(self):

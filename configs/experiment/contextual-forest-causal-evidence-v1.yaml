@@ -131,3 +131,6 @@ analysis:
   bootstrap_seed: 2701
   confidence_level: 0.95
   reject_incomplete_factorial_cells: true
+  permutation_control_gate:
+    minimum_pooled_changed_edge_fraction: 0.95
+    minimum_condition_changed_edge_fraction: 0.90
