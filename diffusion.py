@@ -535,9 +535,16 @@ class Diffusion(L.LightningModule):
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
       raise ValueError(
         'structured adapter manifest is not valid JSON') from error
+    if (not isinstance(manifest_payload, dict)
+        or manifest_payload.get('schema_version') != 4):
+      raise ValueError(
+        'Diffusion adapter loading supports schema-v4 adapters only; use '
+        'verify_contextual_forest_adapter for schema-v5 artifacts with '
+        'authenticated expectations and actual-backbone attestation')
     from scripts.export_structured_adapter import (
       safetensors_metadata_from_bytes,
       structured_decoder_identity_from_config,
+      validate_tensor_state_against_module,
       validate_adapter_manifest_payload,
     )
     runtime_identity, runtime_identity_sha256 = (
@@ -564,6 +571,8 @@ class Diffusion(L.LightningModule):
       raise ValueError(
         'structured adapter must use prefix-stripped head keys; '
         f'found {prefixed[:5]}')
+    validate_tensor_state_against_module(
+      state, self.structured_head, context='structured adapter')
     try:
       self.structured_head.load_state_dict(state, strict=True)
     except RuntimeError as error:
