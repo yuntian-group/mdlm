@@ -46,8 +46,8 @@ class WikitextRevealControlQueueTest(unittest.TestCase):
     tasks = build_tasks(self.paths)
     for index, task in enumerate(tasks):
       self.assertEqual(task.shard_index, index)
-      self.assertIn('reveal-policy-control-v1', str(task.output_dir))
-      self.assertIn('reveal-policy-control-v1', str(task.log_path))
+      self.assertIn('reveal-policy-control-v2', str(task.output_dir))
+      self.assertIn('reveal-policy-control-v2', str(task.log_path))
       self.assertNotIn('dynamic_dynamic/shard-', str(task.output_dir))
 
   def test_launch_plan_is_deterministic_and_path_bound(self):

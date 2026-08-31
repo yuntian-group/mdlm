@@ -32,7 +32,7 @@ from evaluation.generation_shard_aggregation import (  # noqa: E402
 )
 
 
-RUNNER_GIT_SHA = 'cd138c75a9265d6cbbf876338878376df593ad06'
+RUNNER_GIT_SHA = '8b309fccbddfa0661f89ecd59275d5b3719e9d44'
 RUNNER_SCRIPT_SHA256 = (
   'd65b5a26615377454a43aa76e78db4a329d0368c2ffeaadd173dac25ec48b910')
 BACKBONE_SHA256 = (
@@ -52,6 +52,7 @@ NUM_SAMPLES = 788
 NUM_SHARDS = 16
 BATCH_SIZE = 8
 BASE_SEED = 91001
+OUTPUT_NAMESPACE = 'reveal-policy-control-v2'
 
 
 @dataclass(frozen=True)
@@ -110,7 +111,7 @@ def expected_shard_samples(shard_index: int) -> int:
 
 def build_tasks(paths: Paths) -> list[Task]:
   root = paths.experiment_root
-  output_root = root / 'wikitext' / 'reveal-policy-control-v1'
+  output_root = root / 'wikitext' / OUTPUT_NAMESPACE
   adapter_root = (
     paths.expansion_root / 'runs'
     / 'export--dynamic_dynamic--s001--k128'
@@ -175,7 +176,7 @@ def _canonical_sha256(payload: Any) -> str:
 
 def launch_plan_sha256(tasks: Sequence[Task]) -> str:
   return _canonical_sha256({
-    'policy': 'wikitext-reveal-policy-control-v1',
+    'policy': 'wikitext-reveal-policy-control-v2',
     'runner_git_sha': RUNNER_GIT_SHA,
     'tasks': [{
       'shard_index': task.shard_index,
@@ -308,7 +309,7 @@ def main(argv=None) -> int:
     return 0
   _verify_runner(paths)
   output_root = (
-    paths.experiment_root / 'wikitext' / 'reveal-policy-control-v1')
+    paths.experiment_root / 'wikitext' / OUTPUT_NAMESPACE)
   completion = output_root / 'queue-complete.json'
   if completion.exists():
     raise FileExistsError(f'queue already completed: {completion}')
