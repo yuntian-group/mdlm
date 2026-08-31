@@ -26,6 +26,10 @@ from evaluation.infilling_prompts import (  # noqa: E402
   build_infilling_prompts,
   serialize_prompt_jsonl,
 )
+from evaluation.prompt_provenance import (  # noqa: E402
+  PROMPT_ARTIFACT,
+  PROMPT_MANIFEST_SCHEMA_VERSION,
+)
 
 
 def _sha256_file(path: Path) -> str:
@@ -44,6 +48,29 @@ def _atomic_write(path: Path, payload: bytes) -> None:
   finally:
     if temporary.exists():
       temporary.unlink()
+
+
+def _clean_git_provenance() -> dict[str, object]:
+  """Require a reproducible builder checkout before reading any dataset."""
+  try:
+    git_sha = subprocess.check_output(
+      ['git', 'rev-parse', 'HEAD'], cwd=REPO_ROOT, text=True,
+      stderr=subprocess.DEVNULL).strip()
+    status = subprocess.check_output(
+      ['git', 'status', '--porcelain=v1'], cwd=REPO_ROOT, text=True,
+      stderr=subprocess.DEVNULL)
+  except (OSError, subprocess.CalledProcessError) as error:
+    raise RuntimeError(
+      'prompt construction requires a Git checkout with a resolvable HEAD') \
+      from error
+  if (len(git_sha) != 40
+      or any(character not in '0123456789abcdef' for character in git_sha)):
+    raise RuntimeError('prompt builder Git SHA is not a full lowercase SHA-1')
+  if status:
+    raise RuntimeError(
+      'prompt construction requires a clean Git checkout so the builder '
+      'identity is reproducible')
+  return {'git_sha': git_sha, 'clean': True}
 
 
 def _parse_args(argv=None) -> argparse.Namespace:
@@ -179,6 +206,8 @@ def main(argv=None) -> int:
   if args.num_proc <= 0:
     raise ValueError('--num-proc must be positive')
 
+  repository = _clean_git_provenance()
+
   output = args.output.expanduser().resolve()
   manifest_path = (
     args.manifest.expanduser().resolve()
@@ -223,17 +252,12 @@ def main(argv=None) -> int:
   _atomic_write(output, payload)
   data_config_path = (
     REPO_ROOT / 'configs' / 'data' / f'{args.data_config}.yaml')
-  try:
-    git_sha = subprocess.check_output(
-      ['git', 'rev-parse', 'HEAD'], cwd=REPO_ROOT, text=True).strip()
-  except (OSError, subprocess.CalledProcessError):
-    git_sha = None
   manifest = {
-    'schema_version': 1,
-    'artifact': 'pinned_document_local_infilling_prompts',
+    'schema_version': PROMPT_MANIFEST_SCHEMA_VERSION,
+    'artifact': PROMPT_ARTIFACT,
     'created_utc': dt.datetime.now(dt.timezone.utc).isoformat(),
     'command': sys.argv if argv is None else [sys.argv[0], *argv],
-    'git_sha': git_sha,
+    'repository': repository,
     'data_config': {
       'name': args.data_config,
       'path': str(data_config_path.resolve()),

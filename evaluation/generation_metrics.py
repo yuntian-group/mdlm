@@ -11,7 +11,9 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import dataclass
+import importlib.metadata
 import math
+import platform
 from typing import Iterable, Sequence
 
 import torch
@@ -21,6 +23,15 @@ import torch.nn.functional as F
 TokenSequence = Sequence[int]
 REFERENCE_LM_SEQUENCE_POLICY = (
   'retokenize_decoded_text_score_through_first_nonleading_eos_v1')
+REFERENCE_LM_PRECISION_POLICY = (
+  'explicit_checkpoint_dtype_no_autocast_float32_cross_entropy_v1')
+REFERENCE_LM_TOKENIZATION_POLICY = (
+  'fast_tokenizer_right_padding_right_truncation_add_special_tokens_v1')
+REFERENCE_LM_DTYPES = {
+  'float32': torch.float32,
+  'float16': torch.float16,
+  'bfloat16': torch.bfloat16,
+}
 
 
 def validate_reference_lm_spec(
@@ -231,9 +242,13 @@ class TransformersReferenceLMScorer:
       device: str = 'cuda',
       batch_size: int = 8,
       max_length: int | None = None,
+      dtype: str = 'float32',
   ) -> None:
     if batch_size <= 0:
       raise ValueError('batch_size must be positive')
+    if dtype not in REFERENCE_LM_DTYPES:
+      raise ValueError(
+        f'dtype must be one of {sorted(REFERENCE_LM_DTYPES)}, found {dtype!r}')
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     validated_model, validated_revision = validate_reference_lm_spec(
@@ -243,12 +258,22 @@ class TransformersReferenceLMScorer:
     self.revision = validated_revision
     self.device = torch.device(device)
     self.batch_size = int(batch_size)
+    self.dtype_name = dtype
+    self.torch_dtype = REFERENCE_LM_DTYPES[dtype]
     self.tokenizer = AutoTokenizer.from_pretrained(
-      self.model_name_or_path, revision=self.revision)
+      self.model_name_or_path,
+      revision=self.revision,
+      use_fast=True,
+      trust_remote_code=False)
     if self.tokenizer.pad_token_id is None:
       self.tokenizer.pad_token = self.tokenizer.eos_token
+    self.tokenizer.padding_side = 'right'
+    self.tokenizer.truncation_side = 'right'
     self.model = AutoModelForCausalLM.from_pretrained(
-      self.model_name_or_path, revision=self.revision).to(self.device).eval()
+      self.model_name_or_path,
+      revision=self.revision,
+      torch_dtype=self.torch_dtype,
+      trust_remote_code=False).to(self.device).eval()
     configured_limit = getattr(self.model.config, 'max_position_embeddings', None)
     self.max_length = int(
       max_length if max_length is not None
@@ -256,6 +281,60 @@ class TransformersReferenceLMScorer:
       else 1024)
     if self.max_length < 2:
       raise ValueError('reference-LM max_length must be at least two')
+    if (configured_limit is not None
+        and self.max_length > int(configured_limit)):
+      raise ValueError(
+        'reference-LM max_length exceeds the pinned model context length')
+    parameter_dtypes = sorted({
+      str(parameter.dtype) for parameter in self.model.parameters()
+    })
+    expected_dtype = str(self.torch_dtype)
+    if parameter_dtypes != [expected_dtype]:
+      raise RuntimeError(
+        'reference-LM parameter dtypes differ from the requested dtype: '
+        f'{parameter_dtypes!r} versus {[expected_dtype]!r}')
+    self.parameter_dtypes = parameter_dtypes
+
+  def runtime_identity(self) -> dict[str, object]:
+    """Return every model-, tokenizer-, and scoring-relevant runtime field."""
+    tokenizer_vocab_size = len(self.tokenizer)
+    if tokenizer_vocab_size <= 0:
+      raise RuntimeError('reference-LM tokenizer has an empty vocabulary')
+    return {
+      'schema_version': 1,
+      'model_name_or_path': self.model_name_or_path,
+      'model_revision': self.revision,
+      'model_class': (
+        f'{type(self.model).__module__}.{type(self.model).__qualname__}'),
+      'model_config_class': (
+        f'{type(self.model.config).__module__}.'
+        f'{type(self.model.config).__qualname__}'),
+      'tokenizer_name_or_path': self.model_name_or_path,
+      'tokenizer_revision': self.revision,
+      'tokenizer_class': (
+        f'{type(self.tokenizer).__module__}.'
+        f'{type(self.tokenizer).__qualname__}'),
+      'tokenizer_vocab_size': tokenizer_vocab_size,
+      'tokenizer_bos_token_id': self.tokenizer.bos_token_id,
+      'tokenizer_eos_token_id': self.tokenizer.eos_token_id,
+      'tokenizer_pad_token_id': self.tokenizer.pad_token_id,
+      'tokenizer_padding_side': self.tokenizer.padding_side,
+      'tokenizer_truncation_side': self.tokenizer.truncation_side,
+      'tokenization_policy': REFERENCE_LM_TOKENIZATION_POLICY,
+      'sequence_policy': REFERENCE_LM_SEQUENCE_POLICY,
+      'add_special_tokens': True,
+      'batch_size': self.batch_size,
+      'max_length': self.max_length,
+      'requested_dtype': self.dtype_name,
+      'parameter_dtypes': list(self.parameter_dtypes),
+      'precision_policy': REFERENCE_LM_PRECISION_POLICY,
+      'device': str(self.device),
+      'python': platform.python_version(),
+      'torch': torch.__version__,
+      'cuda_runtime': torch.version.cuda,
+      'transformers': importlib.metadata.version('transformers'),
+      'tokenizers': importlib.metadata.version('tokenizers'),
+    }
 
   @torch.no_grad()
   def score(self, texts: Sequence[str]) -> list[ReferenceLMScore]:

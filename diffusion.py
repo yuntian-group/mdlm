@@ -19,6 +19,7 @@ from torch import Tensor
 import crf_utils
 import dataloader
 from evaluation import conditional_denoising_records
+from evaluation import causal_denoising
 import models
 import noise_schedule
 import structured_objective
@@ -224,6 +225,11 @@ class Diffusion(L.LightningModule):
     self.conditional_records_enabled = bool(
       record_cfg.get('enabled', False))
     self.conditional_record_config = record_cfg
+    self.conditional_record_schema_version = int(
+      record_cfg.get('schema_version', 1))
+    self.conditional_record_support_candidate_ks = tuple(
+      int(value) for value in record_cfg.get(
+        'support_candidate_ks', []))
     self._conditional_record_writer = None
     self._initialize_structured_decoder()
 
@@ -691,6 +697,20 @@ class Diffusion(L.LightningModule):
           raise ValueError(
             'eval.conditional_records.train_seed must be a '
             'non-negative integer')
+        if self.conditional_record_schema_version not in {1, 2}:
+          raise ValueError(
+            'eval.conditional_records.schema_version must be 1 or 2')
+        support_ks = self.conditional_record_support_candidate_ks
+        if self.conditional_record_schema_version == 2:
+          if (not support_ks or tuple(sorted(set(support_ks))) != support_ks
+              or support_ks[-1] > self.vocab_size
+              or support_ks[0] < 1):
+            raise ValueError(
+              'schema-v2 support_candidate_ks must be increasing, unique, '
+              'non-empty, and within the vocabulary')
+        elif support_ks:
+          raise ValueError(
+            'support_candidate_ks require conditional record schema v2')
 
   def on_load_checkpoint(self, checkpoint):
     if self.ema:
@@ -1042,7 +1062,10 @@ class Diffusion(L.LightningModule):
           ConditionalDenoisingRecordWriter(
             output_dir=str(self.config.checkpointing.save_dir),
             rank=int(self.global_rank),
-            metadata=self._conditional_record_metadata()))
+            metadata=self._conditional_record_metadata(),
+            schema_version=self.conditional_record_schema_version,
+            support_candidate_ks=(
+              self.conditional_record_support_candidate_ks)))
       else:
         self._conditional_record_writer = None
     assert self.valid_metrics.nll.mean_value == 0
@@ -1089,7 +1112,8 @@ class Diffusion(L.LightningModule):
             output_dir=str(self.config.checkpointing.save_dir),
             metadata=self._conditional_record_metadata(),
             rank_summaries=rank_summaries,
-            pairing_digest=payload)
+            pairing_digest=payload,
+            schema_version=self.conditional_record_schema_version)
         self._conditional_record_writer = None
       if self.trainer.is_global_zero:
         structured_pairing.write_pairing_digest(
@@ -1811,7 +1835,7 @@ class Diffusion(L.LightningModule):
 
   def _structured_head_output(
       self, tokens, conditioning, active_mask,
-      force_no_grad_backbone=False):
+      force_no_grad_backbone=False, return_hidden_states=False):
     hidden_states, unary_logits = self._structured_backbone_output(
       tokens=tokens,
       conditioning=conditioning,
@@ -1833,6 +1857,8 @@ class Diffusion(L.LightningModule):
       active_mask=active_mask,
       fixed_edge_index=self.structured_fixed_edge_index,
       fixed_edge_mask=fixed_edge_mask)
+    if return_hidden_states:
+      return output, unary_logits, hidden_states
     return output, unary_logits
 
   def _forward_pass_structured(
@@ -1901,10 +1927,11 @@ class Diffusion(L.LightningModule):
         corrupted_input_ids=xt,
         active_mask=active_mask)
 
-    output, unary_logits = self._structured_head_output(
+    output, unary_logits, hidden_states = self._structured_head_output(
       tokens=xt,
       conditioning=conditioning,
-      active_mask=active_mask)
+      active_mask=active_mask,
+      return_hidden_states=True)
     denoising = structured_training.structured_denoising_loss(
       output=output,
       unary_logits=unary_logits,
@@ -1920,6 +1947,26 @@ class Diffusion(L.LightningModule):
       'retained_mass_sum': output.retained_mass.masked_fill(
         ~active_mask, 0.0).sum(dim=-1).detach(),
     }
+    if (record_pairing and self.conditional_records_enabled
+        and self.conditional_record_schema_version == 2):
+      head_timestep = (
+        conditioning[:, 0]
+        if conditioning.ndim == 2 and conditioning.shape[-1] == 1
+        else conditioning)
+      causal_metrics = causal_denoising.causal_denoising_metrics(
+        head=self.structured_head,
+        primary_output=output,
+        hidden_states=hidden_states,
+        unary_logits=unary_logits,
+        timestep=head_timestep,
+        clean_tokens=x0,
+        active_mask=active_mask,
+        candidate_ks=self.conditional_record_support_candidate_ks,
+        topology_permutation_seed=(
+          int(self.structured_eval_corruption_seed) + 1_000_000_007),
+        structured_joint_nll_sum=denoising.per_example_nll.detach())
+      self._last_structured_example_metrics.update(
+        causal_metrics.as_record_metrics())
 
     training_cfg = self.structured_training_config
     factorized_auxiliary = structured_training.factorized_denoising_nll(

@@ -54,6 +54,12 @@ ROW_FIELDS = {
   'masked_tokens', 'candidate_hits', 'retained_mass_sum',
   'pairing_digest_sha256',
 }
+CAUSAL_ROW_FIELDS = ROW_FIELDS | {
+  'structured_marginal_nll_sum', 'factorized_backbone_nll_sum',
+  'parameter_matched_no_edge_nll_sum',
+  'matched_permuted_topology_nll_sum', 'selected_edges',
+  'permuted_changed_edges', 'candidate_support',
+}
 
 # This is deliberately an exact protocol-v1 allowlist rather than a heuristic
 # such as ``dataset.startswith('wiki')``. A future WikiText revision or partial
@@ -117,13 +123,18 @@ def validate_record(
 ) -> dict[str, Any]:
   if not isinstance(row, Mapping):
     raise TypeError(f'{source} must be a JSON object')
-  if set(row) != ROW_FIELDS:
+  schema_version = row.get('schema_version')
+  expected_fields = (
+    ROW_FIELDS if schema_version == 1 else CAUSAL_ROW_FIELDS
+    if schema_version == 2 else None)
+  if expected_fields is None:
+    raise ValueError(f'{source} schema_version must equal 1 or 2')
+  if set(row) != expected_fields:
     raise ValueError(
-      f'{source} schema mismatch: missing={sorted(ROW_FIELDS - set(row))}, '
-      f'unknown={sorted(set(row) - ROW_FIELDS)}')
+      f'{source} schema mismatch: '
+      f'missing={sorted(expected_fields - set(row))}, '
+      f'unknown={sorted(set(row) - expected_fields)}')
   result = dict(row)
-  if result['schema_version'] != 1:
-    raise ValueError(f'{source} schema_version must equal 1')
   for field in ('protocol_id', 'job_id', 'arm', 'dataset', 'document_id'):
     if not isinstance(result[field], str) or not result[field]:
       raise ValueError(f'{source}.{field} must be non-empty')
@@ -155,6 +166,51 @@ def validate_record(
     context=f'{source}.retained_mass_sum', minimum=0.0)
   if result['retained_mass_sum'] > result['masked_tokens'] + 1e-5:
     raise ValueError(f'{source}.retained_mass_sum exceeds masked_tokens')
+  if schema_version == 2:
+    for field in (
+        'structured_marginal_nll_sum', 'factorized_backbone_nll_sum',
+        'parameter_matched_no_edge_nll_sum',
+        'matched_permuted_topology_nll_sum'):
+      result[field] = _finite(
+        result[field], context=f'{source}.{field}', minimum=0.0)
+    if not math.isclose(
+        result['factorized_backbone_nll_sum'],
+        result['parameter_matched_no_edge_nll_sum'],
+        rel_tol=0.0, abs_tol=1e-10):
+      raise ValueError(
+        f'{source} factorized and parameter-matched no-edge scores differ')
+    result['selected_edges'] = _nonnegative_int(
+      result['selected_edges'], context=f'{source}.selected_edges')
+    result['permuted_changed_edges'] = _nonnegative_int(
+      result['permuted_changed_edges'],
+      context=f'{source}.permuted_changed_edges')
+    if result['permuted_changed_edges'] > result['selected_edges']:
+      raise ValueError(
+        f'{source}.permuted_changed_edges exceeds selected_edges')
+    support = result['candidate_support']
+    if not isinstance(support, list) or not support:
+      raise ValueError(f'{source}.candidate_support must be non-empty')
+    support_ks = []
+    for index, item in enumerate(support):
+      context = f'{source}.candidate_support[{index}]'
+      if not isinstance(item, Mapping) or set(item) != {
+          'candidate_k', 'candidate_hits', 'retained_mass_sum'}:
+        raise ValueError(f'{context} has an invalid schema')
+      candidate_k = _positive_int(
+        item['candidate_k'], context=f'{context}.candidate_k')
+      hits = _nonnegative_int(
+        item['candidate_hits'], context=f'{context}.candidate_hits')
+      mass = _finite(
+        item['retained_mass_sum'],
+        context=f'{context}.retained_mass_sum', minimum=0.0)
+      if hits > result['masked_tokens']:
+        raise ValueError(f'{context}.candidate_hits exceeds masked_tokens')
+      if mass > result['masked_tokens'] + 1e-5:
+        raise ValueError(f'{context}.retained_mass_sum exceeds masked_tokens')
+      support_ks.append(candidate_k)
+    if support_ks != sorted(set(support_ks)):
+      raise ValueError(
+        f'{source}.candidate_support K values must be increasing and unique')
   _lower_hex(
     result['dataset_revision'], 40,
     context=f'{source}.dataset_revision')
@@ -173,6 +229,7 @@ def _load_record_bundle(
     expected_metadata: Mapping[str, Any],
     expected_pairing_digest: Mapping[str, Any],
     expected_num_records: int,
+    expected_schema_version: int = 1,
 ) -> list[dict[str, Any]]:
   manifest_path = manifest_path.expanduser().resolve()
   with manifest_path.open() as handle:
@@ -183,7 +240,7 @@ def _load_record_bundle(
   }
   if not isinstance(payload, dict) or set(payload) != expected_manifest_fields:
     raise ValueError(f'invalid conditional record manifest: {manifest_path}')
-  if (payload['schema_version'] != 1
+  if (payload['schema_version'] != expected_schema_version
       or payload['artifact'] != 'conditional_denoising_record_manifest'):
     raise ValueError(f'invalid record manifest identity: {manifest_path}')
   if payload['metadata'] != dict(expected_metadata):
@@ -238,6 +295,9 @@ def _load_record_bundle(
           raise ValueError(f'{rank_path}:{line_number} is blank')
         record = validate_record(
           json.loads(line), source=f'{rank_path}:{line_number}')
+        if record['schema_version'] != expected_schema_version:
+          raise ValueError(
+            f'{rank_path}:{line_number} record schema differs from manifest')
         if record['rank'] != rank_summary['rank']:
           raise ValueError(f'{rank_path}:{line_number} rank mismatch')
         if record['pairing_digest_sha256'] != pairing_sha:
@@ -756,7 +816,9 @@ def load_plan_records(
       record_manifest_path,
       expected_metadata=expected_metadata,
       expected_pairing_digest=pairing_payload,
-      expected_num_records=expected_windows))
+      expected_num_records=expected_windows,
+      expected_schema_version=(
+        manifest['analysis']['document_record_schema_version'])))
   source_integrity = _source_integrity_commitment(
     plan=plan,
     plan_path=plan_dir / 'compiled-plan.json',

@@ -72,6 +72,11 @@ eval:
   corruption_seed: null
   conditional_records:
     enabled: false
+    # v1 records the structured joint score and support at the adapter K.
+    # v2 additionally records factorized, singleton-product, no-edge, and
+    # matched-permuted-topology scores plus a multi-K support sweep.
+    schema_version: 1
+    support_candidate_ks: []
     protocol_id: null
     job_id: null
     arm: null

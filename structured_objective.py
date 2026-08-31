@@ -170,6 +170,81 @@ def structured_token_log_probability(
     + residual_correction)
 
 
+def structured_marginal_token_log_probability(
+    output: StructuredDecoderOutput,
+    unary_logits: torch.Tensor,
+    token_ids: torch.Tensor,
+    active_mask: torch.Tensor,
+    inference: Optional[StructuredInference] = None) -> torch.Tensor:
+  """Log probability under the product of exact singleton marginals.
+
+  This is the likelihood counterpart of
+  :func:`sample_structured_marginal_tokens`.  It uses the *same* exact forest
+  inference result as joint likelihood/sampling, but deliberately discards
+  all cross-node dependence after marginalization.  Comparing it with
+  :func:`structured_token_log_probability` therefore isolates the value of
+  representing the joint rather than changes to singleton predictions.
+
+  The implementation stays on the compressed top-K-plus-residual lattice.
+  It never materializes a ``[B,L,V]`` probability tensor, which would be
+  prohibitively large for the released MDLM vocabulary.
+  """
+  active_mask = _validate_active_mask(output, active_mask)
+  if unary_logits.shape[:2] != token_ids.shape:
+    raise ValueError('unary_logits and token_ids leading shapes differ')
+  if unary_logits.shape[-1] <= int(output.candidate_ids.max().item()):
+    raise ValueError('unary_logits vocabulary is incompatible with candidates')
+
+  inference = inference or infer_structured_distribution(output, active_mask)
+  states = compressed_states_for_tokens(output, token_ids)
+  states = torch.where(active_mask, states, torch.zeros_like(states))
+  compressed_log_probability = torch.gather(
+    inference.marginals.node_log_marginals,
+    -1,
+    states[:, :, None]).squeeze(-1)
+
+  residual_state = output.num_candidate_states - 1
+  uses_residual = active_mask & states.eq(residual_state)
+  residual_correction = compressed_log_probability.new_zeros(
+    compressed_log_probability.shape)
+  if bool(uses_residual.any().item()):
+    tail_log_probs = output.residual_log_probs(unary_logits)
+    token_tail_log_prob = torch.gather(
+      tail_log_probs, -1, token_ids[:, :, None]).squeeze(-1)
+    residual_correction = torch.where(
+      uses_residual,
+      token_tail_log_prob,
+      torch.zeros_like(token_tail_log_prob))
+
+  per_node = compressed_log_probability + residual_correction
+  return torch.where(
+    active_mask, per_node, torch.zeros_like(per_node)).sum(dim=-1)
+
+
+def factorized_token_log_probability(
+    unary_logits: torch.Tensor,
+    token_ids: torch.Tensor,
+    active_mask: torch.Tensor) -> torch.Tensor:
+  """Per-example log probability under the original factorized backbone.
+
+  ``unary_logits`` are the released MDLM backbone logits before any forest
+  factor is applied.  Returning one value per example makes this baseline
+  pairable with joint and marginal-product likelihoods on the exact same
+  corruption draw.
+  """
+  if unary_logits.ndim != 3:
+    raise ValueError('unary_logits must have shape [B,L,V]')
+  if unary_logits.shape[:2] != token_ids.shape:
+    raise ValueError('unary_logits and token_ids leading shapes differ')
+  if active_mask.shape != token_ids.shape or active_mask.dtype != torch.bool:
+    raise ValueError('active_mask must be boolean with shape [B,L]')
+  selected = torch.gather(
+    unary_logits, -1, token_ids[:, :, None]).squeeze(-1)
+  per_node = selected - torch.logsumexp(unary_logits, dim=-1)
+  return torch.where(
+    active_mask, per_node, torch.zeros_like(per_node)).sum(dim=-1)
+
+
 def full_vocabulary_marginals(
     output: StructuredDecoderOutput,
     unary_logits: torch.Tensor,

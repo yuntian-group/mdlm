@@ -29,11 +29,42 @@ from evaluation.generation_metrics import (
   repetition_rate,
   summarize_token_metrics,
 )
+from evaluation.infilling_prompts import (
+  PROMPT_POLICY_ID,
+  deterministic_span_start,
+)
+from evaluation.prompt_provenance import (
+  PROMPT_ARTIFACT,
+  PROMPT_MANIFEST_SCHEMA_VERSION,
+)
 
 
 EXPERIMENT = 'paired_contextual_forest_generation_pilot'
+PAIRING_DIGEST_ALGORITHM = 'sha256-canonical-json-v2-prompt-metadata'
 SUPPORTED_SAMPLING_MODES = {
   'factorized', 'structured_marginal', 'structured_joint',
+}
+CONTROL_MODES = {
+  'dynamic_dynamic': ('dynamic', 'dynamic'),
+  'fixed_dynamic': ('fixed', 'dynamic'),
+  'dynamic_fixed': ('dynamic', 'fixed'),
+  'static_static': ('fixed', 'fixed'),
+}
+STRUCTURED_IDENTITY_FIELDS = {
+  'control_identity', 'topology_mode', 'factor_mode', 'candidate_top_k',
+  'independent_mode', 'topology_weight', 'head_semantics',
+  'training_semantics',
+}
+HEAD_SEMANTIC_FIELDS = {
+  'rank', 'time_embed_dim', 'topology_dim', 'local_window',
+  'num_anchor_slots', 'contextual_neighbors', 'component_size_cap',
+  'min_edge_score', 'fixed_edges', 'fixed_edge_path',
+}
+TRAINING_SEMANTIC_FIELDS = {
+  'objective_name', 'factorized_aux_weight', 'topology_strategy',
+  'topology_temperature', 'topology_minimum_choices',
+  'topology_edge_weight', 'topology_anchor_weight',
+  'topology_slot_weight', 'topology_on_validation',
 }
 RUNTIME_PACKAGE_FIELDS = {
   'numpy', 'safetensors', 'tokenizers', 'transformers',
@@ -46,7 +77,7 @@ REFERENCE_LM_EXP_ABS_TOL = 1e-12
 MANIFEST_FIELDS = {
   'schema_version', 'experiment', 'scientific_scope', 'command',
   'start_time_utc', 'end_time_utc', 'duration_seconds', 'host',
-  'repository', 'artifacts', 'prompts', 'pairing',
+  'repository', 'artifacts', 'adapter_origin_evidence', 'prompts', 'pairing',
   'spot_interruption_policy', 'matrix', 'outputs', 'reference_lm',
 }
 RECORD_FIELDS = {
@@ -213,6 +244,7 @@ def _pair_identity(record: Mapping[str, Any]) -> dict[str, Any]:
     'initial_token_ids': record['initial_token_ids'],
     'active_mask': record['active_mask'],
     'reference_token_ids': record['reference_token_ids'],
+    'prompt_metadata': record['prompt_metadata'],
   }
 
 
@@ -290,6 +322,7 @@ def _validate_record(
     *,
     source: str,
     pairing: Mapping[str, Any],
+    prompt_identity: Mapping[str, Any],
     modes: Sequence[str],
     nfe_budgets: Sequence[int],
 ) -> tuple[dict[str, Any], int]:
@@ -311,6 +344,49 @@ def _validate_record(
   _nonempty_string(record['prompt_id'], context=f'{source}.prompt_id')
   if not isinstance(record['prompt_metadata'], Mapping):
     raise TypeError(f'{source}.prompt_metadata must be a JSON object')
+  if prompt_identity['source'] == 'jsonl':
+    metadata = record['prompt_metadata']
+    expected_metadata_fields = {
+      'prompt_policy_id', 'dataset_id', 'source_document_index',
+      'source_document_sha256', 'source_chunk_index', 'sequence_length',
+      'span_start', 'span_stop', 'span_length', 'selection_seed',
+    }
+    _strict_fields(
+      metadata, expected_metadata_fields,
+      context=f'{source}.prompt_metadata')
+    policy = prompt_identity['bundle_identity']['policy']
+    dataset_id = prompt_identity['bundle_identity']['data_config'][
+      'logical_validation_dataset']
+    if (metadata['prompt_policy_id'] != PROMPT_POLICY_ID
+        or metadata['dataset_id'] != dataset_id
+        or metadata['sequence_length'] != policy['sequence_length']
+        or metadata['span_length'] != policy['span_length']
+        or metadata['selection_seed'] != policy['selection_seed']):
+      raise ValueError(f'{source}.prompt_metadata differs from prompt bundle')
+    document_index = _nonnegative_int(
+      metadata['source_document_index'],
+      context=f'{source}.prompt_metadata.source_document_index')
+    chunk_index = _nonnegative_int(
+      metadata['source_chunk_index'],
+      context=f'{source}.prompt_metadata.source_chunk_index')
+    document_sha = _lower_hex(
+      metadata['source_document_sha256'], 64,
+      context=f'{source}.prompt_metadata.source_document_sha256')
+    span_start = deterministic_span_start(
+      dataset_id=dataset_id,
+      document_sha256=document_sha,
+      chunk_index=chunk_index,
+      sequence_length=policy['sequence_length'],
+      span_length=policy['span_length'],
+      selection_seed=policy['selection_seed'])
+    span_stop = span_start + policy['span_length']
+    expected_prompt_id = (
+      f'{dataset_id}/document-{document_index:09d}/'
+      f'chunk-{chunk_index:05d}/span-{policy["span_length"]:04d}')
+    if (metadata['span_start'] != span_start
+        or metadata['span_stop'] != span_stop
+        or record['prompt_id'] != expected_prompt_id):
+      raise ValueError(f'{source} is not the committed deterministic prompt')
   if record['sampling_mode'] not in modes:
     raise ValueError(f'{source}.sampling_mode is outside the declared matrix')
   if record['requested_nfe_budget'] not in nfe_budgets:
@@ -343,6 +419,15 @@ def _validate_record(
     raise ValueError(f'{source}.active_mask must contain only booleans')
   if not any(record['active_mask']):
     raise ValueError(f'{source}.active_mask must select at least one token')
+  if prompt_identity['source'] == 'jsonl':
+    expected_active = [
+      prompt_identity['bundle_identity']['policy']['span_length'] > 0
+      and record['prompt_metadata']['span_start'] <= index
+      < record['prompt_metadata']['span_stop']
+      for index in range(sequence_length)
+    ]
+    if record['active_mask'] != expected_active:
+      raise ValueError(f'{source}.active_mask differs from prompt provenance')
   reference = record['reference_token_ids']
   if reference is not None:
     if not isinstance(reference, list) or len(reference) != sequence_length:
@@ -351,6 +436,13 @@ def _validate_record(
     for index, value in enumerate(reference):
       _nonnegative_int(
         value, context=f'{source}.reference_token_ids[{index}]')
+    if any(
+        initial != target
+        for initial, target, active in zip(
+          record['initial_token_ids'], reference, record['active_mask'])
+        if not active):
+      raise ValueError(
+        f'{source} observed prompt tokens differ from the reference')
 
   mask_values = {
     token for token, active in zip(
@@ -585,28 +677,251 @@ def _validate_group_summary(
   _assert_equivalent(claimed, recomputed, context=context)
 
 
+def _normalize_prompt_bundle_identity(
+    payload: object,
+    *,
+    context: str,
+) -> dict[str, Any]:
+  if not isinstance(payload, Mapping):
+    raise TypeError(f'{context} must be a JSON object')
+  expected = {
+    'schema_version', 'artifact', 'manifest_sha256', 'builder_git_sha',
+    'data_config', 'runtime_provenance', 'policy', 'output',
+  }
+  _strict_fields(payload, expected, context=context)
+  if (payload['schema_version'] != PROMPT_MANIFEST_SCHEMA_VERSION
+      or payload['artifact'] != PROMPT_ARTIFACT):
+    raise ValueError(f'{context} has an unsupported identity')
+  manifest_sha = _lower_hex(
+    payload['manifest_sha256'], 64,
+    context=f'{context}.manifest_sha256')
+  builder_sha = _lower_hex(
+    payload['builder_git_sha'], 40,
+    context=f'{context}.builder_git_sha')
+
+  data_config = payload['data_config']
+  if not isinstance(data_config, Mapping):
+    raise TypeError(f'{context}.data_config must be an object')
+  data_fields = {
+    'name', 'sha256', 'logical_validation_dataset', 'dataset_revision',
+    'tokenizer_name_or_path', 'tokenizer_revision',
+  }
+  _strict_fields(data_config, data_fields, context=f'{context}.data_config')
+  normalized_data = {
+    'name': _nonempty_string(
+      data_config['name'], context=f'{context}.data_config.name'),
+    'sha256': _lower_hex(
+      data_config['sha256'], 64, context=f'{context}.data_config.sha256'),
+    'logical_validation_dataset': _nonempty_string(
+      data_config['logical_validation_dataset'],
+      context=f'{context}.data_config.logical_validation_dataset'),
+    'dataset_revision': _lower_hex(
+      data_config['dataset_revision'], 40,
+      context=f'{context}.data_config.dataset_revision'),
+    'tokenizer_name_or_path': _nonempty_string(
+      data_config['tokenizer_name_or_path'],
+      context=f'{context}.data_config.tokenizer_name_or_path'),
+    'tokenizer_revision': _lower_hex(
+      data_config['tokenizer_revision'], 40,
+      context=f'{context}.data_config.tokenizer_revision'),
+  }
+
+  runtime = payload['runtime_provenance']
+  if not isinstance(runtime, Mapping):
+    raise TypeError(f'{context}.runtime_provenance must be an object')
+  runtime_fields = {'sha256', 'specification_sha256', 'manifest_sha256'}
+  _strict_fields(
+    runtime, runtime_fields, context=f'{context}.runtime_provenance')
+  normalized_runtime = {
+    field: _lower_hex(
+      runtime[field], 64,
+      context=f'{context}.runtime_provenance.{field}')
+    for field in sorted(runtime_fields)
+  }
+
+  policy = payload['policy']
+  if not isinstance(policy, Mapping):
+    raise TypeError(f'{context}.policy must be an object')
+  policy_fields = {
+    'policy_id', 'selection_seed', 'span_length', 'sequence_length',
+    'record_selection', 'boundary_policy',
+  }
+  _strict_fields(policy, policy_fields, context=f'{context}.policy')
+  if (policy['policy_id'] != PROMPT_POLICY_ID
+      or policy['record_selection'] != 'first_n_in_pinned_validation_order'
+      or policy['boundary_policy'] != 'never_mask_first_or_last_token'):
+    raise ValueError(f'{context}.policy is unsupported')
+  normalized_policy = {
+    'policy_id': PROMPT_POLICY_ID,
+    'selection_seed': _nonnegative_int(
+      policy['selection_seed'], context=f'{context}.policy.selection_seed'),
+    'span_length': _positive_int(
+      policy['span_length'], context=f'{context}.policy.span_length'),
+    'sequence_length': _positive_int(
+      policy['sequence_length'], context=f'{context}.policy.sequence_length'),
+    'record_selection': policy['record_selection'],
+    'boundary_policy': policy['boundary_policy'],
+  }
+  if normalized_policy['span_length'] > normalized_policy['sequence_length'] - 2:
+    raise ValueError(f'{context}.policy span is incompatible with sequence')
+
+  output = payload['output']
+  if not isinstance(output, Mapping):
+    raise TypeError(f'{context}.output must be an object')
+  _strict_fields(
+    output, {'sha256', 'size_bytes', 'num_prompts'},
+    context=f'{context}.output')
+  normalized_output = {
+    'sha256': _lower_hex(
+      output['sha256'], 64, context=f'{context}.output.sha256'),
+    'size_bytes': _positive_int(
+      output['size_bytes'], context=f'{context}.output.size_bytes'),
+    'num_prompts': _positive_int(
+      output['num_prompts'], context=f'{context}.output.num_prompts'),
+  }
+  return {
+    'schema_version': PROMPT_MANIFEST_SCHEMA_VERSION,
+    'artifact': PROMPT_ARTIFACT,
+    'manifest_sha256': manifest_sha,
+    'builder_git_sha': builder_sha,
+    'data_config': normalized_data,
+    'runtime_provenance': normalized_runtime,
+    'policy': normalized_policy,
+    'output': normalized_output,
+  }
+
+
 def _normalize_prompt_identity(prompts: object, *, context: str) -> dict[str, Any]:
   if not isinstance(prompts, Mapping):
     raise TypeError(f'{context} must be a JSON object')
-  _strict_fields(
-    prompts, {'source', 'path', 'sha256', 'num_prompt_records'},
-    context=context)
   source = _nonempty_string(prompts['source'], context=f'{context}.source')
-  count = _positive_int(
-    prompts['num_prompt_records'], context=f'{context}.num_prompt_records')
-  digest = prompts['sha256']
   if source == 'jsonl':
+    _strict_fields(
+      prompts,
+      {
+        'source', 'path', 'sha256', 'num_prompt_records', 'manifest_path',
+        'manifest_sha256', 'bundle_identity',
+      },
+      context=context)
     _nonempty_string(prompts['path'], context=f'{context}.path')
-    _lower_hex(digest, 64, context=f'{context}.sha256')
+    _nonempty_string(
+      prompts['manifest_path'], context=f'{context}.manifest_path')
+    count = _positive_int(
+      prompts['num_prompt_records'], context=f'{context}.num_prompt_records')
+    digest = _lower_hex(
+      prompts['sha256'], 64, context=f'{context}.sha256')
+    manifest_sha = _lower_hex(
+      prompts['manifest_sha256'], 64,
+      context=f'{context}.manifest_sha256')
+    bundle = _normalize_prompt_bundle_identity(
+      prompts['bundle_identity'], context=f'{context}.bundle_identity')
+    if (bundle['manifest_sha256'] != manifest_sha
+        or bundle['output']['sha256'] != digest
+        or bundle['output']['num_prompts'] != count):
+      raise ValueError(f'{context} differs from its prompt bundle identity')
+    return {
+      'source': source,
+      'sha256': digest,
+      'num_prompt_records': count,
+      'manifest_sha256': manifest_sha,
+      'bundle_identity': bundle,
+    }
   elif source == 'generated_unconditional_prompt':
-    if digest is not None or prompts['path'] is not None or count != 1:
+    _strict_fields(
+      prompts, {'source', 'path', 'sha256', 'num_prompt_records'},
+      context=context)
+    count = _positive_int(
+      prompts['num_prompt_records'], context=f'{context}.num_prompt_records')
+    if prompts['sha256'] is not None or prompts['path'] is not None or count != 1:
       raise ValueError(f'{context} has invalid generated prompt provenance')
+    return {
+      'source': source,
+      'sha256': None,
+      'num_prompt_records': count,
+    }
   else:
     raise ValueError(f'{context}.source is unsupported: {source!r}')
+
+
+def _normalize_structured_adapter_identity(
+    payload: object,
+    *,
+    context: str,
+) -> dict[str, Any]:
+  if not isinstance(payload, Mapping):
+    raise TypeError(f'{context} must be a JSON object')
+  _strict_fields(payload, STRUCTURED_IDENTITY_FIELDS, context=context)
+  control = _nonempty_string(
+    payload['control_identity'], context=f'{context}.control_identity')
+  expected_modes = CONTROL_MODES.get(control)
+  observed_modes = (payload['topology_mode'], payload['factor_mode'])
+  if expected_modes is None or observed_modes != expected_modes:
+    raise ValueError(
+      f'{context} control/mode identity is inconsistent: '
+      f'{control!r}, {observed_modes!r}')
+  candidate_k = _positive_int(
+    payload['candidate_top_k'], context=f'{context}.candidate_top_k')
+  if not isinstance(payload['independent_mode'], bool):
+    raise ValueError(f'{context}.independent_mode must be boolean')
+  topology_weight = _finite_float(
+    payload['topology_weight'], context=f'{context}.topology_weight',
+    minimum=0.0)
+
+  head = payload['head_semantics']
+  if not isinstance(head, Mapping):
+    raise TypeError(f'{context}.head_semantics must be an object')
+  _strict_fields(head, HEAD_SEMANTIC_FIELDS, context=f'{context}.head_semantics')
+  for field in (
+      'rank', 'time_embed_dim', 'topology_dim', 'local_window',
+      'num_anchor_slots', 'contextual_neighbors', 'component_size_cap'):
+    _positive_int(head[field], context=f'{context}.head_semantics.{field}')
+  if head['min_edge_score'] is not None:
+    _finite_float(
+      head['min_edge_score'], context=f'{context}.head_semantics.min_edge_score')
+  fixed_edges = head['fixed_edges']
+  if fixed_edges is not None:
+    if not isinstance(fixed_edges, list):
+      raise TypeError(f'{context}.head_semantics.fixed_edges must be an array')
+    for index, edge in enumerate(fixed_edges):
+      if (not isinstance(edge, list) or len(edge) != 2
+          or any(not isinstance(value, int) or isinstance(value, bool)
+                 or value < 0 for value in edge)):
+        raise ValueError(
+          f'{context}.head_semantics.fixed_edges[{index}] is invalid')
+  fixed_edge_path = head['fixed_edge_path']
+  if fixed_edge_path is not None and not isinstance(fixed_edge_path, str):
+    raise TypeError(f'{context}.head_semantics.fixed_edge_path must be a string')
+
+  training = payload['training_semantics']
+  if not isinstance(training, Mapping):
+    raise TypeError(f'{context}.training_semantics must be an object')
+  _strict_fields(
+    training, TRAINING_SEMANTIC_FIELDS,
+    context=f'{context}.training_semantics')
+  for field in (
+      'factorized_aux_weight', 'topology_temperature',
+      'topology_edge_weight', 'topology_anchor_weight',
+      'topology_slot_weight'):
+    _finite_float(
+      training[field], context=f'{context}.training_semantics.{field}')
+  _positive_int(
+    training['topology_minimum_choices'],
+    context=f'{context}.training_semantics.topology_minimum_choices')
+  for field in ('objective_name', 'topology_strategy'):
+    _nonempty_string(
+      training[field], context=f'{context}.training_semantics.{field}')
+  if not isinstance(training['topology_on_validation'], bool):
+    raise ValueError(
+      f'{context}.training_semantics.topology_on_validation must be boolean')
   return {
-    'source': source,
-    'sha256': digest,
-    'num_prompt_records': count,
+    'control_identity': control,
+    'topology_mode': observed_modes[0],
+    'factor_mode': observed_modes[1],
+    'candidate_top_k': candidate_k,
+    'independent_mode': payload['independent_mode'],
+    'topology_weight': topology_weight,
+    'head_semantics': dict(head),
+    'training_semantics': dict(training),
   }
 
 
@@ -622,6 +937,7 @@ def _normalize_artifact_identity(
   if require_adapter_manifest:
     expected.update({
       'manifest_path', 'manifest_sha256', 'identity_sha256',
+      'semantic_identity',
     })
   _strict_fields(payload, expected, context=context)
   _nonempty_string(payload['path'], context=f'{context}.path')
@@ -633,15 +949,185 @@ def _normalize_artifact_identity(
       payload['manifest_path'], context=f'{context}.manifest_path').strip()
     if not manifest_path:
       raise ValueError(f'{context}.manifest_path must not be whitespace')
+    semantic_identity = _normalize_structured_adapter_identity(
+      payload['semantic_identity'], context=f'{context}.semantic_identity')
+    identity_sha256 = _lower_hex(
+      payload['identity_sha256'], 64,
+      context=f'{context}.identity_sha256')
+    if canonical_sha256(semantic_identity) != identity_sha256:
+      raise ValueError(
+        f'{context}.identity_sha256 does not commit to semantic_identity')
     result.update({
       'manifest_sha256': _lower_hex(
         payload['manifest_sha256'], 64,
         context=f'{context}.manifest_sha256'),
-      'identity_sha256': _lower_hex(
-        payload['identity_sha256'], 64,
-        context=f'{context}.identity_sha256'),
+      'identity_sha256': identity_sha256,
+      'semantic_identity': semantic_identity,
     })
   return result
+
+
+def _normalize_adapter_origin_binding(
+    payload: object,
+    *,
+    context: str,
+) -> dict[str, Any]:
+  """Validate the runner's self-hashed train/export/adapter binding."""
+  if not isinstance(payload, Mapping):
+    raise TypeError(f'{context} must be a JSON object')
+  expected_fields = {
+    'schema_version', 'artifact', 'evidence_file', 'source', 'arm',
+    'adapter', 'plan_export', 'binding_sha256',
+  }
+  _strict_fields(payload, expected_fields, context=context)
+  if (payload['schema_version'] != 1
+      or payload['artifact'] !=
+      'contextual_forest_generation_adapter_origin_binding'):
+    raise ValueError(f'{context} has an unsupported identity')
+  binding_sha256 = _lower_hex(
+    payload['binding_sha256'], 64, context=f'{context}.binding_sha256')
+  body = {
+    field: payload[field] for field in expected_fields
+    if field != 'binding_sha256'
+  }
+  if canonical_sha256(body) != binding_sha256:
+    raise ValueError(f'{context}.binding_sha256 does not commit to its body')
+
+  evidence_file = payload['evidence_file']
+  if not isinstance(evidence_file, Mapping):
+    raise TypeError(f'{context}.evidence_file must be a JSON object')
+  _strict_fields(
+    evidence_file, {'path', 'sha256', 'evidence_sha256'},
+    context=f'{context}.evidence_file')
+  evidence_path = Path(_nonempty_string(
+    evidence_file['path'], context=f'{context}.evidence_file.path'))
+  if not evidence_path.is_absolute():
+    raise ValueError(f'{context}.evidence_file.path must be absolute')
+  for field in ('sha256', 'evidence_sha256'):
+    _lower_hex(
+      evidence_file[field], 64,
+      context=f'{context}.evidence_file.{field}')
+
+  source = payload['source']
+  source_fields = {
+    'compiled_plan_path', 'compiled_plan_sha256', 'plan_id', 'protocol_id',
+    'source_manifest_sha256', 'repository', 'suite', 'candidate_k',
+    'train_seed', 'legacy_plan_schema',
+  }
+  if not isinstance(source, Mapping):
+    raise TypeError(f'{context}.source must be a JSON object')
+  _strict_fields(source, source_fields, context=f'{context}.source')
+  plan_path = Path(_nonempty_string(
+    source['compiled_plan_path'],
+    context=f'{context}.source.compiled_plan_path'))
+  if not plan_path.is_absolute() or plan_path.name != 'compiled-plan.json':
+    raise ValueError(
+      f'{context}.source.compiled_plan_path must be an absolute plan path')
+  for field in ('compiled_plan_sha256', 'plan_id', 'source_manifest_sha256'):
+    _lower_hex(source[field], 64, context=f'{context}.source.{field}')
+  for field in ('protocol_id', 'suite'):
+    _nonempty_string(source[field], context=f'{context}.source.{field}')
+  candidate_k = _positive_int(
+    source['candidate_k'], context=f'{context}.source.candidate_k')
+  _positive_int(source['train_seed'], context=f'{context}.source.train_seed')
+  if source['legacy_plan_schema'] is not False:
+    raise ValueError(
+      f'{context} requires a schema-v2 plan with schema-v4 exports')
+  repository = source['repository']
+  if (not isinstance(repository, Mapping)
+      or set(repository) != {'sha', 'clean'}
+      or repository['clean'] is not True):
+    raise ValueError(f'{context}.source.repository must be exactly clean')
+  _lower_hex(
+    repository['sha'], 40, context=f'{context}.source.repository.sha')
+
+  arm = payload['arm']
+  if arm not in {'dynamic_dynamic', 'static_static'}:
+    raise ValueError(f'{context}.arm is not a paper comparison arm')
+  adapter = payload['adapter']
+  adapter_fields = {
+    'path', 'sha256', 'manifest_path', 'manifest_sha256',
+    'structured_decoder_identity', 'structured_decoder_identity_sha256',
+    'source_checkpoint_sha256', 'source_checkpoint_global_step',
+    'released_backbone',
+  }
+  if not isinstance(adapter, Mapping):
+    raise TypeError(f'{context}.adapter must be a JSON object')
+  _strict_fields(adapter, adapter_fields, context=f'{context}.adapter')
+  for field in ('path', 'manifest_path'):
+    artifact_path = Path(_nonempty_string(
+      adapter[field], context=f'{context}.adapter.{field}'))
+    if not artifact_path.is_absolute():
+      raise ValueError(f'{context}.adapter.{field} must be absolute')
+  for field in (
+      'sha256', 'manifest_sha256', 'structured_decoder_identity_sha256',
+      'source_checkpoint_sha256'):
+    _lower_hex(adapter[field], 64, context=f'{context}.adapter.{field}')
+  _nonnegative_int(
+    adapter['source_checkpoint_global_step'],
+    context=f'{context}.adapter.source_checkpoint_global_step')
+  semantic_identity = _normalize_structured_adapter_identity(
+    adapter['structured_decoder_identity'],
+    context=f'{context}.adapter.structured_decoder_identity')
+  _assert_equivalent(
+    adapter['structured_decoder_identity'], semantic_identity,
+    context=f'{context}.adapter.structured_decoder_identity')
+  if canonical_sha256(semantic_identity) != \
+      adapter['structured_decoder_identity_sha256']:
+    raise ValueError(
+      f'{context}.adapter identity SHA256 does not commit to its semantics')
+  if (semantic_identity['control_identity'] != arm
+      or semantic_identity['candidate_top_k'] != candidate_k):
+    raise ValueError(f'{context}.adapter semantics differ from source/arm')
+
+  released = adapter['released_backbone']
+  released_fields = {
+    'repository', 'revision', 'source_sha256', 'source_size_bytes',
+    'tensor_count',
+  }
+  if not isinstance(released, Mapping):
+    raise TypeError(f'{context}.adapter.released_backbone must be an object')
+  _strict_fields(
+    released, released_fields,
+    context=f'{context}.adapter.released_backbone')
+  for field in ('repository', 'revision'):
+    _nonempty_string(
+      released[field],
+      context=f'{context}.adapter.released_backbone.{field}')
+  _lower_hex(
+    released['source_sha256'], 64,
+    context=f'{context}.adapter.released_backbone.source_sha256')
+  for field in ('source_size_bytes', 'tensor_count'):
+    _positive_int(
+      released[field],
+      context=f'{context}.adapter.released_backbone.{field}')
+
+  plan_export = payload['plan_export']
+  plan_export_fields = {
+    'train_job_id', 'train_job_spec_sha256', 'train_job_execution_sha256',
+    'train_success_marker_sha256', 'checkpoint_sha256',
+    'training_data_provenance_sha256',
+    'training_validation_data_provenance_sha256', 'export_job_id',
+    'export_job_spec_sha256', 'export_job_execution_sha256',
+    'export_success_marker_sha256', 'adapter_sha256',
+    'adapter_manifest_sha256',
+  }
+  if not isinstance(plan_export, Mapping):
+    raise TypeError(f'{context}.plan_export must be a JSON object')
+  _strict_fields(
+    plan_export, plan_export_fields, context=f'{context}.plan_export')
+  for field in ('train_job_id', 'export_job_id'):
+    _nonempty_string(
+      plan_export[field], context=f'{context}.plan_export.{field}')
+  for field in plan_export_fields - {'train_job_id', 'export_job_id'}:
+    _lower_hex(
+      plan_export[field], 64, context=f'{context}.plan_export.{field}')
+  if (plan_export['adapter_sha256'] != adapter['sha256']
+      or plan_export['adapter_manifest_sha256'] != adapter['manifest_sha256']
+      or plan_export['checkpoint_sha256'] !=
+      adapter['source_checkpoint_sha256']):
+    raise ValueError(f'{context}.plan_export differs from adapter provenance')
+  return dict(payload)
 
 
 def _normalize_runtime_identity(
@@ -731,6 +1217,12 @@ def _reference_lm_identity(payload: object, *, context: str) -> dict[str, Any] |
     return None
   if not isinstance(payload, Mapping):
     raise TypeError(f'{context} must be null or a JSON object')
+  expected_fields = {
+    'model_name_or_path', 'revision', 'sequence_policy', 'runtime_identity',
+    'num_scored_sequences', 'num_scored_tokens', 'mean_nll_nats',
+    'perplexity',
+  }
+  _strict_fields(payload, expected_fields, context=context)
   model = _nonempty_string(
     payload.get('model_name_or_path'),
     context=f'{context}.model_name_or_path')
@@ -741,10 +1233,71 @@ def _reference_lm_identity(payload: object, *, context: str) -> dict[str, Any] |
     raise ValueError(
       f'{context}.sequence_policy must equal '
       f'{REFERENCE_LM_SEQUENCE_POLICY!r}')
+  runtime = payload['runtime_identity']
+  if not isinstance(runtime, Mapping):
+    raise TypeError(f'{context}.runtime_identity must be a JSON object')
+  runtime_fields = {
+    'schema_version', 'model_name_or_path', 'model_revision', 'model_class',
+    'model_config_class', 'tokenizer_name_or_path', 'tokenizer_revision',
+    'tokenizer_class', 'tokenizer_vocab_size', 'tokenizer_bos_token_id',
+    'tokenizer_eos_token_id', 'tokenizer_pad_token_id',
+    'tokenizer_padding_side', 'tokenizer_truncation_side',
+    'tokenization_policy', 'sequence_policy', 'add_special_tokens',
+    'batch_size', 'max_length', 'requested_dtype', 'parameter_dtypes',
+    'precision_policy', 'device', 'python', 'torch', 'cuda_runtime',
+    'transformers', 'tokenizers',
+  }
+  _strict_fields(
+    runtime, runtime_fields, context=f'{context}.runtime_identity')
+  if runtime['schema_version'] != 1:
+    raise ValueError(f'{context}.runtime_identity schema is unsupported')
+  if (runtime['model_name_or_path'] != model
+      or runtime['model_revision'] != revision
+      or runtime['tokenizer_revision'] != revision
+      or runtime['sequence_policy'] != sequence_policy):
+    raise ValueError(f'{context}.runtime_identity differs from model identity')
+  for field in (
+      'model_class', 'model_config_class', 'tokenizer_name_or_path',
+      'tokenizer_class', 'tokenizer_padding_side',
+      'tokenizer_truncation_side', 'tokenization_policy', 'requested_dtype',
+      'precision_policy', 'device', 'python', 'torch', 'transformers',
+      'tokenizers'):
+    _nonempty_string(
+      runtime[field], context=f'{context}.runtime_identity.{field}')
+  for field in ('tokenizer_vocab_size', 'batch_size', 'max_length'):
+    _positive_int(
+      runtime[field], context=f'{context}.runtime_identity.{field}')
+  for field in (
+      'tokenizer_bos_token_id', 'tokenizer_eos_token_id',
+      'tokenizer_pad_token_id'):
+    _nonnegative_int(
+      runtime[field], context=f'{context}.runtime_identity.{field}')
+  if runtime['add_special_tokens'] is not True:
+    raise ValueError(
+      f'{context}.runtime_identity.add_special_tokens must be true')
+  parameter_dtypes = runtime['parameter_dtypes']
+  if (not isinstance(parameter_dtypes, list) or not parameter_dtypes
+      or parameter_dtypes != sorted(parameter_dtypes)
+      or len(set(parameter_dtypes)) != len(parameter_dtypes)
+      or any(not isinstance(value, str) or not value.strip()
+             for value in parameter_dtypes)):
+    raise ValueError(
+      f'{context}.runtime_identity.parameter_dtypes is invalid')
+  device_type = runtime['device'].split(':', 1)[0].lower()
+  if device_type not in {'cpu', 'cuda', 'mps'}:
+    raise ValueError(f'{context}.runtime_identity.device is unsupported')
+  cuda_runtime = runtime['cuda_runtime']
+  if device_type == 'cuda':
+    _nonempty_string(
+      cuda_runtime, context=f'{context}.runtime_identity.cuda_runtime')
+  elif cuda_runtime is not None:
+    raise ValueError(
+      f'{context}.runtime_identity.cuda_runtime must be null off CUDA')
   return {
     'model_name_or_path': model,
     'revision': revision,
     'sequence_policy': sequence_policy,
+    'runtime_identity': dict(runtime),
   }
 
 
@@ -788,6 +1341,18 @@ def _validate_manifest_header(
       context=f'{path}.artifacts.structured_adapter',
       require_adapter_manifest=True),
   }
+  result['_adapter_origin_identity'] = _normalize_adapter_origin_binding(
+    result['adapter_origin_evidence'],
+    context=f'{path}.adapter_origin_evidence')
+  if (result['_adapter_origin_identity']['adapter']['sha256'] !=
+      result['_artifact_identity']['structured_adapter']['sha256']
+      or result['_adapter_origin_identity']['adapter']['manifest_sha256'] !=
+      result['_artifact_identity']['structured_adapter']['manifest_sha256']
+      or result['_adapter_origin_identity']['adapter'][
+        'structured_decoder_identity_sha256'] !=
+      result['_artifact_identity']['structured_adapter']['identity_sha256']):
+    raise ValueError(
+      f'{path}.adapter_origin_evidence differs from the loaded adapter')
   result['_prompt_identity'] = _normalize_prompt_identity(
     result['prompts'], context=f'{path}.prompts')
 
@@ -800,7 +1365,7 @@ def _validate_manifest_header(
     'num_shards', 'shard_index', 'sequence_length',
   }
   _strict_fields(pairing, expected_pairing_fields, context=f'{path}.pairing')
-  if pairing['digest_algorithm'] != 'sha256-canonical-json-v1':
+  if pairing['digest_algorithm'] != PAIRING_DIGEST_ALGORITHM:
     raise ValueError(f'{path}.pairing uses an unsupported digest algorithm')
   for field in ('global_pairing_digest', 'shard_pairing_digest'):
     _lower_hex(pairing[field], 64, context=f'{path}.pairing.{field}')
@@ -813,6 +1378,11 @@ def _validate_manifest_header(
     pairing['shard_index'], context=f'{path}.pairing.shard_index')
   if shard_index >= pairing['num_shards']:
     raise ValueError(f'{path}.pairing.shard_index lies outside the shard range')
+  if (result['_prompt_identity']['source'] == 'jsonl'
+      and result['_prompt_identity']['bundle_identity']['policy'][
+        'sequence_length'] != pairing['sequence_length']):
+    raise ValueError(
+      f'{path}.pairing.sequence_length differs from prompt provenance')
 
   matrix = result['matrix']
   if not isinstance(matrix, Mapping):
@@ -868,6 +1438,28 @@ def _validate_manifest_header(
 
   result['_reference_lm_identity'] = _reference_lm_identity(
     result['reference_lm'], context=f'{path}.reference_lm')
+  if result['_reference_lm_identity'] is not None:
+    reference_runtime = result['_reference_lm_identity']['runtime_identity']
+    host_runtime = result['_runtime_identity']
+    expected_shared_runtime = {
+      'python': host_runtime['python'],
+      'torch': host_runtime['torch'],
+      'cuda_runtime': host_runtime['cuda_runtime'],
+      'transformers': host_runtime['packages']['transformers'],
+      'tokenizers': host_runtime['packages']['tokenizers'],
+      'device_type': host_runtime['device_type'],
+    }
+    observed_shared_runtime = {
+      'python': reference_runtime['python'],
+      'torch': reference_runtime['torch'],
+      'cuda_runtime': reference_runtime['cuda_runtime'],
+      'transformers': reference_runtime['transformers'],
+      'tokenizers': reference_runtime['tokenizers'],
+      'device_type': reference_runtime['device'].split(':', 1)[0].lower(),
+    }
+    if observed_shared_runtime != expected_shared_runtime:
+      raise ValueError(
+        f'{path}.reference_lm runtime differs from the generation host')
   return result
 
 
@@ -980,6 +1572,7 @@ def load_generation_shard(raw_path: Path) -> dict[str, Any]:
         _load_json_line(
           line, source=f'{sample_path}:{line_number}'),
         source=f'{sample_path}:{line_number}', pairing=pairing,
+        prompt_identity=manifest['_prompt_identity'],
         modes=manifest['matrix']['sampling_modes'],
         nfe_budgets=manifest['matrix']['nfe_budgets'])
       records.append(record)
@@ -1032,10 +1625,7 @@ def load_generation_shard(raw_path: Path) -> dict[str, Any]:
       raise ValueError(f'{sample_path} group {key} pairing digest mismatch')
     for record in group_records:
       index = record['sample_index']
-      identity = {
-        **_pair_identity(record),
-        'prompt_metadata': record['prompt_metadata'],
-      }
+      identity = _pair_identity(record)
       if index in pair_identity_by_index:
         _assert_equivalent(
           identity, pair_identity_by_index[index],
@@ -1265,8 +1855,11 @@ def _comparison(
       for endpoint in baseline_endpoints
     }
     prompt_by_sample[index] = baseline[index]['prompt_id']
-  endpoint_names = set.intersection(*(
-    set(values) for values in endpoints_by_sample.values()))
+  endpoint_sets = {
+    frozenset(values) for values in endpoints_by_sample.values()}
+  if len(endpoint_sets) != 1:
+    raise ValueError('comparison endpoint availability differs across samples')
+  endpoint_names = set(next(iter(endpoint_sets)))
   intervals = {}
   for offset, endpoint in enumerate(sorted(endpoint_names)):
     intervals[endpoint] = paired_bootstrap_intervals(
@@ -1366,6 +1959,7 @@ def aggregate_generation_shards(
   invariant_identity = {
     'repository': first_manifest['repository'],
     'artifacts': first_manifest['_artifact_identity'],
+    'adapter_origin_evidence': first_manifest['_adapter_origin_identity'],
     'prompts': first_manifest['_prompt_identity'],
     'resolved_config_sha256': first_manifest['outputs']['resolved_config']['sha256'],
     'reference_lm': first_manifest['_reference_lm_identity'],
@@ -1387,6 +1981,7 @@ def aggregate_generation_shards(
     observed_identity = {
       'repository': manifest['repository'],
       'artifacts': manifest['_artifact_identity'],
+      'adapter_origin_evidence': manifest['_adapter_origin_identity'],
       'prompts': manifest['_prompt_identity'],
       'resolved_config_sha256': manifest['outputs']['resolved_config']['sha256'],
       'reference_lm': manifest['_reference_lm_identity'],

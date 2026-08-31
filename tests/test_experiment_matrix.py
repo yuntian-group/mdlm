@@ -18,6 +18,10 @@ from scripts.compile_experiment_matrix import (
 from scripts.run_compiled_job import run_job
 
 
+CAUSAL_MANIFEST = (
+  REPO_ROOT / 'configs/experiment/contextual-forest-causal-evidence-v1.yaml')
+
+
 class ExperimentMatrixTest(unittest.TestCase):
 
   def setUp(self):
@@ -125,6 +129,27 @@ class ExperimentMatrixTest(unittest.TestCase):
         'conditional_record_manifest', 'dataset_provenance'})
     self.assertTrue(
       str(evaluation['artifact_dir']).startswith(str(artifact_root.resolve())))
+
+  def test_causal_smoke_compiles_schema_v2_paired_metrics(self):
+    with tempfile.TemporaryDirectory() as directory:
+      root = Path(directory)
+      artifact_root = root / 'artifacts'
+      plan, jobs, _ = compile_matrix(
+        CAUSAL_MANIFEST,
+        selected_suites=['causal_smoke'],
+        allowed_artifact_root=root,
+        artifact_root_override=artifact_root,
+        output_dir=artifact_root / 'plan')
+
+    self.assertEqual(plan['job_counts'], {
+      'eval': 16, 'export': 2, 'train': 2})
+    evaluation = next(job for job in jobs.values() if job['kind'] == 'eval')
+    self.assertIn(
+      'eval.conditional_records.schema_version=2', evaluation['argv'])
+    self.assertIn(
+      'eval.conditional_records.support_candidate_ks=[32,64,128,256]',
+      evaluation['argv'])
+    self.assertEqual(evaluation['identity']['candidate_k'], 128)
 
   def test_gated_suite_requires_matching_promotion_evidence(self):
     with tempfile.TemporaryDirectory() as directory:

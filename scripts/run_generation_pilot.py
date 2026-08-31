@@ -28,6 +28,10 @@ if str(REPO_ROOT) not in sys.path:
 
 import torch  # noqa: E402
 
+from evaluation.adapter_pair_origin import (  # noqa: E402
+  ARMS as ADAPTER_ORIGIN_ARMS,
+  bind_generation_arm_to_adapter_origin_evidence,
+)
 from evaluation.generation_harness import (  # noqa: E402
   SAMPLING_MODES,
   expand_paired_samples,
@@ -42,6 +46,10 @@ from evaluation.generation_metrics import (  # noqa: E402
   REFERENCE_LM_SEQUENCE_POLICY,
   TransformersReferenceLMScorer,
   validate_reference_lm_spec,
+)
+from evaluation.prompt_provenance import validate_prompt_bundle  # noqa: E402
+from evaluation.generation_shard_aggregation import (  # noqa: E402
+  PAIRING_DIGEST_ALGORITHM,
 )
 
 
@@ -115,8 +123,21 @@ def _parse_args(argv=None) -> argparse.Namespace:
   parser.add_argument('--adapter-sha256', required=True)
   parser.add_argument('--adapter-manifest', type=Path, required=True)
   parser.add_argument('--adapter-manifest-sha256', required=True)
+  parser.add_argument('--adapter-origin-evidence', type=Path)
+  parser.add_argument('--adapter-origin-evidence-sha256')
+  parser.add_argument(
+    '--adapter-origin-arm', choices=ADAPTER_ORIGIN_ARMS,
+    help='Exact compiled-plan arm bound by --adapter-origin-evidence.')
   parser.add_argument('--output-dir', type=Path, required=True)
   parser.add_argument('--prompt-jsonl', type=Path)
+  parser.add_argument(
+    '--prompt-manifest', type=Path,
+    help=(
+      'Builder provenance manifest for --prompt-jsonl. Required for '
+      'document-local infilling prompts.'))
+  parser.add_argument(
+    '--prompt-manifest-sha256',
+    help='Expected SHA256 of --prompt-manifest; never inferred at runtime.')
   parser.add_argument('--num-samples', type=int, default=256)
   parser.add_argument(
     '--num-shards', type=int, default=1,
@@ -141,6 +162,11 @@ def _parse_args(argv=None) -> argparse.Namespace:
   parser.add_argument('--reference-lm-revision')
   parser.add_argument('--reference-lm-device', default='cuda')
   parser.add_argument('--reference-lm-batch-size', type=int, default=8)
+  parser.add_argument('--reference-lm-max-length', type=int, default=256)
+  parser.add_argument(
+    '--reference-lm-dtype',
+    choices=('float32', 'float16', 'bfloat16'),
+    default='float32')
   parser.add_argument(
     '--allow-dirty', action='store_true',
     help='Allow a dirty Git tree; dirty content is committed in the manifest.')
@@ -150,11 +176,18 @@ def _parse_args(argv=None) -> argparse.Namespace:
 def _load_prompt_records(
     path: Path | None,
     *,
+    manifest_path: Path | None,
+    manifest_sha256: str | None,
+    data_config: str,
     tokenizer,
     mask_token_id: int,
     sequence_length: int,
 ) -> tuple[list, dict[str, Any]]:
   if path is None:
+    if manifest_path is not None or manifest_sha256 is not None:
+      raise ValueError(
+        '--prompt-manifest and --prompt-manifest-sha256 require '
+        '--prompt-jsonl')
     return [unconditional_prompt(
       mask_token_id=mask_token_id,
       sequence_length=sequence_length)], {
@@ -163,9 +196,20 @@ def _load_prompt_records(
         'sha256': None,
         'num_prompt_records': 1,
       }
+  if manifest_path is None or manifest_sha256 is None:
+    raise ValueError(
+      '--prompt-jsonl requires both --prompt-manifest and '
+      '--prompt-manifest-sha256')
   path = path.resolve()
   if not path.is_file():
     raise FileNotFoundError(path)
+  manifest_path = manifest_path.resolve()
+  bundle_identity = validate_prompt_bundle(
+    path,
+    manifest_path,
+    expected_manifest_sha256=manifest_sha256,
+    expected_data_config=data_config,
+    expected_sequence_length=sequence_length)
   prompts = []
   with path.open() as handle:
     for line_number, line in enumerate(handle, start=1):
@@ -191,6 +235,9 @@ def _load_prompt_records(
     'path': str(path),
     'sha256': sha256_file(path),
     'num_prompt_records': len(prompts),
+    'manifest_path': str(manifest_path),
+    'manifest_sha256': bundle_identity['manifest_sha256'],
+    'bundle_identity': bundle_identity,
   }
 
 
@@ -320,12 +367,31 @@ def _attach_reference_lm_scores(
     revision: str,
     device: str,
     batch_size: int,
+    max_length: int,
+    dtype: str,
 ) -> dict[str, Any]:
   scorer = TransformersReferenceLMScorer(
     model_name_or_path,
     revision=revision,
     device=device,
-    batch_size=batch_size)
+    batch_size=batch_size,
+    max_length=max_length,
+    dtype=dtype)
+  runtime_identity = scorer.runtime_identity()
+  expected_identity = {
+    'model_name_or_path': model_name_or_path,
+    'model_revision': revision,
+    'batch_size': batch_size,
+    'max_length': max_length,
+    'requested_dtype': dtype,
+    'device': str(torch.device(device)),
+    'sequence_policy': REFERENCE_LM_SEQUENCE_POLICY,
+  }
+  for field, expected in expected_identity.items():
+    if runtime_identity.get(field) != expected:
+      raise RuntimeError(
+        f'reference-LM runtime identity {field} differs from the requested '
+        f'scoring configuration')
   scores = scorer.score([record['text'] for record in records])
   nll_contributions = []
   total_tokens = 0
@@ -348,7 +414,7 @@ def _attach_reference_lm_scores(
     'model_name_or_path': model_name_or_path,
     'revision': revision,
     'sequence_policy': REFERENCE_LM_SEQUENCE_POLICY,
-    'device': device,
+    'runtime_identity': runtime_identity,
     'num_scored_sequences': len(scores),
     'num_scored_tokens': total_tokens,
     'mean_nll_nats': mean_nll,
@@ -395,6 +461,20 @@ def _summarize_attached_reference_lm(
 
 def main(argv=None) -> int:
   args = _parse_args(argv)
+  origin_arguments = (
+    args.adapter_origin_evidence,
+    args.adapter_origin_evidence_sha256,
+    args.adapter_origin_arm,
+  )
+  if any(value is not None for value in origin_arguments) and not all(
+      value is not None for value in origin_arguments):
+    raise ValueError(
+      'adapter-origin evidence path, SHA256, and arm must be supplied '
+      'together')
+  if args.prompt_jsonl is not None and not all(
+      value is not None for value in origin_arguments):
+    raise ValueError(
+      'document-local infilling runs require exact adapter-origin evidence')
   args.reference_lm, args.reference_lm_revision = validate_reference_lm_spec(
     args.reference_lm, args.reference_lm_revision)
 
@@ -408,6 +488,10 @@ def main(argv=None) -> int:
     raise ValueError('--sequence-length must be positive')
   if args.batch_size <= 0:
     raise ValueError('--batch-size must be positive')
+  if args.reference_lm_batch_size <= 0:
+    raise ValueError('--reference-lm-batch-size must be positive')
+  if args.reference_lm_max_length < 2:
+    raise ValueError('--reference-lm-max-length must be at least two')
   if args.num_shards <= 0:
     raise ValueError('--num-shards must be positive')
   if not 0 <= args.shard_index < args.num_shards:
@@ -438,6 +522,20 @@ def main(argv=None) -> int:
   model = diffusion.Diffusion(config, tokenizer=tokenizer)
   adapter_identity_sha256 = model.structured_adapter_manifest[
     'structured_decoder_identity_sha256']
+  adapter_semantic_identity = model.structured_adapter_manifest[
+    'structured_decoder_identity']
+  adapter_origin_binding = None
+  if args.adapter_origin_evidence is not None:
+    adapter_origin_binding = bind_generation_arm_to_adapter_origin_evidence(
+      args.adapter_origin_evidence,
+      expected_evidence_sha256=args.adapter_origin_evidence_sha256,
+      arm=args.adapter_origin_arm,
+      adapter_path=args.adapter,
+      expected_adapter_sha256=adapter_sha256,
+      adapter_manifest_path=args.adapter_manifest,
+      expected_adapter_manifest_sha256=adapter_manifest_sha256,
+      structured_decoder_identity=adapter_semantic_identity,
+    )
   device = torch.device(args.device)
   if device.type == 'cuda' and not torch.cuda.is_available():
     raise RuntimeError('CUDA was requested but is unavailable')
@@ -456,6 +554,9 @@ def main(argv=None) -> int:
 
   prompts, prompt_provenance = _load_prompt_records(
     args.prompt_jsonl,
+    manifest_path=args.prompt_manifest,
+    manifest_sha256=args.prompt_manifest_sha256,
+    data_config=args.data_config,
     tokenizer=tokenizer,
     mask_token_id=model.mask_index,
     sequence_length=args.sequence_length)
@@ -521,7 +622,9 @@ def main(argv=None) -> int:
       model_name_or_path=args.reference_lm,
       revision=args.reference_lm_revision,
       device=args.reference_lm_device,
-      batch_size=args.reference_lm_batch_size)
+      batch_size=args.reference_lm_batch_size,
+      max_length=args.reference_lm_max_length,
+      dtype=args.reference_lm_dtype)
     for summary in summaries:
       group_records = [
         record for record in all_records
@@ -594,11 +697,13 @@ def main(argv=None) -> int:
         'manifest_path': str(args.adapter_manifest.resolve()),
         'manifest_sha256': adapter_manifest_sha256,
         'identity_sha256': adapter_identity_sha256,
+        'semantic_identity': adapter_semantic_identity,
       },
     },
+    'adapter_origin_evidence': adapter_origin_binding,
     'prompts': prompt_provenance,
     'pairing': {
-      'digest_algorithm': 'sha256-canonical-json-v1',
+      'digest_algorithm': PAIRING_DIGEST_ALGORITHM,
       'global_pairing_digest': global_pairing_digest,
       'shard_pairing_digest': input_pairing_digest,
       'base_seed': args.base_seed,

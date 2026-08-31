@@ -19,7 +19,10 @@ import torch
 import torch.nn.functional as F
 
 from models.structured_decoder import StructuredDecoderOutput
-from structured_objective import structured_token_log_probability
+from structured_objective import (
+  factorized_token_log_probability,
+  structured_token_log_probability,
+)
 
 
 STRUCTURED_OBJECTIVE_NAME = (
@@ -184,16 +187,14 @@ def structured_denoising_loss(
 def factorized_denoising_nll(
     unary_logits: torch.Tensor,
     clean_tokens: torch.Tensor,
-    active_mask: torch.Tensor) -> torch.Tensor:
+  active_mask: torch.Tensor) -> torch.Tensor:
   """Ordinary independent denoising NLL per active token."""
-  if unary_logits.shape[:2] != clean_tokens.shape:
-    raise ValueError('unary_logits and clean_tokens leading shapes differ')
-  selected = torch.gather(
-    unary_logits, -1, clean_tokens[:, :, None]).squeeze(-1)
-  log_probability = selected - torch.logsumexp(unary_logits, dim=-1)
   active_tokens = active_mask.sum()
-  return -(log_probability.masked_fill(~active_mask, 0.0).sum()
-           / active_tokens.clamp_min(1))
+  log_probability = factorized_token_log_probability(
+    unary_logits=unary_logits,
+    token_ids=clean_tokens,
+    active_mask=active_mask)
+  return -(log_probability.sum() / active_tokens.clamp_min(1))
 
 
 def sample_active_sources(

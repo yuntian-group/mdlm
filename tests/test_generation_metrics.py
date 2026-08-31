@@ -79,22 +79,44 @@ class GenerationMetricsTest(unittest.TestCase):
   @mock.patch('transformers.AutoTokenizer.from_pretrained')
   def test_reference_lm_revision_is_passed_to_both_loaders(
       self, tokenizer_loader, model_loader):
-    tokenizer = SimpleNamespace(pad_token_id=0)
+    class FakeTokenizer:
+      pad_token_id = 0
+      bos_token_id = 0
+      eos_token_id = 0
+      padding_side = 'left'
+      truncation_side = 'left'
+
+      def __len__(self):
+        return 17
+
+    tokenizer = FakeTokenizer()
     tokenizer_loader.return_value = tokenizer
     model = mock.Mock()
     model.to.return_value = model
     model.eval.return_value = model
     model.config = SimpleNamespace(max_position_embeddings=128)
+    model.parameters.return_value = [
+      torch.nn.Parameter(torch.zeros(1, dtype=torch.float32))]
     model_loader.return_value = model
 
     scorer = TransformersReferenceLMScorer(
       'org/model', revision='b' * 40, device='cpu')
 
     tokenizer_loader.assert_called_once_with(
-      'org/model', revision='b' * 40)
+      'org/model', revision='b' * 40, use_fast=True,
+      trust_remote_code=False)
     model_loader.assert_called_once_with(
-      'org/model', revision='b' * 40)
+      'org/model', revision='b' * 40, torch_dtype=torch.float32,
+      trust_remote_code=False)
     self.assertEqual(scorer.revision, 'b' * 40)
+    self.assertEqual(scorer.max_length, 128)
+    self.assertEqual(scorer.parameter_dtypes, ['torch.float32'])
+    runtime = scorer.runtime_identity()
+    self.assertEqual(runtime['tokenizer_vocab_size'], 17)
+    self.assertEqual(runtime['batch_size'], 8)
+    self.assertEqual(runtime['max_length'], 128)
+    self.assertEqual(runtime['requested_dtype'], 'float32')
+    self.assertEqual(runtime['parameter_dtypes'], ['torch.float32'])
 
   def test_reference_lm_scores_only_through_first_nonpadding_eos(self):
     class FakeTokenizer:

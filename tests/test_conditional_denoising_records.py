@@ -89,6 +89,55 @@ class ConditionalDenoisingRecordsTest(unittest.TestCase):
       finally:
         writer.close()
 
+  def test_schema_v2_streams_causal_scores_and_support_grid(self):
+    with tempfile.TemporaryDirectory() as directory:
+      writer = ConditionalDenoisingRecordWriter(
+        output_dir=directory,
+        rank=0,
+        metadata=self._metadata(),
+        schema_version=2,
+        support_candidate_ks=(32, 64, 128, 256))
+      writer.append(
+        batch={
+          'input_ids': torch.zeros(1, 8, dtype=torch.long),
+          'source_document_index': torch.tensor([12]),
+          'source_document_sha256': ['b' * 64],
+          'source_chunk_index': torch.tensor([0]),
+        },
+        metrics={
+          'nll_sum': torch.tensor([4.0]),
+          'structured_marginal_nll_sum': torch.tensor([4.5]),
+          'factorized_backbone_nll_sum': torch.tensor([5.0]),
+          'parameter_matched_no_edge_nll_sum': torch.tensor([5.0]),
+          'matched_permuted_topology_nll_sum': torch.tensor([4.75]),
+          'active_tokens': torch.tensor([4]),
+          'candidate_hits': torch.tensor([3]),
+          'retained_mass_sum': torch.tensor([3.2]),
+          'candidate_support_ks': [32, 64, 128, 256],
+          'candidate_support_hits': torch.tensor([[1, 2, 3, 4]]),
+          'candidate_support_retained_mass_sum': torch.tensor(
+            [[1.0, 2.0, 3.0, 3.8]]),
+          'selected_edges': torch.tensor([3]),
+          'permuted_changed_edges': torch.tensor([2]),
+        },
+        batch_index=0)
+      summary = writer.finalize(pairing_digest_sha256='c' * 64)
+      rows = [json.loads(line) for line in (
+        Path(directory) / summary['path']).read_text().splitlines()]
+      self.assertEqual(rows[0]['schema_version'], 2)
+      self.assertEqual(
+        [item['candidate_k'] for item in rows[0]['candidate_support']],
+        [32, 64, 128, 256])
+      self.assertEqual(rows[0]['factorized_backbone_nll_sum'], 5.0)
+      manifest_path = write_record_manifest(
+        output_dir=directory,
+        metadata=self._metadata(),
+        rank_summaries=[summary],
+        pairing_digest={'sha256': 'c' * 64, 'world_size': 1},
+        schema_version=2)
+      self.assertEqual(
+        json.loads(Path(manifest_path).read_text())['schema_version'], 2)
+
 
 if __name__ == '__main__':
   unittest.main()

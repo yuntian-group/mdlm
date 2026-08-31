@@ -246,6 +246,7 @@ def pairing_digest(samples: Sequence[PairedSampleSpec]) -> str:
       'initial_token_ids': item.prompt.initial_token_ids,
       'active_mask': item.prompt.active_mask,
       'reference_token_ids': item.prompt.reference_token_ids,
+      'prompt_metadata': item.prompt.metadata,
     }
     for item in samples
   ])
@@ -521,6 +522,7 @@ def summarize_group(records: Sequence[dict[str, Any]]) -> dict[str, Any]:
         'initial_token_ids': record['initial_token_ids'],
         'active_mask': record['active_mask'],
         'reference_token_ids': record['reference_token_ids'],
+        'prompt_metadata': record['prompt_metadata'],
       }
       for record in records
     ]),

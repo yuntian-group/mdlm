@@ -11,7 +11,26 @@ import torch
 
 
 RECORD_SCHEMA_VERSION = 1
+CAUSAL_RECORD_SCHEMA_VERSION = 2
+SUPPORTED_RECORD_SCHEMA_VERSIONS = frozenset({
+  RECORD_SCHEMA_VERSION, CAUSAL_RECORD_SCHEMA_VERSION})
 RECORD_BASENAME = 'conditional_denoising_records'
+
+_V1_METRICS = (
+  'nll_sum', 'active_tokens', 'candidate_hits', 'retained_mass_sum')
+_V2_EXTRA_SCALAR_METRICS = (
+  'structured_marginal_nll_sum',
+  'factorized_backbone_nll_sum',
+  'parameter_matched_no_edge_nll_sum',
+  'matched_permuted_topology_nll_sum',
+  'selected_edges',
+  'permuted_changed_edges',
+)
+_V2_SUPPORT_METRICS = (
+  'candidate_support_ks',
+  'candidate_support_hits',
+  'candidate_support_retained_mass_sum',
+)
 
 
 def _sha256_file(path: Path) -> str:
@@ -41,7 +60,9 @@ class ConditionalDenoisingRecordWriter:
       *,
       output_dir: str,
       rank: int,
-      metadata: Mapping[str, Any]):
+      metadata: Mapping[str, Any],
+      schema_version: int = RECORD_SCHEMA_VERSION,
+      support_candidate_ks: tuple[int, ...] | list[int] = ()):
     if '://' in output_dir:
       raise ValueError(
         'conditional record output must be a local/shared filesystem path')
@@ -50,6 +71,23 @@ class ConditionalDenoisingRecordWriter:
     self.rank = int(rank)
     if self.rank < 0:
       raise ValueError('rank must be non-negative')
+    if schema_version not in SUPPORTED_RECORD_SCHEMA_VERSIONS:
+      raise ValueError(
+        f'unsupported conditional record schema {schema_version}')
+    self.schema_version = int(schema_version)
+    self.support_candidate_ks = tuple(support_candidate_ks)
+    if self.schema_version == CAUSAL_RECORD_SCHEMA_VERSION:
+      if (not self.support_candidate_ks
+          or tuple(sorted(set(self.support_candidate_ks)))
+          != self.support_candidate_ks
+          or any(not isinstance(value, int) or isinstance(value, bool)
+                 or value <= 0 for value in self.support_candidate_ks)):
+        raise ValueError(
+          'schema-v2 support_candidate_ks must be positive, unique, and '
+          'increasing')
+    elif self.support_candidate_ks:
+      raise ValueError(
+        'support_candidate_ks are only valid for record schema v2')
     self.metadata = dict(metadata)
     required = (
       'protocol_id', 'job_id', 'arm', 'train_seed', 'corruption_seed',
@@ -76,7 +114,7 @@ class ConditionalDenoisingRecordWriter:
       self,
       *,
       batch: Mapping[str, Any],
-      metrics: Mapping[str, torch.Tensor],
+      metrics: Mapping[str, Any],
       batch_index: int) -> None:
     required_batch = (
       'source_document_index', 'source_document_sha256',
@@ -86,9 +124,10 @@ class ConditionalDenoisingRecordWriter:
       raise ValueError(
         'conditional records require document-local dataset metadata; '
         f'missing {missing_batch}')
-    required_metrics = (
-      'nll_sum', 'active_tokens', 'candidate_hits',
-      'retained_mass_sum')
+    required_metrics = list(_V1_METRICS)
+    if self.schema_version == CAUSAL_RECORD_SCHEMA_VERSION:
+      required_metrics.extend(_V2_EXTRA_SCALAR_METRICS)
+      required_metrics.extend(_V2_SUPPORT_METRICS)
     missing_metrics = [
       field for field in required_metrics if field not in metrics]
     if missing_metrics:
@@ -105,16 +144,35 @@ class ConditionalDenoisingRecordWriter:
     chunk_indices = _as_cpu_list(
       batch['source_chunk_index'], name='source_chunk_index',
       batch_size=batch_size)
+    scalar_metric_names = list(_V1_METRICS)
+    if self.schema_version == CAUSAL_RECORD_SCHEMA_VERSION:
+      scalar_metric_names.extend(_V2_EXTRA_SCALAR_METRICS)
+      scalar_metric_names.extend((
+        'candidate_support_hits',
+        'candidate_support_retained_mass_sum'))
     values = {
       name: _as_cpu_list(value, name=name, batch_size=batch_size)
       for name, value in metrics.items()
-      if name in required_metrics
+      if name in scalar_metric_names
     }
+    if self.schema_version == CAUSAL_RECORD_SCHEMA_VERSION:
+      observed_ks = tuple(metrics['candidate_support_ks'])
+      if observed_ks != self.support_candidate_ks:
+        raise ValueError(
+          f'candidate support K values changed: expected '
+          f'{self.support_candidate_ks}, found {observed_ks}')
+      for name in (
+          'candidate_support_hits',
+          'candidate_support_retained_mass_sum'):
+        if any(len(row) != len(self.support_candidate_ks)
+               for row in values[name]):
+          raise ValueError(
+            f'{name} width differs from support_candidate_ks')
 
     for example_index in range(batch_size):
       masked_tokens = int(values['active_tokens'][example_index])
       row = {
-        'schema_version': RECORD_SCHEMA_VERSION,
+        'schema_version': self.schema_version,
         **self.metadata,
         'rank': self.rank,
         'batch_index': int(batch_index),
@@ -131,6 +189,30 @@ class ConditionalDenoisingRecordWriter:
         'retained_mass_sum': float(
           values['retained_mass_sum'][example_index]),
       }
+      if self.schema_version == CAUSAL_RECORD_SCHEMA_VERSION:
+        row.update({
+          name: float(values[name][example_index])
+          for name in (
+            'structured_marginal_nll_sum',
+            'factorized_backbone_nll_sum',
+            'parameter_matched_no_edge_nll_sum',
+            'matched_permuted_topology_nll_sum')
+        })
+        row.update({
+          name: int(values[name][example_index])
+          for name in ('selected_edges', 'permuted_changed_edges')
+        })
+        row['candidate_support'] = [
+          {
+            'candidate_k': candidate_k,
+            'candidate_hits': int(
+              values['candidate_support_hits'][example_index][index]),
+            'retained_mass_sum': float(
+              values['candidate_support_retained_mass_sum'][
+                example_index][index]),
+          }
+          for index, candidate_k in enumerate(self.support_candidate_ks)
+        ]
       self._handle.write(json.dumps(
         row, sort_keys=True, separators=(',', ':'), allow_nan=False) + '\n')
       self.num_records += 1
@@ -176,7 +258,11 @@ def write_record_manifest(
     output_dir: str,
     metadata: Mapping[str, Any],
     rank_summaries: list[Mapping[str, Any]],
-    pairing_digest: Mapping[str, Any]) -> str:
+    pairing_digest: Mapping[str, Any],
+    schema_version: int = RECORD_SCHEMA_VERSION) -> str:
+  if schema_version not in SUPPORTED_RECORD_SCHEMA_VERSIONS:
+    raise ValueError(
+      f'unsupported conditional record schema {schema_version}')
   output_path = Path(output_dir).expanduser().resolve()
   ordered = sorted(
     (dict(summary) for summary in rank_summaries),
@@ -185,7 +271,7 @@ def write_record_manifest(
   if [summary['rank'] for summary in ordered] != expected_ranks:
     raise ValueError('record summaries must cover contiguous ranks')
   payload = {
-    'schema_version': RECORD_SCHEMA_VERSION,
+    'schema_version': schema_version,
     'artifact': 'conditional_denoising_record_manifest',
     'metadata': dict(metadata),
     'pairing_digest': dict(pairing_digest),

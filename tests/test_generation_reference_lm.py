@@ -22,21 +22,36 @@ class GenerationReferenceLMPlumbingTest(unittest.TestCase):
     ]
     rows = [{'text': 'one'}, {'text': 'two'}]
     revision = 'c' * 40
+    scorer.runtime_identity.return_value = {
+      'model_name_or_path': 'org/model',
+      'model_revision': revision,
+      'batch_size': 2,
+      'max_length': 256,
+      'requested_dtype': 'float32',
+      'device': 'cpu',
+      'sequence_policy': (
+        'retokenize_decoded_text_score_through_first_nonleading_eos_v1'),
+    }
 
     overall = _attach_reference_lm_scores(
       rows,
       model_name_or_path='org/model',
       revision=revision,
       device='cpu',
-      batch_size=2)
+      batch_size=2,
+      max_length=256,
+      dtype='float32')
     group = _summarize_attached_reference_lm(rows)
     independently_recomputed = _summarize_reference_lm(rows)
 
     scorer_class.assert_called_once_with(
-      'org/model', revision=revision, device='cpu', batch_size=2)
+      'org/model', revision=revision, device='cpu', batch_size=2,
+      max_length=256, dtype='float32')
     self.assertTrue(all(
       row['reference_lm']['revision'] == revision for row in rows))
     self.assertEqual(overall['revision'], revision)
+    self.assertEqual(
+      overall['runtime_identity'], scorer.runtime_identity.return_value)
     self.assertEqual(
       overall['sequence_policy'],
       'retokenize_decoded_text_score_through_first_nonleading_eos_v1')

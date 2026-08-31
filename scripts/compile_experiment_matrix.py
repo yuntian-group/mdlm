@@ -429,8 +429,8 @@ def load_and_validate_manifest(
     'bootstrap_resamples', 'bootstrap_seed', 'confidence_level',
     'reject_incomplete_factorial_cells',
   }, context='analysis')
-  if analysis['document_record_schema_version'] != 1:
-    raise ValueError('document_record_schema_version must equal 1')
+  if analysis['document_record_schema_version'] not in {1, 2}:
+    raise ValueError('document_record_schema_version must equal 1 or 2')
   if analysis['primary_comparison'] not in comparisons:
     raise ValueError('analysis.primary_comparison is not declared')
   if analysis['bootstrap_unit_order'] != ['train_seed', 'document']:
@@ -725,6 +725,8 @@ def build_jobs(
         f'eval.adapter_manifest_sha256='
         f'${{sha256:{export_id}:adapter-manifest.json}}',
         'eval.conditional_records.enabled=true',
+        f'eval.conditional_records.schema_version='
+        f'{manifest["analysis"]["document_record_schema_version"]}',
         f'eval.conditional_records.protocol_id={protocol_id}',
         f'eval.conditional_records.job_id={eval_id}',
         f'eval.conditional_records.arm={control_name}',
@@ -738,6 +740,11 @@ def build_jobs(
         'loader.num_workers=0',
         'checkpointing.resume_from_ckpt=false',
       ]
+      if manifest['analysis']['document_record_schema_version'] == 2:
+        support_ks = ','.join(
+          str(value) for value in evaluation['candidate_ks'])
+        argv.append(
+          f'eval.conditional_records.support_candidate_ks=[{support_ks}]')
       argv += _control_overrides(control)
       argv += _hydra_common(manifest, '{artifact_dir}')
       job = _job(
