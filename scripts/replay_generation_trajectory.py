@@ -229,6 +229,18 @@ def _source_record_projection(record: Mapping[str, Any]) -> dict[str, Any]:
   return result
 
 
+def resolve_device(value: str) -> torch.device:
+  """Canonicalize an unindexed CUDA alias to the active concrete device."""
+  device = torch.device(value)
+  if device.type != 'cuda':
+    return device
+  if not torch.cuda.is_available():
+    raise RuntimeError('CUDA was requested but is unavailable')
+  if device.index is None:
+    return torch.device('cuda', torch.cuda.current_device())
+  return device
+
+
 def _load_model(loaded: Mapping[str, Any], device: torch.device):
   import dataloader
   import diffusion
@@ -263,9 +275,7 @@ def main(argv=None) -> int:
   loaded = selected['loaded']
   first_records = selected['records_by_mode'][args.modes[0]]
   samples = paired_samples_from_records(first_records)
-  device = torch.device(args.device)
-  if device.type == 'cuda' and not torch.cuda.is_available():
-    raise RuntimeError('CUDA was requested but is unavailable')
+  device = resolve_device(args.device)
   model = _load_model(loaded, device)
 
   trajectories = {}

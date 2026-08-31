@@ -1,10 +1,14 @@
 from pathlib import Path
 import unittest
+from unittest import mock
+
+import torch
 
 from scripts.replay_generation_trajectory import (
   SELECTION_POLICY,
   _batch_selection_sha256,
   paired_samples_from_records,
+  resolve_device,
   select_outcome_independent_batch,
 )
 
@@ -104,6 +108,16 @@ class ReplayGenerationTrajectoryCliTest(unittest.TestCase):
     self.assertEqual(samples[0].prompt.active_mask, (False, True, False))
     self.assertEqual(samples[0].prompt.reference_token_ids, (1, 7, 2))
     self.assertEqual(samples[0].prompt.metadata, {'dataset_id': 'test'})
+
+  def test_device_alias_is_canonicalized_for_strict_replay_check(self):
+    self.assertEqual(resolve_device('cpu'), torch.device('cpu'))
+    with mock.patch('torch.cuda.is_available', return_value=True), \
+         mock.patch('torch.cuda.current_device', return_value=2):
+      self.assertEqual(resolve_device('cuda'), torch.device('cuda:2'))
+      self.assertEqual(resolve_device('cuda:1'), torch.device('cuda:1'))
+    with mock.patch('torch.cuda.is_available', return_value=False):
+      with self.assertRaisesRegex(RuntimeError, 'unavailable'):
+        resolve_device('cuda')
 
 
 if __name__ == '__main__':
