@@ -121,6 +121,35 @@ def confident_reveal_mask(x, probabilities, mask_index,
   return reveal
 
 
+def factorized_confidence_gated_update(
+    x, probabilities, mask_index, move_chance_t, move_chance_s):
+  """Sample independent token identities at confidence-ranked positions.
+
+  The clean-token identities remain stochastic independent draws from the
+  supplied factorized distribution.  Only the reveal-position policy changes:
+  :func:`confident_reveal_mask` chooses the highest-confidence masked sites at
+  the absorbing schedule's rounded per-row reveal count.
+  """
+  if probabilities.shape[:2] != x.shape or probabilities.ndim != 3:
+    raise ValueError('probabilities and x shapes are inconsistent')
+  if not 0 <= int(mask_index) < probabilities.shape[-1]:
+    raise ValueError('mask_index lies outside the probability vocabulary')
+  reveal = confident_reveal_mask(
+    x=x,
+    probabilities=probabilities,
+    mask_index=mask_index,
+    move_chance_t=move_chance_t,
+    move_chance_s=move_chance_s)
+  token_probs = probabilities.clone()
+  token_probs[..., mask_index] = 0
+  if bool((token_probs.sum(dim=-1) <= 0).any().item()):
+    raise ValueError('factorized distribution has no non-mask token mass')
+  gumbel_norm = (
+    1e-10 - (torch.rand_like(token_probs) + 1e-10).log())
+  proposed_tokens = (token_probs / gumbel_norm).argmax(dim=-1)
+  return torch.where(reveal, proposed_tokens, x)
+
+
 def sequential_reveal_mask(x, probabilities, mask_index):
   """Select exactly one most-confident masked position per unfinished row."""
   if probabilities.shape[:2] != x.shape or probabilities.ndim != 3:

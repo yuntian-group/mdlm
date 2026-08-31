@@ -639,7 +639,7 @@ class Diffusion(L.LightningModule):
       if (self.structured_sampling_mode != 'factorized'
           and self.sampler != 'ddpm'):
         raise ValueError(
-          'structured marginal/joint sampling requires '
+          'structured and confidence-gated sampling requires '
           'sampling.predictor=ddpm')
       if (self.structured_sampling_mode != 'factorized'
           and bool(self.config.sampling.semi_ar)):
@@ -1431,6 +1431,25 @@ class Diffusion(L.LightningModule):
     return torch.where(active_mask, clean, x)
 
   @torch.no_grad()
+  def _factorized_confidence_gated_ddpm_update(self, x, p_x0,
+                                                move_chance_t,
+                                                move_chance_s):
+    """Stochastically sample factorized tokens at confidence-ranked sites.
+
+    This is a selection-only control.  It uses the unchanged backbone
+    marginals for both token confidence and independent categorical token
+    draws.  The gate deterministically reveals the most-confident masked
+    positions while matching the absorbing schedule's per-row remaining-mask
+    count up to integer rounding.  No coupling-head value enters this update.
+    """
+    return crf_utils.factorized_confidence_gated_update(
+      x=x,
+      probabilities=p_x0,
+      mask_index=self.mask_index,
+      move_chance_t=move_chance_t,
+      move_chance_s=move_chance_s)
+
+  @torch.no_grad()
   def _structured_ddpm_update(self, x, t, dt):
     """Sample structured token identities, then apply the reveal kernel."""
     sigma_t, _ = self.noise(t)
@@ -1453,7 +1472,8 @@ class Diffusion(L.LightningModule):
 
   def _ddpm_update(self, x, t, dt):
     if (self.structured_enabled
-        and self.structured_sampling_mode != 'factorized'):
+        and structured_training.uses_structured_token_distribution(
+          self.structured_sampling_mode)):
       return self._structured_ddpm_update(x, t, dt)
     sigma_t, _ = self.noise(t)
     sigma_s, _ = self.noise(t - dt)
@@ -1477,6 +1497,11 @@ class Diffusion(L.LightningModule):
       p_x0 = log_p_x0.exp()
 
     assert move_chance_t.ndim == p_x0.ndim
+    if (self.structured_enabled
+        and self.structured_sampling_mode
+        == 'factorized_confidence_gated'):
+      return self._factorized_confidence_gated_ddpm_update(
+        x, p_x0, move_chance_t, move_chance_s)
     if (self.config.backbone == 'crf_dit'
         and self.crf_reveal != 'independent'):
       return self._crf_gated_update(
@@ -1668,7 +1693,8 @@ class Diffusion(L.LightningModule):
         p_x0 = self._compute_crf_marginals(x, sigma_1d)
         x = p_x0.argmax(dim=-1)
       elif (self.structured_enabled
-            and self.structured_sampling_mode != 'factorized'):
+            and structured_training.uses_structured_token_distribution(
+              self.structured_sampling_mode)):
         unet_conditioning = self.noise(t)[0]
         x = self._structured_clean_sample(x, unet_conditioning)
       else:

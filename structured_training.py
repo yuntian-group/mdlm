@@ -28,7 +28,10 @@ from structured_objective import (
 STRUCTURED_OBJECTIVE_NAME = (
   'conditional_denoising_nll_not_diffusion_elbo')
 STRUCTURED_SAMPLING_MODES = frozenset({
-  'factorized', 'structured_marginal', 'structured_joint'})
+  'factorized', 'factorized_confidence_gated',
+  'structured_marginal', 'structured_joint'})
+STRUCTURED_TOKEN_SAMPLING_MODES = frozenset({
+  'structured_marginal', 'structured_joint'})
 
 
 def validate_structured_objective_name(name: str) -> str:
@@ -47,6 +50,18 @@ def validate_structured_sampling_mode(mode: str) -> str:
       'structured sampling mode must be one of '
       f'{sorted(STRUCTURED_SAMPLING_MODES)}, got {mode!r}')
   return mode
+
+
+def uses_structured_token_distribution(mode: str) -> bool:
+  """Whether ``mode`` samples clean identities from the coupling forest.
+
+  ``factorized_confidence_gated`` remains a factorized-backbone control: only
+  its reveal-position policy changes.  Keeping that distinction explicit
+  prevents generic ``mode != 'factorized'`` checks from accidentally routing
+  the control through the structured head.
+  """
+  validate_structured_sampling_mode(mode)
+  return mode in STRUCTURED_TOKEN_SAMPLING_MODES
 
 
 def validated_ema_shadow_parameters(

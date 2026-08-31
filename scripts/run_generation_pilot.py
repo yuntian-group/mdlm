@@ -33,6 +33,7 @@ from evaluation.adapter_pair_origin import (  # noqa: E402
   bind_generation_arm_to_adapter_origin_evidence,
 )
 from evaluation.generation_harness import (  # noqa: E402
+  DEFAULT_SAMPLING_MODES,
   SAMPLING_MODES,
   expand_paired_samples,
   iter_batches,
@@ -150,7 +151,7 @@ def _parse_args(argv=None) -> argparse.Namespace:
   parser.add_argument('--base-seed', type=int, default=91001)
   parser.add_argument(
     '--modes', nargs='+', choices=SAMPLING_MODES,
-    default=list(SAMPLING_MODES))
+    default=list(DEFAULT_SAMPLING_MODES))
   parser.add_argument('--nfe-budgets', nargs='+', type=int, default=[32, 64])
   parser.add_argument('--device', default='cuda')
   parser.add_argument('--model-config', default='contextual-forest-small')

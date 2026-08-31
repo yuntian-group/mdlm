@@ -25,11 +25,20 @@ from evaluation.generation_metrics import (
 )
 
 
-SAMPLING_MODES = (
+DEFAULT_SAMPLING_MODES = (
   'factorized',
   'structured_marginal',
   'structured_joint',
 )
+SAMPLING_MODES = (
+  DEFAULT_SAMPLING_MODES[0],
+  'factorized_confidence_gated',
+  *DEFAULT_SAMPLING_MODES[1:],
+)
+STRUCTURED_SAMPLING_MODES = frozenset({
+  'structured_marginal',
+  'structured_joint',
+})
 
 
 @dataclass(frozen=True)
@@ -277,20 +286,94 @@ def _finish_sampling(model, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
     conditioning = model.noise(t)[0]
     sigma_1d = model._process_sigma(conditioning)
     return model._compute_crf_marginals(x, sigma_1d).argmax(dim=-1)
-  if model.structured_enabled and model.structured_sampling_mode != 'factorized':
+  if (model.structured_enabled
+      and model.structured_sampling_mode in STRUCTURED_SAMPLING_MODES):
     conditioning = model.noise(t)[0]
     return model._structured_clean_sample(x, conditioning)
   conditioning = model.noise(t)[0]
   return model.forward(x, conditioning).argmax(dim=-1)
 
 
+def _normalize_snapshot_call_indices(
+    values: Iterable[int],
+) -> tuple[int, ...]:
+  """Validate and canonicalize requested trajectory model-call indices."""
+  result = []
+  for value in values:
+    if isinstance(value, bool) or not isinstance(value, int):
+      raise TypeError('snapshot call indices must be integers')
+    if value < 0:
+      raise ValueError('snapshot call indices must be non-negative')
+    result.append(value)
+  return tuple(sorted(set(result)))
+
+
+class _TrajectoryRecorder:
+  """Capture JSON-serializable raw batch states without consuming RNG."""
+
+  def __init__(
+      self,
+      *,
+      initial_tokens: torch.Tensor,
+      mask_token_id: int,
+      requested_call_indices: Iterable[int],
+  ) -> None:
+    self.requested_call_indices = _normalize_snapshot_call_indices(
+      requested_call_indices)
+    self._requested = set(self.requested_call_indices)
+    self._mask_token_id = int(mask_token_id)
+    self._active_mask = initial_tokens.eq(self._mask_token_id)
+    self._selected_recorded: set[int] = set()
+    self.snapshots: list[dict[str, Any]] = []
+
+  def record(
+      self,
+      tokens: torch.Tensor,
+      *,
+      model_call_index: int,
+      timestep: torch.Tensor | None,
+      stage: str,
+      force: bool = False,
+  ) -> None:
+    if (not force
+        and (model_call_index not in self._requested
+             or model_call_index in self._selected_recorded)):
+      return
+    if model_call_index in self._requested:
+      self._selected_recorded.add(model_call_index)
+    active_mask = self._active_mask.to(tokens.device)
+    unresolved = active_mask & tokens.eq(self._mask_token_id)
+    timestep_values = None
+    if timestep is not None:
+      timestep_cpu = timestep.detach().to('cpu')
+      if timestep_cpu.ndim == 1:
+        timestep_cpu = timestep_cpu[:, None]
+      timestep_values = [
+        [float(value) for value in row]
+        for row in timestep_cpu.tolist()
+      ]
+    self.snapshots.append({
+      'model_call_index': int(model_call_index),
+      'stage': stage,
+      'timestep': timestep_values,
+      'token_ids': [
+        [int(token) for token in row]
+        for row in tokens.detach().to('cpu').tolist()
+      ],
+      'active_mask': active_mask.detach().to('cpu').tolist(),
+      'unresolved_active_mask': unresolved.detach().to('cpu').tolist(),
+      'unresolved_active_count': int(unresolved.sum().item()),
+    })
+
+
 @torch.no_grad()
-def sample_from_initial_state(
+def _sample_from_initial_state(
     model,
     initial_tokens: torch.Tensor,
     *,
     nfe_budget: int,
     eps: float = 1e-5,
+    trajectory_recorder: _TrajectoryRecorder | None = None,
 ) -> tuple[torch.Tensor, int]:
   """Sample from explicit masks while leaving observed tokens untouched.
 
@@ -318,10 +401,17 @@ def sample_from_initial_state(
   timesteps = torch.linspace(1, eps, num_steps + 1, device=model.device)
   dt = (1 - eps) / num_steps
   measured_nfe = 0
+  if trajectory_recorder is not None:
+    trajectory_recorder.record(
+      x,
+      model_call_index=0,
+      timestep=None,
+      stage='initial',
+      force=True)
 
   structured_path = (
     bool(model.structured_enabled)
-    and model.structured_sampling_mode != 'factorized')
+    and model.structured_sampling_mode in STRUCTURED_SAMPLING_MODES)
   handle = None
   original_structured_backbone_output = None
   if structured_path:
@@ -346,22 +436,49 @@ def sample_from_initial_state(
     for index in range(num_steps):
       t = timesteps[index] * torch.ones(
         x.shape[0], 1, device=model.device)
+      calls_before_update = measured_nfe
       if model.sampler == 'ddpm':
         x = model._ddpm_update(x, t, dt)
       else:
         x = model._analytic_update(x, t, dt)
+      if (trajectory_recorder is not None
+          and measured_nfe - calls_before_update not in {0, 1}):
+        raise RuntimeError(
+          'trajectory capture requires at most one model call per sampler '
+          'state transition')
       # Fail closed if a future core sampler starts modifying evidence.
       if not torch.equal(x[observed], observed_values[observed]):
         raise AssertionError('sampling kernel modified observed prompt tokens')
+      if trajectory_recorder is not None:
+        is_final_state = not final_call and index == num_steps - 1
+        trajectory_recorder.record(
+          x,
+          model_call_index=measured_nfe,
+          timestep=t,
+          stage='final' if is_final_state else 'denoising',
+          force=is_final_state)
 
     if final_call:
       t = timesteps[-1] * torch.ones(
         x.shape[0], 1, device=model.device)
+      calls_before_update = measured_nfe
       x = _finish_sampling(model, x, t)
+      if (trajectory_recorder is not None
+          and measured_nfe - calls_before_update not in {0, 1}):
+        raise RuntimeError(
+          'trajectory capture requires at most one model call per final '
+          'state transition')
       # The ordinary factorized final argmax is written for unconditional
       # generation and proposes values at every position.  Explicit evidence
       # is part of this harness's contract, so clamp it after that proposal.
       x = torch.where(observed, observed_values, x)
+      if trajectory_recorder is not None:
+        trajectory_recorder.record(
+          x,
+          model_call_index=measured_nfe,
+          timestep=t,
+          stage='final',
+          force=True)
     if not torch.equal(x[observed], observed_values[observed]):
       raise AssertionError('final denoiser modified observed prompt tokens')
   finally:
@@ -370,6 +487,250 @@ def sample_from_initial_state(
     if original_structured_backbone_output is not None:
       model._structured_backbone_output = original_structured_backbone_output
   return x, measured_nfe
+
+
+@torch.no_grad()
+def sample_from_initial_state(
+    model,
+    initial_tokens: torch.Tensor,
+    *,
+    nfe_budget: int,
+    eps: float = 1e-5,
+) -> tuple[torch.Tensor, int]:
+  """Sample without trajectory capture; this is the ordinary harness path."""
+  return _sample_from_initial_state(
+    model,
+    initial_tokens,
+    nfe_budget=nfe_budget,
+    eps=eps)
+
+
+@torch.no_grad()
+def sample_trajectory_from_initial_state(
+    model,
+    initial_tokens: torch.Tensor,
+    *,
+    nfe_budget: int,
+    snapshot_call_indices: Iterable[int],
+    eps: float = 1e-5,
+) -> tuple[torch.Tensor, int, dict[str, Any]]:
+  """Sample once and capture selected states from that single NFE run.
+
+  Model-call index zero and the actual final state are always captured.  Other
+  states are selected by the number of model calls completed, not by loop
+  iteration or by a state from a separately sampled NFE budget.  If structured
+  sampling resolves every mask early, a requested index beyond the measured
+  NFE is reported as missing rather than synthesized.
+  """
+  recorder = _TrajectoryRecorder(
+    initial_tokens=initial_tokens,
+    mask_token_id=model.mask_index,
+    requested_call_indices=snapshot_call_indices)
+  generated, measured_nfe = _sample_from_initial_state(
+    model,
+    initial_tokens,
+    nfe_budget=nfe_budget,
+    eps=eps,
+    trajectory_recorder=recorder)
+  captured = {
+    int(snapshot['model_call_index']) for snapshot in recorder.snapshots
+  }
+  return generated, measured_nfe, {
+    'schema_version': 1,
+    'trajectory_scope': 'single_nfe_run',
+    'mask_token_id': int(model.mask_index),
+    'batch_size': int(initial_tokens.shape[0]),
+    'sequence_length': int(initial_tokens.shape[1]),
+    'requested_nfe_budget': int(nfe_budget),
+    'measured_nfe': int(measured_nfe),
+    'snapshot_call_indices_requested': list(
+      recorder.requested_call_indices),
+    'snapshot_call_indices_captured': sorted(captured),
+    'snapshot_call_indices_missing': [
+      value for value in recorder.requested_call_indices
+      if value not in captured
+    ],
+    'snapshots': recorder.snapshots,
+  }
+
+
+def _validate_exact_replay_records(
+    samples: Sequence[PairedSampleSpec],
+    expected_records: Sequence[dict[str, Any]],
+    *,
+    sampling_mode: str,
+    nfe_budget: int,
+) -> tuple[int, list[list[int]], int]:
+  """Fail closed unless records identify the complete ordered source batch."""
+  if not samples:
+    raise ValueError('trajectory replay requires a non-empty source batch')
+  if len(expected_records) != len(samples):
+    raise ValueError(
+      'trajectory replay must receive every record from the original batch')
+  expected_batch_seed = batch_seed(samples)
+  expected_final_token_ids = []
+  expected_measured_nfe = None
+  for row_index, (sample, record) in enumerate(zip(samples, expected_records)):
+    context = f'expected_records[{row_index}]'
+    if not isinstance(record, dict):
+      raise TypeError(f'{context} must be an object')
+    identity = {
+      'sample_index': sample.sample_index,
+      'pair_key': sample.pair_key,
+      'pair_seed': sample.pair_seed,
+      'prompt_id': sample.prompt.prompt_id,
+      'prompt_metadata': sample.prompt.metadata,
+      'initial_token_ids': list(sample.prompt.initial_token_ids),
+      'active_mask': list(sample.prompt.active_mask),
+      'reference_token_ids': (
+        list(sample.prompt.reference_token_ids)
+        if sample.prompt.reference_token_ids is not None else None),
+    }
+    for field, value in identity.items():
+      if record.get(field) != value:
+        raise ValueError(
+          f'{context}.{field} does not match the ordered source batch')
+    if record.get('sampling_mode') != sampling_mode:
+      raise ValueError(f'{context}.sampling_mode does not match replay mode')
+    if record.get('requested_nfe_budget') != int(nfe_budget):
+      raise ValueError(
+        f'{context}.requested_nfe_budget does not match replay budget')
+    if record.get('batch_seed') != expected_batch_seed:
+      raise ValueError(
+        f'{context}.batch_seed does not match the complete source batch')
+    timing = record.get('timing')
+    if not isinstance(timing, dict):
+      raise ValueError(f'{context}.timing must identify the source batch')
+    timing_identity = {
+      'batch_seed': expected_batch_seed,
+      'batch_size': len(samples),
+      'requested_nfe_budget': int(nfe_budget),
+    }
+    for field, value in timing_identity.items():
+      if timing.get(field) != value:
+        raise ValueError(
+          f'{context}.timing.{field} does not match the source batch')
+    measured_nfe = record.get('measured_nfe')
+    if (isinstance(measured_nfe, bool)
+        or not isinstance(measured_nfe, int)
+        or measured_nfe < 0):
+      raise ValueError(f'{context}.measured_nfe must be non-negative integer')
+    if timing.get('measured_nfe') != measured_nfe:
+      raise ValueError(
+        f'{context}.timing.measured_nfe does not match its record')
+    if expected_measured_nfe is None:
+      expected_measured_nfe = measured_nfe
+    elif measured_nfe != expected_measured_nfe:
+      raise ValueError('measured_nfe differs within the source batch')
+    final_tokens = record.get('sample_token_ids')
+    if (not isinstance(final_tokens, list)
+        or len(final_tokens) != len(sample.prompt.initial_token_ids)
+        or any(isinstance(token, bool) or not isinstance(token, int)
+               for token in final_tokens)):
+      raise ValueError(
+        f'{context}.sample_token_ids must be a full integer token row')
+    expected_final_token_ids.append([int(token) for token in final_tokens])
+  assert expected_measured_nfe is not None
+  return expected_batch_seed, expected_final_token_ids, expected_measured_nfe
+
+
+@torch.no_grad()
+def replay_sampling_group_trajectory(
+    model,
+    samples: Sequence[PairedSampleSpec],
+    *,
+    sampling_mode: str,
+    nfe_budget: int,
+    expected_records: Sequence[dict[str, Any]],
+    snapshot_call_indices: Iterable[int],
+    device: torch.device,
+) -> dict[str, Any]:
+  """Exactly replay one complete original batch and capture its trajectory.
+
+  The original ordered batch is provenance-critical because ``batch_seed`` is
+  a commitment to every pair in that order.  The replay refuses partial,
+  reordered, or differently configured records and raises unless its final raw
+  token ids and measured NFE exactly match the persisted source records.
+  """
+  if sampling_mode not in SAMPLING_MODES:
+    raise ValueError(f'unsupported sampling mode {sampling_mode!r}')
+  if not samples:
+    raise ValueError('trajectory replay requires a non-empty source batch')
+  if torch.device(model.device) != torch.device(device):
+    raise ValueError('replay device must match model.device')
+  lengths = {len(item.prompt.initial_token_ids) for item in samples}
+  if len(lengths) != 1:
+    raise ValueError('all prompts in a replay batch must have equal length')
+  rng_seed, expected_final, expected_measured_nfe = (
+    _validate_exact_replay_records(
+      samples,
+      expected_records,
+      sampling_mode=sampling_mode,
+      nfe_budget=nfe_budget))
+  initial = torch.tensor(
+    [item.prompt.initial_token_ids for item in samples],
+    dtype=torch.long,
+    device=device)
+  declared_active = torch.tensor(
+    [item.prompt.active_mask for item in samples],
+    dtype=torch.bool,
+    device=device)
+  if not torch.equal(initial.eq(model.mask_index), declared_active):
+    raise ValueError(
+      'initial mask tokens do not exactly match the declared active masks')
+
+  previous_sampling_mode = model.structured_sampling_mode
+  model.structured_sampling_mode = sampling_mode
+  seed_everything(rng_seed, device)
+  try:
+    generated, measured_nfe, trajectory = (
+      sample_trajectory_from_initial_state(
+        model,
+        initial,
+        nfe_budget=nfe_budget,
+        snapshot_call_indices=snapshot_call_indices))
+  finally:
+    model.structured_sampling_mode = previous_sampling_mode
+
+  actual_final = [
+    [int(token) for token in row]
+    for row in generated.detach().to('cpu').tolist()
+  ]
+  if measured_nfe != expected_measured_nfe:
+    raise AssertionError(
+      'exact trajectory replay measured NFE mismatch: '
+      f'expected {expected_measured_nfe}, found {measured_nfe}')
+  if actual_final != expected_final:
+    mismatch_rows = [
+      index for index, (actual, expected) in enumerate(
+        zip(actual_final, expected_final))
+      if actual != expected
+    ]
+    raise AssertionError(
+      'exact trajectory replay final token-id mismatch in batch rows '
+      f'{mismatch_rows}')
+
+  trajectory.update({
+    'artifact_type': 'exact_batch_generation_trajectory',
+    'sampling_mode': sampling_mode,
+    'batch_seed': int(rng_seed),
+    'batch_size': len(samples),
+    'batch_pairing_digest': pairing_digest(samples),
+    'batch_order': [
+      {
+        'batch_row_index': row_index,
+        'sample_index': sample.sample_index,
+        'pair_key': sample.pair_key,
+        'pair_seed': sample.pair_seed,
+        'prompt_id': sample.prompt.prompt_id,
+      }
+      for row_index, sample in enumerate(samples)
+    ],
+    'expected_final_token_ids': expected_final,
+    'final_token_ids': actual_final,
+    'final_token_ids_match_expected': True,
+  })
+  return trajectory
 
 
 def _active_values(values: Sequence[int], mask: Sequence[bool]) -> list[int]:

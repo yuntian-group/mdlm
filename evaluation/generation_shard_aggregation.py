@@ -42,7 +42,8 @@ from evaluation.prompt_provenance import (
 EXPERIMENT = 'paired_contextual_forest_generation_pilot'
 PAIRING_DIGEST_ALGORITHM = 'sha256-canonical-json-v2-prompt-metadata'
 SUPPORTED_SAMPLING_MODES = {
-  'factorized', 'structured_marginal', 'structured_joint',
+  'factorized', 'factorized_confidence_gated',
+  'structured_marginal', 'structured_joint',
 }
 CONTROL_MODES = {
   'dynamic_dynamic': ('dynamic', 'dynamic'),
