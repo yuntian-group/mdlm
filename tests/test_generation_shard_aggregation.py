@@ -909,10 +909,29 @@ class GenerationAdapterComparisonTest(unittest.TestCase):
     self.protocol_patch.stop()
     self.temporary.cleanup()
 
+  def _aggregated_unions(self, *, bootstrap_resamples: int):
+    baseline = aggregate_generation_shards(
+      self.static,
+      baseline_mode='structured_joint',
+      bootstrap_resamples=bootstrap_resamples,
+      bootstrap_seed=117,
+      timestamp_utc='2026-08-30T02:59:00+00:00')
+    treatment = aggregate_generation_shards(
+      self.dynamic,
+      baseline_mode='factorized',
+      bootstrap_resamples=bootstrap_resamples,
+      bootstrap_seed=217,
+      timestamp_utc='2026-08-30T02:59:00+00:00')
+    return baseline, treatment
+
   def test_reloads_both_unions_and_computes_paired_adapter_intervals(self):
+    baseline_union, treatment_union = self._aggregated_unions(
+      bootstrap_resamples=40)
     result = generation_adapter_comparison.compare_generation_adapters(
       self.static,
       self.dynamic,
+      baseline_union=baseline_union,
+      treatment_union=treatment_union,
       bootstrap_resamples=40,
       bootstrap_seed=17,
       timestamp_utc='2026-08-30T03:00:00+00:00')
@@ -952,6 +971,13 @@ class GenerationAdapterComparisonTest(unittest.TestCase):
       'joint_vs_independent_structured_marginals_at_fixed_nfe')
     self.assertEqual(
       result['timing'][0]['inferential_status'], 'descriptive_only')
+    self.assertEqual(
+      result['verified_unions']['baseline_static_static']['canonical_sha256'],
+      canonical_sha256(baseline_union))
+    self.assertEqual(
+      result['verified_unions']['treatment_dynamic_dynamic'][
+        'canonical_sha256'],
+      canonical_sha256(treatment_union))
 
   def test_rejects_cross_arm_prompt_or_unallowed_config_drift(self):
     for shard in self.static:
@@ -959,9 +985,15 @@ class GenerationAdapterComparisonTest(unittest.TestCase):
       manifest['prompts']['manifest_sha256'] = 'f' * 64
       manifest['prompts']['bundle_identity']['manifest_sha256'] = 'f' * 64
       _write_manifest(shard, manifest)
+    baseline_union, treatment_union = self._aggregated_unions(
+      bootstrap_resamples=5)
     with self.assertRaisesRegex(ValueError, 'cross_adapter_identity.prompts'):
       generation_adapter_comparison.compare_generation_adapters(
-        self.static, self.dynamic, bootstrap_resamples=5)
+        self.static,
+        self.dynamic,
+        baseline_union=baseline_union,
+        treatment_union=treatment_union,
+        bootstrap_resamples=5)
 
     self.static = _write_shards(
       self.root / 'static-config-drift', control='static_static',
@@ -974,10 +1006,16 @@ class GenerationAdapterComparisonTest(unittest.TestCase):
       manifest = _read_manifest(shard)
       manifest['outputs']['resolved_config']['sha256'] = _sha256(config_path)
       _write_manifest(shard, manifest)
+    baseline_union, treatment_union = self._aggregated_unions(
+      bootstrap_resamples=5)
     with self.assertRaisesRegex(
         ValueError, 'resolved_config_after_allowed_fields'):
       generation_adapter_comparison.compare_generation_adapters(
-        self.static, self.dynamic, bootstrap_resamples=5)
+        self.static,
+        self.dynamic,
+        baseline_union=baseline_union,
+        treatment_union=treatment_union,
+        bootstrap_resamples=5)
 
 
 if __name__ == '__main__':

@@ -162,6 +162,8 @@ def build_post_bundle(
     comparison = compare_fn(
       static_shards,
       dynamic_shards,
+      baseline_union=static,
+      treatment_union=dynamic,
       bootstrap_resamples=BOOTSTRAP_RESAMPLES,
       bootstrap_seed=COMPARISON_BOOTSTRAP_SEED,
       bootstrap_confidence=BOOTSTRAP_CONFIDENCE)

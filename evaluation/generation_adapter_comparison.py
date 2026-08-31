@@ -24,7 +24,6 @@ from evaluation.generation_protocol import validate_generation_protocol
 from evaluation.generation_shard_aggregation import (
   _assert_equivalent,
   _comparison,
-  aggregate_generation_shards,
   canonical_sha256,
   load_generation_shard,
 )
@@ -210,6 +209,23 @@ def _selected_records_from_loaded(
   return records
 
 
+def _expected_union_input_shards(
+    shards: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+  """Reconstruct the exact raw-shard commitments stored by aggregation."""
+  return [
+    {
+      'shard_index': shard['manifest']['pairing']['shard_index'],
+      'manifest_path': str(shard['manifest_path']),
+      'manifest_sha256': shard['manifest_sha256'],
+      'samples_sha256': shard['manifest']['outputs']['samples_jsonl']['sha256'],
+      'num_records': shard['manifest']['matrix']['num_output_records'],
+    }
+    for shard in sorted(
+      shards, key=lambda item: item['manifest']['pairing']['shard_index'])
+  ]
+
+
 def _records_at_budget(
     records: Sequence[Mapping[str, Any]], budget: int,
 ) -> list[Mapping[str, Any]]:
@@ -284,27 +300,25 @@ def compare_generation_adapters(
     baseline_shards: Sequence[Path],
     treatment_shards: Sequence[Path],
     *,
+    baseline_union: Mapping[str, Any],
+    treatment_union: Mapping[str, Any],
     bootstrap_resamples: int = 20_000,
     bootstrap_seed: int = 94001,
     bootstrap_confidence: float = 0.95,
     timestamp_utc: str | None = None,
 ) -> dict[str, Any]:
-  """Verify and compare the frozen static and dynamic paper-scale arms."""
+  """Verify and compare arms bound to their once-aggregated union payloads."""
   created = timestamp_utc or dt.datetime.now(dt.timezone.utc).isoformat()
-  baseline_union = aggregate_generation_shards(
-    baseline_shards,
-    baseline_mode='structured_joint',
-    bootstrap_resamples=bootstrap_resamples,
-    bootstrap_seed=bootstrap_seed + 100_000,
-    bootstrap_confidence=bootstrap_confidence,
-    timestamp_utc=created)
-  treatment_union = aggregate_generation_shards(
-    treatment_shards,
-    baseline_mode='factorized',
-    bootstrap_resamples=bootstrap_resamples,
-    bootstrap_seed=bootstrap_seed + 200_000,
-    bootstrap_confidence=bootstrap_confidence,
-    timestamp_utc=created)
+  if not isinstance(baseline_union, Mapping):
+    raise TypeError('baseline_union must be a verified union payload')
+  if not isinstance(treatment_union, Mapping):
+    raise TypeError('treatment_union must be a verified union payload')
+  for name, union in (
+      ('baseline_union', baseline_union),
+      ('treatment_union', treatment_union)):
+    if (union.get('schema_version') != 1
+        or union.get('artifact') != 'verified_generation_shard_union'):
+      raise ValueError(f'{name} has an unsupported union identity')
 
   baseline_records, baseline_loaded = _load_selected_records(
     baseline_shards, mode='structured_joint')
@@ -314,6 +328,14 @@ def compare_generation_adapters(
     treatment_loaded, mode='factorized')
   treatment_marginal_records = _selected_records_from_loaded(
     treatment_loaded, mode='structured_marginal')
+  _assert_equivalent(
+    baseline_union.get('input_shards'),
+    _expected_union_input_shards(baseline_loaded),
+    context='baseline_union.input_shards')
+  _assert_equivalent(
+    treatment_union.get('input_shards'),
+    _expected_union_input_shards(treatment_loaded),
+    context='treatment_union.input_shards')
   baseline_manifest = baseline_loaded[0]['manifest']
   treatment_manifest = treatment_loaded[0]['manifest']
 

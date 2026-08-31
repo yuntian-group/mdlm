@@ -503,16 +503,28 @@ class CrossDomainPostBundleTest(unittest.TestCase):
       for slug in ('arxiv', 'pubmed'):
         root = base / slug
         controller = self._controller(root, slug, gate)
-        dynamic, static, comparison = self._analysis_payloads(
+        dynamic, static, _ = self._analysis_payloads(
           controller, slug)
 
         def aggregate(_shards, *, baseline_mode, **_kwargs):
           return dynamic if baseline_mode == 'factorized' else static
 
+        comparison_calls = []
+
+        def compare(
+            _baseline_shards, _treatment_shards, *,
+            baseline_union, treatment_union, **_kwargs):
+          self.assertIs(baseline_union, static)
+          self.assertIs(treatment_union, dynamic)
+          comparison_calls.append((baseline_union, treatment_union))
+          return _comparison(
+            DATASET_CONTRACTS[slug], treatment_union, baseline_union)
+
         bundle_path, bundle_sha = build_post_bundle(
           controller,
           aggregate_fn=aggregate,
-          compare_fn=lambda *_args, **_kwargs: comparison)
+          compare_fn=compare)
+        self.assertEqual(len(comparison_calls), 1)
         validated = validate_cross_domain_post_bundle(
           bundle_path, expected_sha256=bundle_sha,
           controller_repo_root=self.controller_repo)
@@ -527,8 +539,7 @@ class CrossDomainPostBundleTest(unittest.TestCase):
            / POST_BUNDLE_DIRECTORY).is_dir())
         with self.assertRaisesRegex(QueueFailure, 'refusing to overwrite'):
           build_post_bundle(
-            controller, aggregate_fn=aggregate,
-            compare_fn=lambda *_args, **_kwargs: comparison)
+            controller, aggregate_fn=aggregate, compare_fn=compare)
 
   def test_missing_completion_marker_prevents_aggregation_or_staging(self):
     with tempfile.TemporaryDirectory() as directory:
@@ -581,6 +592,33 @@ class CrossDomainPostBundleTest(unittest.TestCase):
       dynamic_path = bundle_path.parent / 'verified-dynamic-union.json'
       dynamic_path.write_text(dynamic_path.read_text() + ' ')
       with self.assertRaisesRegex(GenerationArtifactError, 'SHA256 mismatch'):
+        validate_cross_domain_post_bundle(
+          bundle_path, controller_repo_root=self.controller_repo)
+
+  def test_rehashed_nonprojected_union_tampering_fails_canonical_binding(self):
+    with tempfile.TemporaryDirectory() as directory:
+      root = Path(directory)
+      gate = self._gate(root / 'gate-inputs')
+      controller = self._controller(root, 'arxiv', gate)
+      dynamic, static, comparison = self._analysis_payloads(
+        controller, 'arxiv')
+      bundle_path, _ = build_post_bundle(
+        controller,
+        aggregate_fn=lambda _shards, *, baseline_mode, **_kwargs: (
+          dynamic if baseline_mode == 'factorized' else static),
+        compare_fn=lambda *_args, **_kwargs: comparison)
+
+      static_path = bundle_path.parent / 'verified-static-union.json'
+      tampered_static = json.loads(static_path.read_text())
+      tampered_static['scope_note'] = 'rehashed non-projected tampering'
+      _write_json(static_path, tampered_static)
+      bundle = json.loads(bundle_path.read_text())
+      bundle['artifacts']['static_union']['sha256'] = sha256_file(static_path)
+      _write_json(bundle_path, bundle)
+
+      with self.assertRaisesRegex(
+          GenerationArtifactError,
+          'canonical hash differs from baseline_static_static union'):
         validate_cross_domain_post_bundle(
           bundle_path, controller_repo_root=self.controller_repo)
 

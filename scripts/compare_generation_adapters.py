@@ -17,6 +17,9 @@ if str(REPO_ROOT) not in sys.path:
 from evaluation.generation_adapter_comparison import (  # noqa: E402
   compare_generation_adapters,
 )
+from evaluation.generation_queue_artifacts import (  # noqa: E402
+  load_strict_json,
+)
 
 
 def _parse_args(argv=None) -> argparse.Namespace:
@@ -30,6 +33,12 @@ def _parse_args(argv=None) -> argparse.Namespace:
   parser.add_argument(
     '--treatment-shard', action='append', type=Path, required=True,
     help='Dynamic-treatment shard directory; repeat for all 16 shards.')
+  parser.add_argument(
+    '--baseline-union', type=Path, required=True,
+    help='Exact serialized static union payload to bind in the comparison.')
+  parser.add_argument(
+    '--treatment-union', type=Path, required=True,
+    help='Exact serialized dynamic union payload to bind in the comparison.')
   parser.add_argument('--output', type=Path, required=True)
   parser.add_argument('--bootstrap-resamples', type=int, default=20_000)
   parser.add_argument('--bootstrap-seed', type=int, default=94_001)
@@ -53,9 +62,13 @@ def _atomic_write(path: Path, content: str) -> None:
 
 def main(argv=None) -> int:
   args = _parse_args(argv)
+  baseline_union = load_strict_json(args.baseline_union)
+  treatment_union = load_strict_json(args.treatment_union)
   result = compare_generation_adapters(
     args.baseline_shard,
     args.treatment_shard,
+    baseline_union=baseline_union,
+    treatment_union=treatment_union,
     bootstrap_resamples=args.bootstrap_resamples,
     bootstrap_seed=args.bootstrap_seed,
     bootstrap_confidence=args.bootstrap_confidence)
