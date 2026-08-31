@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 from scripts.aggregate_hierarchical_document_eval import (
   _expected_record_count,
@@ -10,6 +11,7 @@ from scripts.aggregate_hierarchical_document_eval import (
   _record_cross_cell_dataset_provenance,
   _validated_analysis_marker,
   aggregate_records,
+  load_plan_records,
   validate_record,
 )
 from scripts.run_compiled_job import _job_digest, _job_execution_digest
@@ -90,6 +92,24 @@ def _wiki_provenance(processed_num_sequences=197):
 
 
 class HierarchicalDocumentEvaluationTest(unittest.TestCase):
+
+  def test_public_record_loader_is_strict_and_has_no_escape_hatch(self):
+    sentinel = RuntimeError('stop after checking forwarded arguments')
+    with mock.patch(
+        'scripts.aggregate_hierarchical_document_eval._load_plan_records_core',
+        side_effect=sentinel) as loader:
+      with self.assertRaisesRegex(RuntimeError, 'forwarded arguments'):
+        load_plan_records(
+          Path('/tmp/plan'), manifest_path=Path('/tmp/manifest.yaml'),
+          suite_name='pilot', comparison_name='contextual-vs-static')
+      self.assertIs(
+        loader.call_args.kwargs['require_current_repository_match'], True)
+
+    with self.assertRaisesRegex(TypeError, 'unexpected keyword argument'):
+      load_plan_records(
+        Path('/tmp/plan'), manifest_path=Path('/tmp/manifest.yaml'),
+        suite_name='pilot', comparison_name='contextual-vs-static',
+        require_current_repository_match=False)
 
   def _legacy_job(self, root):
     return {
@@ -206,6 +226,23 @@ class HierarchicalDocumentEvaluationTest(unittest.TestCase):
     self.assertEqual(bootstrap['num_strata'], 4)
     self.assertIn('average corruption replications', bootstrap['nesting'][0])
     self.assertIn('no diffusion ELBO', result['scope_note'])
+
+  def test_candidate_k_base_seed_produces_frozen_final_seed(self):
+    records = _records()
+    for row in records:
+      row['candidate_k'] = 128
+    result = aggregate_records(
+      records,
+      baseline_arm='static_static',
+      treatment_arm='dynamic_dynamic',
+      protocol_id='contextual-forest-expansion-v1',
+      suite_name='candidate_k_128_pilot',
+      comparison_name='contextual-vs-static',
+      num_resamples=10,
+      rng_seed=1701,
+      confidence_level=0.95,
+      timestamp_utc='2026-08-30T00:00:00+00:00')
+    self.assertEqual(result['by_candidate_k']['128']['rng_seed'], 1829)
 
   def test_rejects_pairing_digest_mismatch_across_training_seeds(self):
     rows = _records()

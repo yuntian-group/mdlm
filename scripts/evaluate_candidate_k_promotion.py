@@ -7,8 +7,9 @@ import argparse
 import json
 import math
 from pathlib import Path
+import subprocess
 import sys
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -18,6 +19,7 @@ if str(REPO_ROOT) not in sys.path:
 from scripts.compile_experiment_matrix import (  # noqa: E402
   DEFAULT_MANIFEST,
   SLUG_PATTERN,
+  _git_metadata,
   load_and_validate_manifest,
   sha256_file,
 )
@@ -258,7 +260,34 @@ def _verify_policy_predates_source_jobs(
         f'candidate-K policy was not frozen before job {job_id} started')
 
 
-def evaluate_candidate_k_analysis(
+def _require_clean_descendant_repository(
+    source_repository_sha: str,
+    *,
+    repo_root: Path = REPO_ROOT,
+) -> None:
+  """Require replay code to be a clean descendant of the frozen source."""
+  source_repository_sha = _lower_hex(
+    source_repository_sha, 40, context='source repository SHA')
+  repo_root = repo_root.expanduser().resolve()
+  current = _git_metadata(repo_root)
+  if current.get('dirty') is not False:
+    raise ValueError(
+      'historical candidate replay requires a clean current repository')
+  current_sha = _lower_hex(
+    current.get('sha'), 40, context='current repository SHA')
+  check = subprocess.run(
+    ['git', 'merge-base', '--is-ancestor', source_repository_sha, current_sha],
+    cwd=repo_root,
+    check=False,
+    capture_output=True,
+    text=True)
+  if check.returncode != 0:
+    raise ValueError(
+      'historical candidate replay requires a current checkout descended '
+      f'from source revision {source_repository_sha}')
+
+
+def _evaluate_candidate_k_analysis_core(
     policy: Mapping[str, Any],
     analysis: Mapping[str, Any],
     *,
@@ -269,6 +298,7 @@ def evaluate_candidate_k_analysis(
     source_plan_sha256: str,
     manifest_path: Path = DEFAULT_MANIFEST,
     created_utc: str | None = None,
+    authoritative_verifier: Callable[..., dict[str, Any]],
 ) -> dict[str, Any]:
   _lower_hex(policy_sha256, 64, context='policy_sha256')
   _lower_hex(analysis_sha256, 64, context='analysis_sha256')
@@ -279,7 +309,7 @@ def evaluate_candidate_k_analysis(
   validated_plan = _validate_source_plan(
     policy, source_plan, source_plan_sha256=source_plan_sha256)
   conditions, diagnostics = _validate_analysis_contract(policy, analysis)
-  verified_integrity = _verify_authoritative_analysis(
+  verified_integrity = authoritative_verifier(
     policy,
     analysis,
     source_plan=source_plan,
@@ -503,6 +533,179 @@ def evaluate_candidate_k_analysis(
   }
 
 
+def evaluate_candidate_k_analysis(
+    policy: Mapping[str, Any],
+    analysis: Mapping[str, Any],
+    *,
+    policy_sha256: str,
+    analysis_sha256: str,
+    source_plan: Mapping[str, Any],
+    source_plan_path: Path,
+    source_plan_sha256: str,
+    manifest_path: Path = DEFAULT_MANIFEST,
+    created_utc: str | None = None,
+) -> dict[str, Any]:
+  """Evaluate candidate K only from its exact current source checkout."""
+  return _evaluate_candidate_k_analysis_core(
+    policy,
+    analysis,
+    policy_sha256=policy_sha256,
+    analysis_sha256=analysis_sha256,
+    source_plan=source_plan,
+    source_plan_path=source_plan_path,
+    source_plan_sha256=source_plan_sha256,
+    manifest_path=manifest_path,
+    created_utc=created_utc,
+    authoritative_verifier=_verify_authoritative_analysis)
+
+
+def _verify_historical_candidate_authoritative_analysis(
+    policy: Mapping[str, Any],
+    analysis: Mapping[str, Any],
+    *,
+    source_plan: Mapping[str, Any],
+    source_plan_path: Path,
+    source_plan_sha256: str,
+    manifest_path: Path,
+    trusted_policy_path: Path,
+    trusted_analysis_path: Path,
+    trusted_template_path: Path = DEFAULT_TEMPLATE,
+    repo_root: Path = REPO_ROOT,
+) -> dict[str, Any]:
+  """Authenticate and replay one historical candidate-K source plan.
+
+  This is the only caller allowed to bypass current-checkout equality. It
+  independently reloads the policy, analysis, and plan and validates them
+  against the repository's trusted candidate template and manifest before it
+  reaches the private record-loader core. No generic verifier receives an
+  opt-out flag.
+  """
+  trusted_template_path = trusted_template_path.expanduser().resolve()
+  manifest_path = manifest_path.expanduser().resolve()
+  repo_root = repo_root.expanduser().resolve()
+  if trusted_template_path != DEFAULT_TEMPLATE.resolve():
+    raise ValueError('historical candidate replay requires DEFAULT_TEMPLATE')
+  if manifest_path != DEFAULT_MANIFEST.resolve():
+    raise ValueError('historical candidate replay requires DEFAULT_MANIFEST')
+  if repo_root != REPO_ROOT.resolve():
+    raise ValueError('historical candidate replay requires the trusted repo')
+
+  trusted_policy_path = trusted_policy_path.expanduser().resolve()
+  trusted_analysis_path = trusted_analysis_path.expanduser().resolve()
+  source_plan_path = source_plan_path.expanduser().resolve()
+  validated_policy = load_and_validate_candidate_k_policy(
+    trusted_policy_path,
+    template_path=DEFAULT_TEMPLATE,
+    manifest_path=DEFAULT_MANIFEST,
+    repo_root=REPO_ROOT)
+  if validated_policy != dict(policy):
+    raise ValueError(
+      'candidate-K policy mapping differs from the trusted policy artifact')
+  trusted_analysis = _read_mapping(
+    trusted_analysis_path, context='trusted candidate-K analysis')
+  if trusted_analysis != dict(analysis):
+    raise ValueError(
+      'candidate-K analysis mapping differs from the trusted artifact')
+  trusted_plan = _read_mapping(
+    source_plan_path, context='trusted candidate-K source plan')
+  if trusted_plan != dict(source_plan):
+    raise ValueError(
+      'candidate-K source-plan mapping differs from the trusted artifact')
+  if sha256_file(source_plan_path) != source_plan_sha256:
+    raise ValueError('candidate-K source-plan bytes changed before replay')
+  if source_plan_path != Path(
+      str(validated_policy['source_plan']['path'])).expanduser().resolve():
+    raise ValueError('candidate-K source-plan path differs from trusted policy')
+  validated_plan = _validate_source_plan(
+    validated_policy, trusted_plan, source_plan_sha256=source_plan_sha256)
+  _validate_analysis_contract(validated_policy, trusted_analysis)
+  _require_clean_descendant_repository(
+    validated_policy['analysis_contract']['source_repository_sha'],
+    repo_root=REPO_ROOT)
+  _verify_policy_predates_source_jobs(
+    validated_policy, validated_plan, plan_dir=source_plan_path.parent)
+
+  from scripts.aggregate_hierarchical_document_eval import (  # pylint: disable=import-outside-toplevel
+    _load_plan_records_core,
+    aggregate_records,
+    bind_analysis_to_source,
+  )
+  contract = validated_policy['analysis_contract']
+  records, context = _load_plan_records_core(
+    source_plan_path.parent,
+    manifest_path=DEFAULT_MANIFEST,
+    suite_name=validated_policy['source_suite'],
+    comparison_name=contract['comparison'],
+    expected_legacy_plan_sha256=contract['source_compiled_plan_sha256'],
+    expected_legacy_repository_sha=contract['source_repository_sha'],
+    require_current_repository_match=False,
+    repo_root=REPO_ROOT)
+  comparison = context['comparison']
+  base_seed = context['manifest']['analysis']['bootstrap_seed']
+  expected_seed = base_seed + contract['candidate_k']
+  if expected_seed != contract['bootstrap']['rng_seed']:
+    raise ValueError(
+      'candidate-K bootstrap seed binding differs from manifest base + K')
+  recomputed = aggregate_records(
+    records,
+    baseline_arm=comparison['baseline'],
+    treatment_arm=comparison['treatment'],
+    protocol_id=validated_policy['protocol_id'],
+    suite_name=validated_policy['source_suite'],
+    comparison_name=contract['comparison'],
+    num_resamples=contract['bootstrap']['num_resamples'],
+    # aggregate_records domain-separates candidate supports by adding K.
+    rng_seed=base_seed,
+    confidence_level=contract['bootstrap']['confidence_level'],
+    timestamp_utc=trusted_analysis['created_utc'])
+  recomputed = bind_analysis_to_source(recomputed, context)
+  if recomputed != trusted_analysis:
+    raise ValueError(
+      'analysis differs from deterministic recomputation of the '
+      'historical marker-bound source records')
+  return context['source_integrity']
+
+
+def _evaluate_trusted_historical_candidate_k_analysis(
+    *,
+    policy_path: Path,
+    analysis_path: Path,
+    source_plan_path: Path,
+    trusted_template_path: Path = DEFAULT_TEMPLATE,
+    manifest_path: Path = DEFAULT_MANIFEST,
+    repo_root: Path = REPO_ROOT,
+    created_utc: str | None = None,
+) -> dict[str, Any]:
+  """Evaluate an authenticated candidate-K artifact from a descendant tree."""
+  policy_path = policy_path.expanduser().resolve()
+  analysis_path = analysis_path.expanduser().resolve()
+  source_plan_path = source_plan_path.expanduser().resolve()
+  policy = _read_mapping(policy_path, context='candidate-K policy')
+  analysis = _read_mapping(analysis_path, context='candidate-K analysis')
+  source_plan = _read_mapping(source_plan_path, context='candidate-K plan')
+
+  def historical_verifier(*args, **kwargs):
+    return _verify_historical_candidate_authoritative_analysis(
+      *args,
+      **kwargs,
+      trusted_policy_path=policy_path,
+      trusted_analysis_path=analysis_path,
+      trusted_template_path=trusted_template_path,
+      repo_root=repo_root)
+
+  return _evaluate_candidate_k_analysis_core(
+    policy,
+    analysis,
+    policy_sha256=sha256_file(policy_path),
+    analysis_sha256=sha256_file(analysis_path),
+    source_plan=source_plan,
+    source_plan_path=source_plan_path,
+    source_plan_sha256=sha256_file(source_plan_path),
+    manifest_path=manifest_path,
+    created_utc=created_utc,
+    authoritative_verifier=historical_verifier)
+
+
 def build_candidate_compiler_evidence(
     decision: Mapping[str, Any],
     route_name: str,
@@ -582,25 +785,16 @@ def verify_candidate_compiler_evidence(
       or commitments['source_compiled_plan_sha256']
       != sha256_file(source_plan_path)):
     raise ValueError('candidate-K evidence artifact SHA mismatch')
-  policy = load_and_validate_candidate_k_policy(
-    policy_path,
-    template_path=trusted_template_path,
-    manifest_path=manifest_path,
-    repo_root=repo_root)
-  analysis = _read_mapping(analysis_path, context='candidate-K analysis')
-  source_plan = _read_mapping(source_plan_path, context='candidate-K plan')
   decision = _read_mapping(decision_path, context='candidate-K decision')
   if canonical_sha256(decision) != commitments['canonical_decision_sha256']:
     raise ValueError('candidate-K routing decision hash mismatch')
-  canonical_decision = evaluate_candidate_k_analysis(
-    policy,
-    analysis,
-    policy_sha256=sha256_file(policy_path),
-    analysis_sha256=sha256_file(analysis_path),
-    source_plan=source_plan,
+  canonical_decision = _evaluate_trusted_historical_candidate_k_analysis(
+    policy_path=policy_path,
+    analysis_path=analysis_path,
     source_plan_path=source_plan_path,
-    source_plan_sha256=sha256_file(source_plan_path),
+    trusted_template_path=trusted_template_path,
     manifest_path=manifest_path,
+    repo_root=repo_root,
     created_utc=decision.get('created_utc'))
   if decision != canonical_decision:
     raise ValueError('candidate-K decision differs from deterministic reevaluation')
@@ -628,6 +822,29 @@ def _parse_args(argv: Sequence[str] | None = None):
   return parser.parse_args(argv)
 
 
+def _validate_publication_destinations(
+    output: Path,
+    evidence_paths: Mapping[str, Path],
+) -> None:
+  """Reject decision/evidence aliases before the first publication write."""
+  destinations = {
+    'decision': output.expanduser().resolve(),
+    **{
+      f'evidence:{route_name}': path.expanduser().resolve()
+      for route_name, path in evidence_paths.items()},
+  }
+  owners_by_path: dict[Path, list[str]] = {}
+  for owner, path in destinations.items():
+    owners_by_path.setdefault(path, []).append(owner)
+  aliases = {
+    str(path): sorted(owners)
+    for path, owners in owners_by_path.items() if len(owners) > 1}
+  if aliases:
+    raise ValueError(
+      f'decision and compiler-evidence destinations must be pairwise '
+      f'distinct: {aliases}')
+
+
 def main(argv: Sequence[str] | None = None) -> int:
   args = _parse_args(argv)
   policy_path = args.policy.expanduser().resolve()
@@ -636,38 +853,32 @@ def main(argv: Sequence[str] | None = None) -> int:
   output = args.output.expanduser().resolve()
   if output.exists():
     raise FileExistsError(output)
-  policy = load_and_validate_candidate_k_policy(
-    policy_path,
-    template_path=args.template,
-    manifest_path=args.manifest)
-  analysis = _read_mapping(analysis_path, context='candidate-K analysis')
-  source_plan = _read_mapping(source_plan_path, context='candidate-K plan')
-  decision = evaluate_candidate_k_analysis(
-    policy,
-    analysis,
-    policy_sha256=sha256_file(policy_path),
-    analysis_sha256=sha256_file(analysis_path),
-    source_plan=source_plan,
+  decision = _evaluate_trusted_historical_candidate_k_analysis(
+    policy_path=policy_path,
+    analysis_path=analysis_path,
     source_plan_path=source_plan_path,
-    source_plan_sha256=sha256_file(source_plan_path),
+    trusted_template_path=args.template,
     manifest_path=args.manifest)
-  evidence_payloads = {}
   evidence_paths = {}
   if args.compiler_evidence_dir is not None:
     evidence_dir = args.compiler_evidence_dir.expanduser().resolve()
     for route_name, route in decision['routes'].items():
       if route['promote']:
-        path = evidence_dir / f'{route["target_suite"]}-promotion.json'
-        if path.exists():
-          raise FileExistsError(path)
-        evidence_paths[route_name] = path
-        evidence_payloads[route_name] = build_candidate_compiler_evidence(
-          decision,
-          route_name,
-          policy_path=policy_path,
-          analysis_path=analysis_path,
-          source_plan_path=source_plan_path,
-          decision_path=output)
+        evidence_paths[route_name] = (
+          evidence_dir / f'{route["target_suite"]}-promotion.json')
+  _validate_publication_destinations(output, evidence_paths)
+  for path in [output, *evidence_paths.values()]:
+    if path.exists():
+      raise FileExistsError(path)
+  evidence_payloads = {
+    route_name: build_candidate_compiler_evidence(
+      decision,
+      route_name,
+      policy_path=policy_path,
+      analysis_path=analysis_path,
+      source_plan_path=source_plan_path,
+      decision_path=output)
+    for route_name in evidence_paths}
   _exclusive_write_json(output, decision)
   for route_name, payload in evidence_payloads.items():
     _exclusive_write_json(evidence_paths[route_name], payload)

@@ -754,7 +754,7 @@ def _verify_authoritative_analysis(
     source_plan_sha256: str,
     manifest_path: Path,
 ) -> dict[str, Any]:
-  """Reload source artifacts and reproduce the complete aggregate exactly."""
+  """Reload source artifacts from the current checkout and recompute."""
   source_plan_path = source_plan_path.expanduser().resolve()
   if source_plan_path.name != 'compiled-plan.json' \
       or not source_plan_path.is_file():

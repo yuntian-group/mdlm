@@ -18,12 +18,17 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import sys
 from typing import Any, Iterable, Mapping, Sequence
 
 import yaml
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+  # ``python scripts/compile_experiment_matrix.py`` otherwise exposes only the
+  # scripts directory, but gated suites use package-qualified lazy imports.
+  sys.path.insert(0, str(REPO_ROOT))
 DEFAULT_MANIFEST = (
   REPO_ROOT / 'configs/experiment/contextual-forest-expansion-v1.yaml')
 DEFAULT_ALLOWED_ARTIFACT_ROOT = Path('/mnt/contextual-forest')

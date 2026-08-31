@@ -731,7 +731,7 @@ def _source_integrity_commitment(
   }
 
 
-def load_plan_records(
+def _load_plan_records_core(
     plan_dir: Path,
     *,
     manifest_path: Path,
@@ -739,13 +739,21 @@ def load_plan_records(
     comparison_name: str,
     expected_legacy_plan_sha256: str = PINNED_LEGACY_PLAN_SHA256,
     expected_legacy_repository_sha: str = PINNED_LEGACY_REPOSITORY_SHA,
+    require_current_repository_match: bool = True,
     repo_root: Path = REPO_ROOT,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+  """Private record loader supporting authenticated provenance replay.
+
+  Public callers must use :func:`load_plan_records`, which always requires the
+  source checkout. The sole relaxed caller is the candidate-K verifier after
+  it has independently authenticated the frozen policy and source artifacts.
+  """
   plan_dir = plan_dir.expanduser().resolve()
   plan, jobs, plan_sha256, legacy = _load_plan_for_analysis(
     plan_dir,
     expected_legacy_plan_sha256=expected_legacy_plan_sha256,
     expected_legacy_repository_sha=expected_legacy_repository_sha,
+    require_current_repository_match=require_current_repository_match,
     repo_root=repo_root)
   manifest_path = manifest_path.expanduser().resolve()
   if sha256_file(manifest_path) != plan['source_manifest_sha256']:
@@ -884,6 +892,28 @@ def load_plan_records(
     'comparison': comparison,
     'comparison_name': comparison_name,
   }
+
+
+def load_plan_records(
+    plan_dir: Path,
+    *,
+    manifest_path: Path,
+    suite_name: str,
+    comparison_name: str,
+    expected_legacy_plan_sha256: str = PINNED_LEGACY_PLAN_SHA256,
+    expected_legacy_repository_sha: str = PINNED_LEGACY_REPOSITORY_SHA,
+    repo_root: Path = REPO_ROOT,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+  """Load marker-bound records from the exact current source checkout."""
+  return _load_plan_records_core(
+    plan_dir,
+    manifest_path=manifest_path,
+    suite_name=suite_name,
+    comparison_name=comparison_name,
+    expected_legacy_plan_sha256=expected_legacy_plan_sha256,
+    expected_legacy_repository_sha=expected_legacy_repository_sha,
+    require_current_repository_match=True,
+    repo_root=repo_root)
 
 
 def _paired_document_matrices(

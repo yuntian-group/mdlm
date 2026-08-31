@@ -472,7 +472,7 @@ class ExperimentPromotionTest(unittest.TestCase):
       }
       with mock.patch(
           'scripts.aggregate_hierarchical_document_eval.load_plan_records',
-          return_value=([], context)), mock.patch(
+          return_value=([], context)) as loader, mock.patch(
           'scripts.aggregate_hierarchical_document_eval.aggregate_records',
           return_value={'schema_version': 1}), mock.patch(
           'scripts.aggregate_hierarchical_document_eval.bind_analysis_to_source',
@@ -485,6 +485,15 @@ class ExperimentPromotionTest(unittest.TestCase):
           source_plan_path=plan_path,
           source_plan_sha256=sha256_file(plan_path),
           manifest_path=DEFAULT_MANIFEST)
+      self.assertNotIn(
+        'require_current_repository_match', loader.call_args.kwargs)
+
+  def test_authoritative_verifier_has_no_repository_match_escape_hatch(self):
+    with self.assertRaisesRegex(TypeError, 'unexpected keyword argument'):
+      _verify_authoritative_analysis(
+        {}, {}, source_plan={}, source_plan_path=Path('/tmp/missing.json'),
+        source_plan_sha256='a' * 64, manifest_path=DEFAULT_MANIFEST,
+        require_current_repository_match=0)
 
   def test_ineligible_route_cannot_emit_evidence(self):
     decision = self._evaluate(_analysis(
