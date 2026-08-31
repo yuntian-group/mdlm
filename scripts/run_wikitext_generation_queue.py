@@ -17,13 +17,27 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+import datetime as dt
 import hashlib
 import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import time
 from typing import Callable, Sequence
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+  sys.path.insert(0, str(REPO_ROOT))
+
+from evaluation.generation_queue_artifacts import (  # noqa: E402
+  SharedQueueLock,
+  atomic_write_new,
+  canonical_sha256,
+  load_strict_json,
+  sha256_file,
+)
 
 
 IMMUTABLE_RUNNER_GIT_SHA = '09f89c00bbf8c65f679cd40b92609754608817b8'
@@ -46,6 +60,14 @@ SEQUENCE_LENGTH = 256
 BATCH_SIZE = 8
 NFE_BUDGETS = (8, 16, 32, 64)
 CANDIDATE_TOP_K = 128
+LAUNCH_PLAN_SCHEMA_VERSION = 1
+LAUNCH_PLAN_POLICY_ID = 'frozen-generation-queue-launch-plan-v1'
+# Filled from the path-normalized, complete plan payload.  Unlike a comparison
+# against a task reconstructed by the same mutable object, this commitment
+# catches changes to ordering, paths, interpreter/script tokens, and every argv
+# value before any child is reserved or launched.
+WIKITEXT_LAUNCH_PLAN_SHA256 = (
+  '15b75cca776085608e9aa087d040544c598b793dd661bb17aa8086059d017dce')
 
 
 @dataclass(frozen=True)
@@ -273,6 +295,78 @@ def frozen_queue_plan(paths: QueuePaths = DEFAULT_PATHS) -> QueuePlan:
   )
 
 
+def _plan_path_substitutions(paths: QueuePaths):
+  raw_substitutions = (
+    (paths.python, '<PYTHON>'),
+    (paths.backbone, '<BACKBONE>'),
+    (paths.runner_repo, '<RUNNER_REPO>'),
+    (paths.experiment_root, '<EXPERIMENT_ROOT>'),
+    (paths.expansion_root, '<EXPANSION_ROOT>'),
+  )
+  return tuple(
+    (
+      str(Path(raw_path).expanduser()),
+      str(Path(raw_path).expanduser().resolve()),
+      replacement,
+    )
+    for raw_path, replacement in raw_substitutions)
+
+
+def _portable_plan_token(token: str, substitutions) -> str:
+  for raw_value, resolved_value, replacement in substitutions:
+    for value in (raw_value, resolved_value):
+      if token == value:
+        return replacement
+      prefix = f'{value}{os.sep}'
+      if token.startswith(prefix):
+        return f'{replacement}/{token[len(prefix):]}'
+  return token
+
+
+def launch_plan_payload(plan: QueuePlan) -> dict[str, object]:
+  """Return the complete path-portable plan committed before launch."""
+  paths = plan.paths
+  substitutions = _plan_path_substitutions(paths)
+
+  def task_payload(task: ShardTask) -> dict[str, object]:
+    return {
+      'task_id': task.task_id,
+      'dataset_slug': task.dataset_slug,
+      'arm': task.arm.name,
+      'shard_index': task.shard_index,
+      'adopted_pid': task.adopted_pid,
+      'output_dir': _portable_plan_token(
+        str(task.output_dir.resolve()), substitutions),
+      'log_path': _portable_plan_token(
+        str(task.log_path.resolve()), substitutions),
+      'command': [
+        _portable_plan_token(token, substitutions) for token in task.command
+      ],
+    }
+
+  return {
+    'schema_version': LAUNCH_PLAN_SCHEMA_VERSION,
+    'policy_id': LAUNCH_PLAN_POLICY_ID,
+    'initial_tasks': [task_payload(task) for task in plan.initial_tasks],
+    'phases': [
+      [task_payload(task) for task in phase] for phase in plan.phases
+    ],
+  }
+
+
+def launch_plan_sha256(plan: QueuePlan) -> str:
+  return canonical_sha256(launch_plan_payload(plan))
+
+
+def _require_exact_launch_plan(plan: QueuePlan, expected_sha256: str) -> str:
+  observed = launch_plan_sha256(plan)
+  if observed != expected_sha256:
+    raise QueueFailure(
+      'queue launch plan differs from its independent frozen commitment: '
+      f'expected {expected_sha256}, found {observed}')
+  return observed
+
+
 _SCALAR_OPTIONS = {
   '--backbone-checkpoint', '--backbone-sha256', '--adapter',
   '--adapter-sha256', '--adapter-manifest', '--adapter-manifest-sha256',
@@ -327,6 +421,15 @@ def _normalize_runner_arguments(arguments: Sequence[str]) -> dict[str, object]:
     if values:
       if len(values) != len(set(values)):
         raise QueueFailure(f'runner command repeats a value for {option}')
+      if option == '--override':
+        keys = []
+        for value in values:
+          key, separator, _ = value.partition('=')
+          if not separator or not key:
+            raise QueueFailure(f'runner override lacks key=value: {value!r}')
+          keys.append(key)
+        if len(keys) != len(set(keys)):
+          raise QueueFailure('runner command repeats a Hydra override key')
       # Override order is not semantically relevant because all frozen keys
       # are distinct.  Sorting permits adoption of the existing shell argv.
       result[option] = tuple(sorted(values))
@@ -538,6 +641,11 @@ class QueueController:
       process_reader: ProcessReader = read_linux_process,
       sleep: Callable[[float], None] = time.sleep,
       popen_factory: Callable[..., subprocess.Popen] = subprocess.Popen,
+      expected_launch_plan_sha256: str = WIKITEXT_LAUNCH_PLAN_SHA256,
+      logical_dataset: str = 'wikitext103-pinned',
+      launch_authorization: dict[str, object] | None = None,
+      recover_stale_lock: bool = False,
+      lock_factory: Callable[..., SharedQueueLock] = SharedQueueLock,
   ) -> None:
     if poll_seconds <= 0:
       raise ValueError('poll_seconds must be positive')
@@ -547,8 +655,87 @@ class QueueController:
     self.process_reader = process_reader
     self.sleep = sleep
     self.popen_factory = popen_factory
+    self.expected_launch_plan_sha256 = expected_launch_plan_sha256
+    self.launch_plan_sha256 = launch_plan_sha256(plan)
+    self.logical_dataset = logical_dataset
+    self.launch_authorization = launch_authorization
+    self.recover_stale_lock = recover_stale_lock
+    self.lock_factory = lock_factory
+
+  def _all_tasks(self) -> tuple[ShardTask, ...]:
+    return (
+      *self.plan.initial_tasks,
+      *(task for phase in self.plan.phases for task in phase),
+    )
+
+  def _dataset_slug(self) -> str:
+    slugs = {task.dataset_slug for task in self._all_tasks()}
+    if len(slugs) != 1:
+      raise QueueFailure(
+        f'queue plan must carry exactly one dataset slug, found {sorted(slugs)}')
+    return next(iter(slugs))
+
+  def _completion_evidence_path(self) -> Path:
+    return (
+      self.plan.paths.experiment_root / self._dataset_slug()
+      / 'queue-complete.json')
+
+  def _completion_evidence_payload(self) -> dict[str, object]:
+    tasks = []
+    for task in self._all_tasks():
+      manifest_path = task.output_dir / 'manifest.json'
+      if not manifest_path.is_file():
+        raise QueueFailure(
+          f'{task.task_id} lacks a manifest for completion evidence')
+      tasks.append({
+        'task_id': task.task_id,
+        'dataset_slug': task.dataset_slug,
+        'arm': task.arm.name,
+        'shard_index': task.shard_index,
+        'output_dir': str(task.output_dir.resolve()),
+        'manifest_sha256': sha256_file(manifest_path),
+      })
+    return {
+      'schema_version': 1,
+      'artifact': 'frozen_generation_queue_completion',
+      'dataset_slug': self._dataset_slug(),
+      'logical_dataset': self.logical_dataset,
+      'immutable_runner_git_sha': IMMUTABLE_RUNNER_GIT_SHA,
+      'launch_plan_sha256': self.launch_plan_sha256,
+      'launch_authorization': self.launch_authorization,
+      'num_tasks': len(tasks),
+      'tasks': tasks,
+      'completed_utc': dt.datetime.now(dt.timezone.utc).isoformat(),
+    }
+
+  def _write_or_validate_completion_evidence(self) -> tuple[Path, str]:
+    path = self._completion_evidence_path()
+    expected = self._completion_evidence_payload()
+    if path.exists():
+      try:
+        observed = load_strict_json(path)
+      except (OSError, TypeError, ValueError) as error:
+        raise QueueFailure(
+          f'cannot validate existing queue completion evidence {path}') \
+          from error
+      if not isinstance(observed, dict):
+        raise QueueFailure('queue completion evidence must be a JSON object')
+      observed_without_time = dict(observed)
+      observed_time = observed_without_time.pop('completed_utc', None)
+      expected_without_time = dict(expected)
+      expected_without_time.pop('completed_utc')
+      if (not isinstance(observed_time, str) or not observed_time
+          or observed_without_time != expected_without_time):
+        raise QueueFailure(
+          'existing queue completion evidence differs from revalidated shards')
+    else:
+      atomic_write_new(
+        path, json.dumps(expected, indent=2, sort_keys=True) + '\n')
+    return path, sha256_file(path)
 
   def verify_environment(self) -> None:
+    _require_exact_launch_plan(
+      self.plan, self.expected_launch_plan_sha256)
     paths = self.plan.paths
     required_files = {
       paths.runner_repo / 'scripts/run_generation_pilot.py':
@@ -593,21 +780,35 @@ class QueueController:
         f'runner checkout is {revision}, expected {IMMUTABLE_RUNNER_GIT_SHA}')
     if status:
       raise QueueFailure('immutable runner checkout is dirty')
-    expected_ids = {
-      ('dynamic_dynamic', index) for index in range(NUM_SHARDS)} | {
-      ('static_static', index) for index in range(NUM_SHARDS)}
-    observed_ids = {
-      (task.arm.name, task.shard_index)
-      for task in (*self.plan.initial_tasks, *self.plan.phases[0],
-                   *self.plan.phases[1])}
-    if observed_ids != expected_ids:
-      raise QueueFailure('queue task set differs from the exact 32-shard grid')
-    if tuple(
-        (task.arm.name, task.shard_index, task.adopted_pid)
-        for task in self.plan.initial_tasks) != (
-          ('dynamic_dynamic', 0, 5226),
-          ('dynamic_dynamic', 1, 5958)):
-      raise QueueFailure('initial PID/task mapping differs from the live run')
+    observed_signature = (
+      tuple(
+        (task.dataset_slug, task.arm.name, task.shard_index, task.adopted_pid)
+        for task in self.plan.initial_tasks),
+      tuple(
+        tuple(
+          (task.dataset_slug, task.arm.name, task.shard_index, task.adopted_pid)
+          for task in phase)
+        for phase in self.plan.phases),
+    )
+    expected_signature = (
+      (
+        ('wikitext', 'dynamic_dynamic', 0, 5226),
+        ('wikitext', 'dynamic_dynamic', 1, 5958),
+      ),
+      (
+        tuple(
+          ('wikitext', 'dynamic_dynamic', index, None)
+          for index in range(2, NUM_SHARDS)),
+        tuple(
+          ('wikitext', 'static_static', index, None)
+          for index in range(NUM_SHARDS)),
+      ),
+    )
+    if observed_signature != expected_signature:
+      raise QueueFailure(
+        'queue task ordering or PID mapping differs from the exact grid')
+    for task in self._all_tasks():
+      _normalize_runner_arguments(task.command[2:])
 
   def _validate_completed(self, task: ShardTask) -> None:
     if not task.output_dir.is_dir():
@@ -766,7 +967,7 @@ class QueueController:
     if errors:
       raise QueueFailure('; '.join(errors))
 
-  def run(self) -> None:
+  def _run_locked(self) -> None:
     self.verify_environment()
     _emit(
       'generation_queue_verified',
@@ -797,7 +998,27 @@ class QueueController:
       _emit(
         'generation_queue_phase_completed', phase=phase_number,
         arm=phase[0].arm.name if phase else None)
-    _emit('generation_queue_complete', num_shards=32)
+    completion_path, completion_sha256 = \
+      self._write_or_validate_completion_evidence()
+    _emit(
+      'generation_queue_complete',
+      dataset_slug=self._dataset_slug(),
+      logical_dataset=self.logical_dataset,
+      num_tasks=len(self._all_tasks()),
+      launch_plan_sha256=self.launch_plan_sha256,
+      completion_evidence=str(completion_path),
+      completion_evidence_sha256=completion_sha256)
+
+  def run(self) -> None:
+    dataset_slug = self._dataset_slug()
+    lock = self.lock_factory(
+      self.plan.paths.experiment_root / 'generation-queue.lock',
+      queue_id=f'{dataset_slug}-generation-queue',
+      dataset_slug=dataset_slug,
+      launch_plan_sha256=self.launch_plan_sha256,
+      recover_stale=self.recover_stale_lock)
+    with lock:
+      self._run_locked()
 
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -805,13 +1026,19 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
   parser.add_argument(
     '--poll-seconds', type=float, default=30.0,
     help='seconds between immutable /proc checks for adopted PIDs')
+  parser.add_argument(
+    '--recover-stale-lock', action='store_true',
+    help=(
+      'preserve and replace a reviewed stale/invalid shared queue lock; '
+      'never use for an active owner'))
   return parser.parse_args(argv)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
   args = _parse_args(argv)
   controller = QueueController(
-    frozen_queue_plan(), poll_seconds=args.poll_seconds)
+    frozen_queue_plan(), poll_seconds=args.poll_seconds,
+    recover_stale_lock=args.recover_stale_lock)
   try:
     controller.run()
   except Exception as error:

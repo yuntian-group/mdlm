@@ -23,6 +23,13 @@ _wiki_queue = importlib.import_module(
   'scripts.run_wikitext_generation_queue'
   if __package__ else 'run_wikitext_generation_queue')
 
+from evaluation.generation_analysis_artifacts import (  # noqa: E402
+  CROSS_DOMAIN_LAUNCH_PLAN_SHA256S,
+  REPO_ROOT,
+  reviewed_gate_launch_authorization,
+  validate_reviewed_wikitext_gate,
+)
+
 ADAPTER_ORIGIN_EVIDENCE_SHA256 = (
   _wiki_queue.ADAPTER_ORIGIN_EVIDENCE_SHA256)
 BACKBONE_SHA256 = _wiki_queue.BACKBONE_SHA256
@@ -42,8 +49,9 @@ ShardTask = _wiki_queue.ShardTask
 _append_log = _wiki_queue._append_log
 _arm_specs = _wiki_queue._arm_specs
 _normalize_runner_arguments = _wiki_queue._normalize_runner_arguments
+_require_exact_launch_plan = _wiki_queue._require_exact_launch_plan
 _sha256_file = _wiki_queue._sha256_file
-
+launch_plan_sha256 = _wiki_queue.launch_plan_sha256
 
 @dataclass(frozen=True)
 class DatasetSpec:
@@ -54,6 +62,7 @@ class DatasetSpec:
   prompt_name: str
   prompt_sha256: str
   prompt_manifest_sha256: str
+  prompt_provenance_relative_path: str
   prompt_provenance_sha256: str
   num_prompts: int
   global_num_samples: int
@@ -72,6 +81,8 @@ DATASETS = {
       'ab3076602b0bc1988a8bac76e01f34a9662a579669f46692b18f8b1b760ee262'),
     prompt_manifest_sha256=(
       'a449a7006ba5da286c8b36d0fa539a535d73160ad585c048f025a0f4186182c1'),
+    prompt_provenance_relative_path=(
+      'arxiv-span32.jsonl.provenance/valid-4c660805cca2b31bff8b.json'),
     prompt_provenance_sha256=(
       'c5f59ff25c32a0ca9e290d9f7d22a385d1c2a06a2542a46dc1594d1c56ef08a6'),
     num_prompts=256,
@@ -89,6 +100,8 @@ DATASETS = {
       '0b34c431b05cd45d7867bf67e4658c6e5fcb3a71575f0e77629af3a3003efa4e'),
     prompt_manifest_sha256=(
       '2d01f012fbc994b2643c1aec4f905fcca3b5805524ae5ffb4e8b675ff2ffc9aa'),
+    prompt_provenance_relative_path=(
+      'pubmed-span32.jsonl.provenance/valid-d5c64dc21006e0989c86.json'),
     prompt_provenance_sha256=(
       '0315c9b80762732677967877c960dca11fbe6636cd5dfad81a92cc475b70f499'),
     num_prompts=256,
@@ -337,10 +350,22 @@ class CrossDomainQueueController(QueueController):
       dataset: DatasetSpec,
       paths: QueuePaths = DEFAULT_PATHS,
       *,
+      reviewed_gate_sha256: str,
+      reviewed_gate_path: Path | None = None,
+      controller_repo_root: Path = REPO_ROOT,
       poll_seconds: float = 30.0,
+      recover_stale_lock: bool = False,
       **kwargs,
   ) -> None:
     self.dataset = dataset
+    self.reviewed_gate_sha256 = reviewed_gate_sha256
+    self.reviewed_gate_path = (
+      Path(reviewed_gate_path).expanduser().resolve()
+      if reviewed_gate_path is not None else
+      paths.experiment_root / 'wikitext'
+      / 'reviewed-cross-domain-gate-v1.json')
+    self.reviewed_gate_identity = None
+    self.controller_repo_root = Path(controller_repo_root).expanduser().resolve()
     kwargs.setdefault(
       'completion_validator',
       lambda task, queue_paths: _completion_validator(
@@ -348,6 +373,10 @@ class CrossDomainQueueController(QueueController):
     super().__init__(
       frozen_cross_domain_plan(dataset.slug, paths),
       poll_seconds=poll_seconds,
+      expected_launch_plan_sha256=CROSS_DOMAIN_LAUNCH_PLAN_SHA256S[
+        dataset.slug],
+      logical_dataset=dataset.logical_dataset,
+      recover_stale_lock=recover_stale_lock,
       **kwargs,
     )
 
@@ -356,6 +385,9 @@ class CrossDomainQueueController(QueueController):
     dataset = self.dataset
     prompt = paths.experiment_root / 'prompts' / dataset.prompt_name
     prompt_manifest = Path(f'{prompt}.manifest.json')
+    prompt_provenance = (
+      paths.experiment_root / 'prompts'
+      / dataset.prompt_provenance_relative_path)
     required_files = {
       paths.runner_repo / 'scripts/run_generation_pilot.py':
         IMMUTABLE_RUNNER_SHA256,
@@ -367,6 +399,9 @@ class CrossDomainQueueController(QueueController):
         ADAPTER_ORIGIN_EVIDENCE_SHA256,
       prompt: dataset.prompt_sha256,
       prompt_manifest: dataset.prompt_manifest_sha256,
+      prompt_provenance: dataset.prompt_provenance_sha256,
+      paths.runner_repo / 'configs' / 'data' / f'{dataset.data_config}.yaml':
+        dataset.data_config_sha256,
     }
     for arm in _arm_specs(paths).values():
       required_files[arm.adapter] = arm.adapter_sha256
@@ -399,6 +434,7 @@ class CrossDomainQueueController(QueueController):
       ('policy', 'sequence_length'): SEQUENCE_LENGTH,
       ('policy', 'span_length'): 32,
       ('runtime_provenance', 'sha256'): dataset.prompt_provenance_sha256,
+      ('runtime_provenance', 'path'): str(prompt_provenance.resolve()),
     }
     for keys, expected in exact_prompt_fields.items():
       value = prompt_evidence
@@ -426,21 +462,41 @@ class CrossDomainQueueController(QueueController):
         f'runner checkout is {revision}, expected {IMMUTABLE_RUNNER_GIT_SHA}')
     if status:
       raise QueueFailure('immutable runner checkout is dirty')
+    try:
+      self.reviewed_gate_identity = validate_reviewed_wikitext_gate(
+        self.reviewed_gate_path,
+        expected_sha256=self.reviewed_gate_sha256,
+        require_proceed=True,
+        controller_repo_root=self.controller_repo_root)
+    except (OSError, TypeError, ValueError) as error:
+      raise QueueFailure(
+        'reviewed WikiText cross-domain launch gate failed validation: '
+        f'{error}') \
+        from error
+    self.launch_authorization = reviewed_gate_launch_authorization(
+      self.reviewed_gate_identity)
+    _require_exact_launch_plan(
+      self.plan, CROSS_DOMAIN_LAUNCH_PLAN_SHA256S[dataset.slug])
     if self.plan.initial_tasks:
       raise QueueFailure('cross-domain queues never adopt existing processes')
-    expected_ids = {
-      (arm, shard_index)
-      for arm in ('dynamic_dynamic', 'static_static')
-      for shard_index in range(NUM_SHARDS)}
-    observed_ids = {
-      (task.arm.name, task.shard_index)
-      for phase in self.plan.phases for task in phase}
-    if observed_ids != expected_ids:
-      raise QueueFailure('queue task set differs from the exact 32-shard grid')
+    observed_signature = tuple(
+      tuple(
+        (task.dataset_slug, task.arm.name, task.shard_index, task.adopted_pid)
+        for task in phase)
+      for phase in self.plan.phases)
+    expected_signature = (
+      tuple(
+        (dataset.slug, 'dynamic_dynamic', index, None)
+        for index in range(NUM_SHARDS)),
+      tuple(
+        (dataset.slug, 'static_static', index, None)
+        for index in range(NUM_SHARDS)),
+    )
+    if observed_signature != expected_signature:
+      raise QueueFailure(
+        'queue task ordering differs from the exact two-phase 32-shard grid')
     for phase in self.plan.phases:
       for task in phase:
-        if task.dataset_slug != dataset.slug:
-          raise QueueFailure('queue task carries the wrong dataset identity')
         parsed = _normalize_runner_arguments(task.command[2:])
         if parsed.get('--data-config') != dataset.data_config:
           raise QueueFailure('queue command carries the wrong data config')
@@ -450,15 +506,30 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
   parser = argparse.ArgumentParser(description=__doc__)
   parser.add_argument('--dataset', choices=tuple(DATASETS), required=True)
   parser.add_argument(
+    '--wikitext-gate-sha256', required=True,
+    help='reviewed SHA256 printed by compile_wikitext_cross_domain_gate.py')
+  parser.add_argument(
+    '--wikitext-gate', type=Path,
+    help=(
+      'reviewed gate path; defaults to the frozen experiment WikiText '
+      'gate location'))
+  parser.add_argument(
     '--poll-seconds', type=float, default=30.0,
     help='seconds between queue state checks')
+  parser.add_argument(
+    '--recover-stale-lock', action='store_true',
+    help='preserve and replace one reviewed stale/invalid shared queue lock')
   return parser.parse_args(argv)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
   args = _parse_args(argv)
   controller = CrossDomainQueueController(
-    DATASETS[args.dataset], poll_seconds=args.poll_seconds)
+    DATASETS[args.dataset],
+    reviewed_gate_sha256=args.wikitext_gate_sha256,
+    reviewed_gate_path=args.wikitext_gate,
+    poll_seconds=args.poll_seconds,
+    recover_stale_lock=args.recover_stale_lock)
   try:
     controller.run()
   except Exception as error:

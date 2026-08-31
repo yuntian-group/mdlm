@@ -12,6 +12,7 @@ from scripts.run_wikitext_generation_queue import (
   IMMUTABLE_RUNNER_GIT_SHA,
   IMMUTABLE_RUNNER_SHA256,
   PROMPT_MANIFEST_SHA256,
+  WIKITEXT_LAUNCH_PLAN_SHA256,
   ProcessSnapshot,
   QueueController,
   QueueFailure,
@@ -21,6 +22,7 @@ from scripts.run_wikitext_generation_queue import (
   _default_completion_validator,
   _normalize_runner_arguments,
   frozen_queue_plan,
+  launch_plan_sha256,
 )
 
 
@@ -82,6 +84,8 @@ class FrozenPlanTest(unittest.TestCase):
     self.assertEqual(
       _normalize_runner_arguments(dynamic_command[2:])['--nfe-budgets'],
       ('8', '16', '32', '64'))
+    self.assertEqual(
+      launch_plan_sha256(plan), WIKITEXT_LAUNCH_PLAN_SHA256)
 
   def test_command_parser_rejects_dirty_unknown_and_duplicate_arguments(self):
     with self.assertRaisesRegex(QueueFailure, 'allow-dirty'):
@@ -95,6 +99,10 @@ class FrozenPlanTest(unittest.TestCase):
       _normalize_runner_arguments([
         '--override', 'trainer.devices=1',
         '--override', 'trainer.devices=1'])
+    with self.assertRaisesRegex(QueueFailure, 'repeats a Hydra override key'):
+      _normalize_runner_arguments([
+        '--override', 'trainer.devices=1',
+        '--override', 'trainer.devices=2'])
 
 
 class QueueControllerTest(unittest.TestCase):
@@ -262,6 +270,14 @@ class QueueControllerTest(unittest.TestCase):
     self.assertEqual(
       [event for event in events if event[0] == 'launch'],
       [('launch', task.task_id) for task in (*dynamic, *static)])
+    completion_path = self.paths.experiment_root / 'wikitext' / 'queue-complete.json'
+    completion = json.loads(completion_path.read_text())
+    self.assertEqual(completion['dataset_slug'], 'wikitext')
+    self.assertEqual(completion['logical_dataset'], 'wikitext103-pinned')
+    self.assertEqual(completion['num_tasks'], 6)
+    self.assertEqual(len(completion['tasks']), 6)
+    self.assertFalse(
+      (self.paths.experiment_root / 'generation-queue.lock').exists())
 
   def test_failed_child_drains_and_validates_peer_then_stops(self):
     dynamic = self.full_plan.phases[0][:2]
