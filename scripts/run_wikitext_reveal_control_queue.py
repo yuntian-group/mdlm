@@ -97,6 +97,11 @@ def _parse_args(argv=None) -> argparse.Namespace:
   return parser.parse_args(argv)
 
 
+def _absolute_path_without_resolving_symlinks(path: Path) -> Path:
+  """Make a path absolute while preserving virtual-environment symlinks."""
+  return Path(os.path.abspath(path))
+
+
 def expected_shard_samples(shard_index: int) -> int:
   if not 0 <= shard_index < NUM_SHARDS:
     raise ValueError('shard_index lies outside the frozen grid')
@@ -289,7 +294,8 @@ def _atomic_json(path: Path, payload: Mapping[str, Any]) -> None:
 def main(argv=None) -> int:
   args = _parse_args(argv)
   paths = Paths(
-    args.runner_repo.resolve(), args.python.resolve(),
+    args.runner_repo.resolve(),
+    _absolute_path_without_resolving_symlinks(args.python),
     args.experiment_root.resolve(), args.expansion_root.resolve(),
     args.backbone.resolve())
   tasks = build_tasks(paths)

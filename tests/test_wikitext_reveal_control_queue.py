@@ -9,6 +9,7 @@ from scripts.run_wikitext_reveal_control_queue import (
   NUM_SAMPLES,
   NUM_SHARDS,
   Paths,
+  _absolute_path_without_resolving_symlinks,
   build_tasks,
   expected_shard_samples,
   launch_plan_sha256,
@@ -66,6 +67,10 @@ class WikitextRevealControlQueueTest(unittest.TestCase):
       expected_shard_samples(-1)
     with self.assertRaisesRegex(ValueError, 'outside'):
       expected_shard_samples(NUM_SHARDS)
+
+  def test_python_path_preserves_virtual_environment_symlink(self):
+    path = Path('/mnt/contextual-forest/venv/bin/python')
+    self.assertEqual(_absolute_path_without_resolving_symlinks(path), path)
 
 
 if __name__ == '__main__':
