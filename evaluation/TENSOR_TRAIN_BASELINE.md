@@ -57,8 +57,12 @@ byte-level offline-cache identity.
 
 Once the L4 is idle, run one non-paper sample before any paper job. This loads
 the exact source/checkpoint/cache/runtime, exercises the official sampler, and
-writes a fresh attestation. It acquires the same nonblocking GPU lock and
-continuous foreign-PID monitor as paper jobs.
+writes a fresh attestation. It acquires the submission-wide nonblocking GPU
+lock at `/mnt/contextual-forest/experiments/.submission-gpu.lock` and the same
+continuous foreign-PID monitor as paper jobs. The attestation also records
+CUDA-synchronized generation time and peak allocated/reserved memory for this
+single sample. Those resource fields are an operational projection aid, not a
+paper result or a substitute for the full-cell measurements.
 
 ```bash
 python scripts/preflight_tensor_train_feasibility.py \
@@ -73,8 +77,9 @@ Do not run this preflight while another generation queue owns the GPU.
 
 Run jobs sequentially: the runtime gate requires an otherwise idle visible GPU
 so its timing and memory measurements are interpretable. A nonblocking lock
-prevents two harness jobs from racing, while a one-second process monitor makes
-any foreign CUDA process fail the attempt and preserve its partial directory.
+shared with the other submission workloads prevents two harnesses from racing,
+while a one-second process monitor makes any foreign CUDA process fail the
+attempt and preserve its partial directory.
 The example below runs one cell.
 
 ```bash

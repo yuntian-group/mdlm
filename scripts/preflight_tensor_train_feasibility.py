@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import platform
 import sys
+import time
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -22,6 +23,7 @@ from evaluation.tensor_train_baseline import (  # noqa: E402
   EXPECTED_CHECKPOINT_CONFIG_SHA256,
   EXPECTED_CHECKPOINT_STATE_KEYS,
   EXPECTED_CHECKPOINT_STEPS,
+  SUBMISSION_GPU_LOCK,
   canonical_sha256,
   clean_git_identity,
   load_compiled_plan,
@@ -65,6 +67,29 @@ def _write_exclusive(path: Path, payload: dict) -> None:
     os.fsync(handle.fileno())
 
 
+def _descriptive_resource_probe(
+    *,
+    generation_seconds: float,
+    generation_peak_allocated_bytes: int,
+    generation_peak_reserved_bytes: int,
+) -> dict:
+  if not math.isfinite(generation_seconds) or generation_seconds <= 0.0:
+    raise RuntimeError('preflight generation timing must be finite and positive')
+  for name, value in (
+      ('allocated', generation_peak_allocated_bytes),
+      ('reserved', generation_peak_reserved_bytes)):
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+      raise RuntimeError(f'preflight CUDA peak {name} bytes are invalid')
+  if generation_peak_reserved_bytes < generation_peak_allocated_bytes:
+    raise RuntimeError('preflight CUDA reserved memory is inconsistent')
+  return {
+    'scope': 'one_sample_generation_only_excludes_model_load_and_evaluator',
+    'generation_seconds': generation_seconds,
+    'generation_peak_allocated_bytes': generation_peak_allocated_bytes,
+    'generation_peak_reserved_bytes': generation_peak_reserved_bytes,
+  }
+
+
 def run_preflight(plan_path: Path, job_id: str) -> dict:
   plan_path = plan_path.expanduser().resolve()
   plan, jobs = load_compiled_plan(plan_path)
@@ -77,9 +102,7 @@ def run_preflight(plan_path: Path, job_id: str) -> dict:
     raise RuntimeError('preflight Python differs from compiled job')
   packages = _package_versions(runtime['critical_packages'])
   cache_identity = _prepare_offline_cache(plan, job)
-  lock_path = Path(plan['artifact_root']).expanduser().resolve() \
-      / '.tensor-train-gpu.lock'
-  with _exclusive_gpu_lock(lock_path) as acquired_lock:
+  with _exclusive_gpu_lock(SUBMISSION_GPU_LOCK) as acquired_lock:
     with _ForeignPidMonitor(
         runtime['gpu_monitor_interval_seconds']) as monitor:
       source_root = Path(job['source']['path']).resolve()
@@ -131,6 +154,9 @@ def run_preflight(plan_path: Path, job_id: str) -> dict:
 
       upstream_generate.pick_tokens_to_unmask = recorded_pick
       _reseed_sampling(torch, smoke_generation['generation_seed'])
+      torch.cuda.reset_peak_memory_stats()
+      torch.cuda.synchronize()
+      generation_started = time.perf_counter()
       try:
         with torch.inference_mode():
           generated, observed_steps = upstream_generate.sample(
@@ -138,6 +164,13 @@ def run_preflight(plan_path: Path, job_id: str) -> dict:
       finally:
         upstream_generate.pick_tokens_to_unmask = original_pick
       torch.cuda.synchronize()
+      generation_seconds = time.perf_counter() - generation_started
+      generation_peak_allocated = torch.cuda.max_memory_allocated()
+      generation_peak_reserved = torch.cuda.max_memory_reserved()
+      resource_probe = _descriptive_resource_probe(
+        generation_seconds=generation_seconds,
+        generation_peak_allocated_bytes=generation_peak_allocated,
+        generation_peak_reserved_bytes=generation_peak_reserved)
       schedule = recorder.finalize(job={**job, 'generation': smoke_generation})
       if tuple(generated.shape) != (1, smoke_generation['sequence_length']) \
           or not math.isclose(
@@ -170,6 +203,7 @@ def run_preflight(plan_path: Path, job_id: str) -> dict:
         'runtime_packages': packages,
         'gpu': _gpu_identity(),
         'gpu_exclusivity': gpu_evidence,
+        'descriptive_resource_probe': resource_probe,
         'sample_token_ids_sha256': canonical_sha256(tokens),
         'position_schedule_sha256': schedule['records'][0][
           'position_schedule_sha256'],

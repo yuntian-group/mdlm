@@ -38,6 +38,8 @@ SCHEDULE_POLICY = 'recorded_selected_position_chunks_v1'
 CACHE_POLICY = 'pinned_snapshot_offline_warm_cache_v1'
 GPU_EXCLUSIVITY_POLICY = (
   'nonblocking_flock_and_continuous_pid_monitor_v1')
+SUBMISSION_GPU_LOCK = Path(
+  '/mnt/contextual-forest/experiments/.submission-gpu.lock')
 EXPECTED_CHECKPOINT_STEPS = {
   'marginal': 599999,
   'tensor_train_rank4': 149999,
@@ -1517,10 +1519,8 @@ def validate_completed_run(
     raise ValueError('resource measurement was not GPU-exclusive')
   lock_path = Path(_nonempty_string(
     exclusivity['lock_path'], context='gpu exclusivity.lock_path'))
-  expected_lock_path = Path(plan['artifact_root']).expanduser().resolve() \
-      / '.tensor-train-gpu.lock'
-  if lock_path.expanduser().resolve() != expected_lock_path:
-    raise ValueError('GPU lock path differs from the compiled plan')
+  if lock_path.expanduser().resolve() != SUBMISSION_GPU_LOCK:
+    raise ValueError('GPU lock path differs from the submission-wide lock')
 
   schedules = validate_position_schedules(
     _read_json(resolved_outputs['position_schedules_json']), job=job)

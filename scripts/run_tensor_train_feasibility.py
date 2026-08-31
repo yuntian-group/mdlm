@@ -42,6 +42,7 @@ from evaluation.tensor_train_baseline import (  # noqa: E402
   EXPECTED_CHECKPOINT_STATE_KEYS,
   EXPECTED_CHECKPOINT_STEPS,
   GPU_EXCLUSIVITY_POLICY,
+  SUBMISSION_GPU_LOCK,
   canonical_sha256,
   cached_model_identities,
   clean_git_identity,
@@ -985,9 +986,7 @@ def run_job(plan_path: Path, job_id: str, *, resume: bool) -> dict[str, Any]:
     f'{uuid.uuid4().hex[:12]}')
   temporary_dir.mkdir(parents=False, exist_ok=False)
   try:
-    lock_path = Path(plan['artifact_root']).expanduser().resolve() \
-        / '.tensor-train-gpu.lock'
-    with _exclusive_gpu_lock(lock_path) as acquired_lock_path:
+    with _exclusive_gpu_lock(SUBMISSION_GPU_LOCK) as acquired_lock_path:
       _execute(
         plan_path=plan_path,
         plan=plan,

@@ -1,3 +1,4 @@
+import contextlib
 import hashlib
 import json
 import math
@@ -17,6 +18,7 @@ from evaluation.tensor_train_baseline import (
   GPU_EXCLUSIVITY_POLICY,
   OFFICIAL_CHECKPOINT_REVISION,
   OFFICIAL_SOURCE_REVISION,
+  SUBMISSION_GPU_LOCK,
   canonical_sha256,
   compile_plan,
   load_compiled_plan,
@@ -295,7 +297,7 @@ class TensorTrainBaselineTest(unittest.TestCase):
       'gpu_exclusivity': {
         'required': True,
         'policy': GPU_EXCLUSIVITY_POLICY,
-        'lock_path': str(Path(plan['artifact_root']) / '.tensor-train-gpu.lock'),
+        'lock_path': str(SUBMISSION_GPU_LOCK),
         'lock_acquired': True,
         'monitor_interval_seconds': 1.0,
         'monitor_samples': 2,
@@ -518,6 +520,24 @@ class TensorTrainBaselineTest(unittest.TestCase):
       with self.assertRaisesRegex(ValueError, 'output hash mismatch'):
         run_job(plan_path, job['job_id'], resume=True)
 
+  def test_completed_run_requires_submission_wide_gpu_lock(self):
+    with tempfile.TemporaryDirectory() as directory:
+      root = Path(directory)
+      plan, jobs = self._compile(root)
+      plan_path = write_plan(plan, jobs, root / 'artifacts/plan')
+      job = jobs[plan['job_ids'][0]]
+      self._write_completed_run(plan, job, plan_path)
+      run_dir = Path(job['artifact_dir'])
+      resource_path = run_dir / 'resource-metrics.json'
+      resource = json.loads(resource_path.read_text())
+      resource['gpu_exclusivity']['lock_path'] = str(
+        root / '.private-gpu.lock')
+      self._write_json(resource_path, resource)
+      self._rehash_run(run_dir)
+      with self.assertRaisesRegex(
+          ValueError, 'submission-wide lock'):
+        validate_completed_run(run_dir, plan=plan, job=job)
+
   def test_complete_matrix_requires_all_pairs_and_one_evaluator(self):
     with tempfile.TemporaryDirectory() as directory:
       root = Path(directory)
@@ -550,11 +570,15 @@ class TensorTrainBaselineTest(unittest.TestCase):
           run_dir=kwargs['temporary_dir'])
 
       with mock.patch(
-          'scripts.run_tensor_train_feasibility._execute',
-          side_effect=fake_execute) as execute:
+          'scripts.run_tensor_train_feasibility._exclusive_gpu_lock',
+          return_value=contextlib.nullcontext(SUBMISSION_GPU_LOCK)), mock.patch(
+            'scripts.run_tensor_train_feasibility._execute',
+            side_effect=fake_execute) as execute:
         result = run_job(plan_path, job['job_id'], resume=False)
       self.assertEqual(result['event'], 'tensor_train_feasibility_job_complete')
       self.assertEqual(execute.call_count, 1)
+      self.assertEqual(
+        execute.call_args.kwargs['lock_path'], SUBMISSION_GPU_LOCK)
       self.assertTrue(Path(job['artifact_dir'], '_SUCCESS.json').is_file())
       self.assertFalse(any(
         path.name.startswith(f'.{job["job_id"]}.partial-')
@@ -567,8 +591,10 @@ class TensorTrainBaselineTest(unittest.TestCase):
       plan_path = write_plan(plan, jobs, root / 'artifacts/plan')
       job = jobs[plan['job_ids'][0]]
       with mock.patch(
-          'scripts.run_tensor_train_feasibility._execute',
-          side_effect=RuntimeError('injected new-run failure')):
+          'scripts.run_tensor_train_feasibility._exclusive_gpu_lock',
+          return_value=contextlib.nullcontext(SUBMISSION_GPU_LOCK)), mock.patch(
+            'scripts.run_tensor_train_feasibility._execute',
+            side_effect=RuntimeError('injected new-run failure')):
         with self.assertRaisesRegex(RuntimeError, 'injected new-run failure'):
           run_job(plan_path, job['job_id'], resume=False)
       self.assertFalse(Path(job['artifact_dir']).exists())
@@ -764,9 +790,27 @@ class TensorTrainBaselineTest(unittest.TestCase):
           monitor.snapshot(lock_path=Path('/fixture/gpu.lock'))
 
   def test_real_preflight_entrypoint_is_importable_without_gpu(self):
-    from scripts.preflight_tensor_train_feasibility import run_preflight
+    from scripts.preflight_tensor_train_feasibility import (
+      _descriptive_resource_probe,
+      run_preflight,
+    )
 
     self.assertTrue(callable(run_preflight))
+    probe = _descriptive_resource_probe(
+      generation_seconds=1.25,
+      generation_peak_allocated_bytes=10,
+      generation_peak_reserved_bytes=12)
+    self.assertEqual(probe['generation_seconds'], 1.25)
+    with self.assertRaisesRegex(RuntimeError, 'finite and positive'):
+      _descriptive_resource_probe(
+        generation_seconds=float('nan'),
+        generation_peak_allocated_bytes=10,
+        generation_peak_reserved_bytes=12)
+    with self.assertRaisesRegex(RuntimeError, 'reserved memory'):
+      _descriptive_resource_probe(
+        generation_seconds=1.25,
+        generation_peak_allocated_bytes=13,
+        generation_peak_reserved_bytes=12)
 
 
 if __name__ == '__main__':
