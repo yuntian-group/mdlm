@@ -581,8 +581,13 @@ def build_production_model(
     backbone_checkpoint: Path,
     expectations: AuthenticatedProductionExpectations,
     overrides: Sequence[str],
+    runtime_mode: str = 'train',
+    data_cache_dir: Path | None = None,
+    checkpoint_save_dir: Path | None = None,
 ) -> torch.nn.Module:
   """Construct the release target through the repository's Diffusion path."""
+  if runtime_mode not in {'train', 'ppl_eval'}:
+    raise ValueError('runtime_mode must be train or ppl_eval')
   backbone_state, loaded_attestation = load_authenticated_backbone_wrapper(
     backbone_checkpoint, expectations=expectations)
   expected_attestation = production_provenance_from_expectations(expectations)
@@ -606,7 +611,12 @@ def build_production_model(
         *overrides,
       ])
   with open_dict(config):
-    config.mode = 'train'
+    config.mode = runtime_mode
+    if data_cache_dir is not None:
+      config.data.cache_dir = str(data_cache_dir.expanduser().resolve())
+    if checkpoint_save_dir is not None:
+      config.checkpointing.save_dir = str(
+        checkpoint_save_dir.expanduser().resolve())
     # The authenticated bytes above are loaded directly below.  Leaving this
     # unset prevents Diffusion from reopening a replaceable filesystem path.
     config.model.structured_decoder.training.backbone_checkpoint = None

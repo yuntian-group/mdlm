@@ -35,6 +35,16 @@ from scripts.export_structured_adapter import (
   tensor_state_content_sha256,
   tensor_state_schema,
 )
+from scripts.replay_contextual_forest_adapter import (
+  EXPECTED_RUNTIME_CONFIG,
+  RUNTIME_CONFIG_IDENTITY_SHA256,
+  _write_report_exclusive,
+  authenticate_and_load_replay_model,
+  attest_replay_sources,
+  attest_repository,
+  attest_runtime_environment,
+  validate_seed_201_runtime_config,
+)
 from scripts.verify_contextual_forest_adapter import (
   verify_contextual_forest_adapter,
 )
@@ -147,6 +157,18 @@ class TinyContextualForest(torch.nn.Module):
 
 
 class ContextualForestAdapterTest(unittest.TestCase):
+
+  def _seed_201_config(self, *, cache: Path, output: Path):
+    config = {}
+    for dotted_path, value in EXPECTED_RUNTIME_CONFIG.items():
+      current = config
+      fields = dotted_path.split('.')
+      for field in fields[:-1]:
+        current = current.setdefault(field, {})
+      current[fields[-1]] = copy.deepcopy(value)
+    config['data']['cache_dir'] = str(cache.resolve())
+    config['checkpointing']['save_dir'] = str(output.resolve())
+    return config
 
   def test_production_inventory_matches_contextual_forest_small(self):
     from models.structured_decoder import ContextualCouplingForestHead
@@ -631,8 +653,12 @@ class ContextualForestAdapterTest(unittest.TestCase):
           expected_adapter_tensor_bytes=32,
           development_mode=True)
 
-  def test_legacy_head_and_diffusion_loaders_reject_schema_v5(self):
+  def test_legacy_main_head_and_diffusion_loaders_reject_schema_v5(self):
     diffusion_class = _diffusion_class_for_loader_test()
+    main_source = (
+      Path(__file__).resolve().parents[1] / 'main.py').read_text()
+    self.assertIn('return diffusion.Diffusion(', main_source)
+    self.assertNotIn('verify_contextual_forest_adapter', main_source)
 
     with tempfile.TemporaryDirectory() as directory:
       root = Path(directory)
@@ -758,6 +784,175 @@ class ContextualForestAdapterTest(unittest.TestCase):
           expected_adapter_parameter_count=8,
           expected_adapter_tensor_bytes=32,
           expectations=authenticated)
+
+  def test_authenticated_replay_accepts_only_attested_schema_v5(self):
+    with tempfile.TemporaryDirectory() as directory:
+      root = Path(directory)
+      _, adapter, manifest_path, manifest, _, authenticated = (
+        self._production_export(root))
+      runtime = TinyContextualForest()
+      result = authenticate_and_load_replay_model(
+        model=runtime,
+        adapter_path=adapter,
+        manifest_path=manifest_path,
+        expected_adapter_sha256=manifest['adapter_sha256'],
+        expected_manifest_sha256=_sha256(manifest_path),
+        expectations=authenticated,
+        expected_adapter_tensor_count=2,
+        expected_adapter_parameter_count=8,
+        expected_adapter_tensor_bytes=32)
+      self.assertTrue(result['strict_load'])
+      self.assertEqual(manifest['schema_version'], 5)
+      torch.testing.assert_close(
+        runtime.structured_head.weight,
+        torch.arange(6.0).reshape(2, 3))
+
+      mutated = TinyContextualForest()
+      mutated.backbone.tensor_000 += 1
+      with mock.patch.object(
+          mutated.structured_head,
+          'load_state_dict',
+          wraps=mutated.structured_head.load_state_dict) as load_mock:
+        with self.assertRaisesRegex(ValueError, 'tensor content differs'):
+          authenticate_and_load_replay_model(
+            model=mutated,
+            adapter_path=adapter,
+            manifest_path=manifest_path,
+            expected_adapter_sha256=manifest['adapter_sha256'],
+            expected_manifest_sha256=_sha256(manifest_path),
+            expectations=authenticated,
+            expected_adapter_tensor_count=2,
+            expected_adapter_parameter_count=8,
+            expected_adapter_tensor_bytes=32)
+      load_mock.assert_not_called()
+
+      checkpoint = root / 'last.ckpt'
+      legacy_adapter = root / 'legacy.safetensors'
+      legacy_manifest_path = root / 'legacy-manifest.json'
+      legacy_manifest = export_contextual_forest_adapter(
+        checkpoint,
+        legacy_adapter,
+        legacy_manifest_path,
+        expected_checkpoint_sha256=_sha256(checkpoint),
+        expected_global_step=17,
+        model=TinyContextualForest(),
+        expected_adapter_tensor_count=2,
+        expected_adapter_parameter_count=8,
+        expected_adapter_tensor_bytes=32,
+        development_mode=True)
+      with self.assertRaisesRegex(ValueError, 'schema-v4 adapter'):
+        authenticate_and_load_replay_model(
+          model=TinyContextualForest(),
+          adapter_path=legacy_adapter,
+          manifest_path=legacy_manifest_path,
+          expected_adapter_sha256=legacy_manifest['adapter_sha256'],
+          expected_manifest_sha256=_sha256(legacy_manifest_path),
+          expectations=authenticated,
+          expected_adapter_tensor_count=2,
+          expected_adapter_parameter_count=8,
+          expected_adapter_tensor_bytes=32)
+
+  def test_seed_201_runtime_config_and_report_are_fail_closed(self):
+    with tempfile.TemporaryDirectory() as directory:
+      root = Path(directory)
+      cache = root / 'cache'
+      output = root / 'fresh-attempt'
+      cache.mkdir()
+      config = self._seed_201_config(cache=cache, output=output)
+      identity = validate_seed_201_runtime_config(
+        config, data_cache_dir=cache, output_dir=output)
+      self.assertEqual(
+        identity['identity_sha256'], RUNTIME_CONFIG_IDENTITY_SHA256)
+      self.assertNotIn(str(root), json.dumps(identity, sort_keys=True))
+
+      drifted = copy.deepcopy(config)
+      drifted['seed'] = 202
+      with self.assertRaisesRegex(ValueError, 'configuration drifted'):
+        validate_seed_201_runtime_config(
+          drifted, data_cache_dir=cache, output_dir=output)
+      with self.assertRaisesRegex(ValueError, 'data cache path drifted'):
+        validate_seed_201_runtime_config(
+          config, data_cache_dir=root / 'other-cache', output_dir=output)
+
+      output.mkdir()
+      report = _write_report_exclusive(output, {'status': 'complete'})
+      self.assertEqual(report.name, 'authenticated-seed-201-replay.json')
+      with self.assertRaises(FileExistsError):
+        _write_report_exclusive(output, {'status': 'replacement'})
+
+  def test_seed_201_replay_rejects_repository_and_config_source_drift(self):
+    revision = 'a' * 40
+    with mock.patch(
+        'scripts.replay_contextual_forest_adapter._git_output',
+        side_effect=[revision, '']):
+      self.assertEqual(
+        attest_repository(revision),
+        {'revision': revision, 'clean': True})
+    with mock.patch(
+        'scripts.replay_contextual_forest_adapter._git_output',
+        return_value='b' * 40):
+      with self.assertRaisesRegex(ValueError, 'revision mismatch'):
+        attest_repository(revision)
+    with mock.patch(
+        'scripts.replay_contextual_forest_adapter._git_output',
+        side_effect=[revision, ' M configs/config.yaml']):
+      with self.assertRaisesRegex(ValueError, 'not clean'):
+        attest_repository(revision)
+
+    sources = attest_replay_sources()
+    self.assertEqual(
+      sources['model_config']['filename'], 'contextual-forest-small.yaml')
+    self.assertEqual(
+      sources['data_config']['filename'], 'openwebtext-streaming.yaml')
+    with mock.patch(
+        'scripts.replay_contextual_forest_adapter._sha256_file',
+        return_value='0' * 64):
+      with self.assertRaisesRegex(ValueError, 'model_config SHA256 mismatch'):
+        attest_replay_sources()
+
+  def test_seed_201_replay_authenticates_runtime_environment(self):
+    versions = {
+      'lightning': '2.2.1',
+      'torchmetrics': '1.3.2',
+      'transformers': '4.38.2',
+      'datasets': '2.18.0',
+      'hydra-core': '1.3.2',
+      'omegaconf': '2.3.0',
+      'safetensors': '0.4.2',
+      'tokenizers': '0.15.2',
+      'fsspec': '2024.2.0',
+    }
+    patches = (
+      mock.patch(
+        'scripts.replay_contextual_forest_adapter.'
+        'importlib.metadata.version', side_effect=versions.__getitem__),
+      mock.patch(
+        'scripts.replay_contextual_forest_adapter.'
+        'platform.python_version', return_value='3.10.12'),
+      mock.patch(
+        'scripts.replay_contextual_forest_adapter.'
+        'platform.platform',
+        return_value='Linux-6.8.0-1066-gcp-x86_64-with-glibc2.35'),
+      mock.patch.object(torch, '__version__', '2.5.1+cu121'),
+      mock.patch.object(torch.version, 'cuda', '12.1'),
+      mock.patch(
+        'scripts.replay_contextual_forest_adapter.'
+        'subprocess.check_output',
+        return_value='NVIDIA L4, 580.173.02, 23034\n'),
+    )
+    with (patches[0], patches[1], patches[2], patches[3], patches[4],
+          patches[5]):
+      environment = attest_runtime_environment()
+    self.assertEqual(environment['gpu']['name'], 'NVIDIA L4')
+    self.assertEqual(environment['packages'], versions)
+
+    drifted = dict(versions)
+    drifted['transformers'] = '99.0.0'
+    with mock.patch(
+        'scripts.replay_contextual_forest_adapter.'
+        'importlib.metadata.version', side_effect=drifted.__getitem__):
+      with self.assertRaisesRegex(RuntimeError, 'transformers drifted'):
+        attest_runtime_environment()
 
   def test_authenticated_expectations_bind_source_config_and_inventory(self):
     with tempfile.TemporaryDirectory() as directory:
