@@ -196,7 +196,7 @@ def render(
   provenance = {
     'schema_version': 1,
     'artifact': 'generation_trajectory_figure_provenance',
-    'figure_path': str(output),
+    'figure_filename': output.name,
     'trajectory_input_file_sha256': trajectory_file_sha256,
     'trajectory_artifact_sha256': payload['artifact_sha256'],
     'source_selection_policy': payload['selection']['policy'],
