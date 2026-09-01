@@ -22,6 +22,8 @@ operational notes.
   replay summary and provenance. It does not identify a quality effect.
 - `k256-pilot/` contains the clean-revision compiled plan and fully replayed
   one-seed, two-dataset K=256 conditional-denoising aggregate.
+- `tensor-train-feasibility/` contains the complete six-cell released-baseline
+  feasibility matrix, its plan, and successful exact-stack preflight.
 - `released-backbone-preflight/` contains the strict raw-weight loading and
   length-1024 structured-forward compatibility check.  It is not a language
   quality or latency result.
