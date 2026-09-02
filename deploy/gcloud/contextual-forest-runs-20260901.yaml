@@ -14,6 +14,10 @@ factorial:
   plan_dir: /mnt/contextual-forest/experiments/contextual-forest-causal-evidence-v1/plans/causal-primary-from-d8671a0-v1
   compiled_plan_sha256: b75f5f213a3fc51247e1d96042710a0d1e01f7ae7049ccfd2dc26111afdfc7a9
   jobs: {train: 12, export: 12, eval: 576}
+  monitoring:
+    completion_rule: exact_intersection_with_compiled_plan_eval_job_ids
+    excluded_historical_eval_successes: 32
+    excluded_historical_scope: n0064_pilot_jobs_not_in_compiled_primary_plan
   service: contextual-forest-factorial-eval-six.service
   controller: /mnt/contextual-forest/run_causal_primary_eval_partition.sh
   partition_count: 6
