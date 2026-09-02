@@ -32,3 +32,16 @@ candidate marker hash; `consolidation.json` records the resulting one-source-
 per-job 600-job tree.  Their file SHA-256 values are
 `4b0ccdb84b1bc7d9e4aff542c2f82bb291724eb538820ac40ba921133f790658`
 and `6fe0051c23999727a3c8679265dfb06b14fda187660126532d1cef48fdff8c9b`.
+
+`selection-alt.json` reverses the fallback source order without inspecting any
+metric, and `analysis-alt.json` replays the identical frozen analysis on that
+alternate union.  Every qualitative conclusion is unchanged.  Across all ten
+pooled contrasts, the largest absolute point-estimate change is
+0.00009694 (the interaction); across the 16 primary conditions it is
+0.00008671.  The alternate selection and serialized analysis file SHA-256
+values are
+`ecfd1925fe773b077b35556d00682fc98876a79f0370c78b64e5e44875e7d12f`
+and `b30d886955f9d9e7d8cd7ae342d56886417d015735bde0e6d2436f5232a619f3`;
+the alternate canonical analysis identity is
+`9823018b5f6645f44431b88cdb12bbe7bebc70b44ea9621561dc774a5b5fdebf`.
+`sensitivity.json` gives the compact contrast-by-contrast comparison.
