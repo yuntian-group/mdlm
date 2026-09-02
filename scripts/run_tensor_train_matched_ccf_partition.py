@@ -15,7 +15,7 @@ RUNNER_ROOT = Path('/mnt/contextual-forest/mdlm-causal-a574aca')
 PYTHON = Path('/mnt/contextual-forest/venv/bin/python')
 OUTPUT_ROOT = Path(
   '/mnt/contextual-forest/experiments/'
-  'contextual-forest-tensor-train-matched-v1/ccf')
+  'contextual-forest-tensor-train-matched-v1/ccf-origin-v1')
 BACKBONE = Path('/mnt/contextual-forest/checkpoints/mdlm-owt-backbone.pt')
 BACKBONE_SHA256 = (
   '1b7c724d0228b1a2c825185c96642ffd706bd828b237f84512f0e1c7b5765573')
@@ -28,6 +28,11 @@ ADAPTER_SHA256 = (
 ADAPTER_MANIFEST = ADAPTER.with_name('adapter-manifest.json')
 ADAPTER_MANIFEST_SHA256 = (
   'd527f40926eda894e1ee5c9c1a91317353941463acbdfe059a279884fdbd2da9')
+ADAPTER_ORIGIN_EVIDENCE = Path(
+  '/mnt/contextual-forest/experiments/'
+  'contextual-forest-tensor-train-matched-v1/adapter-pair-origin.json')
+ADAPTER_ORIGIN_EVIDENCE_SHA256 = (
+  '0c5ef69ee6bd14d1d40bbc8c8e6ea9d412eb7e65a25b42b530cd45e3d456a558')
 SOURCE_SHA = 'a574aca873d6de66a3b847c13efd1c7bc4efb66b'
 NUM_SHARDS = 32
 
@@ -44,7 +49,8 @@ def _verify_inputs() -> None:
   for path, expected in (
       (BACKBONE, BACKBONE_SHA256),
       (ADAPTER, ADAPTER_SHA256),
-      (ADAPTER_MANIFEST, ADAPTER_MANIFEST_SHA256)):
+      (ADAPTER_MANIFEST, ADAPTER_MANIFEST_SHA256),
+      (ADAPTER_ORIGIN_EVIDENCE, ADAPTER_ORIGIN_EVIDENCE_SHA256)):
     if not path.is_file() or _sha256(path) != expected:
       raise RuntimeError(f'artifact identity mismatch: {path}')
   result = subprocess.run(
@@ -86,6 +92,12 @@ def _validate_shard(path: Path, shard_index: int) -> None:
     raise RuntimeError(f'{path}: backbone hash differs')
   if manifest['artifacts']['adapter']['sha256'] != ADAPTER_SHA256:
     raise RuntimeError(f'{path}: adapter hash differs')
+  origin = manifest.get('adapter_origin_evidence')
+  if (not isinstance(origin, dict)
+      or origin.get('evidence_file', {}).get('sha256')
+      != ADAPTER_ORIGIN_EVIDENCE_SHA256
+      or origin.get('arm') != 'dynamic_dynamic'):
+    raise RuntimeError(f'{path}: adapter origin evidence differs')
 
 
 def _command(shard_index: int, output: Path) -> list[str]:
@@ -97,6 +109,9 @@ def _command(shard_index: int, output: Path) -> list[str]:
     '--adapter-sha256', ADAPTER_SHA256,
     '--adapter-manifest', str(ADAPTER_MANIFEST),
     '--adapter-manifest-sha256', ADAPTER_MANIFEST_SHA256,
+    '--adapter-origin-evidence', str(ADAPTER_ORIGIN_EVIDENCE),
+    '--adapter-origin-evidence-sha256', ADAPTER_ORIGIN_EVIDENCE_SHA256,
+    '--adapter-origin-arm', 'dynamic_dynamic',
     '--output-dir', str(output),
     '--num-samples', '256',
     '--num-shards', str(NUM_SHARDS),

@@ -21,6 +21,11 @@ artifacts:
   adapter_manifest:
     path: /mnt/contextual-forest/experiments/contextual-forest-causal-evidence-v1/runs/export--dynamic_dynamic--s001--k128/attempts/attempt-0001/adapter-manifest.json
     sha256: d527f40926eda894e1ee5c9c1a91317353941463acbdfe059a279884fdbd2da9
+  adapter_origin_evidence:
+    path: /mnt/contextual-forest/experiments/contextual-forest-tensor-train-matched-v1/adapter-pair-origin.json
+    sha256: 0c5ef69ee6bd14d1d40bbc8c8e6ea9d412eb7e65a25b42b530cd45e3d456a558
+    evidence_sha256: ddf7e496a3791d971c66ea9b370194a283faeb327bc51b0d5f7c8580f796b7b7
+    compiled_plan_sha256: b75f5f213a3fc51247e1d96042710a0d1e01f7ae7049ccfd2dc26111afdfc7a9
 
 generation:
   dataset_label: openwebtext
@@ -50,6 +55,10 @@ runtime:
   interruption_policy: >-
     Every shard is an atomic fresh attempt. Existing shards are reused only
     after full manifest, output-hash, record, seed, and summary replay.
+  excluded_attempts: >-
+    The initial ccf/shard-00 through ccf/shard-03 outputs omitted adapter
+    origin evidence and are preserved but excluded. Paper inputs use only the
+    fresh ccf-origin-v1 root whose manifests bind the evidence above.
 
 comparison:
   external_artifact: artifacts/paper/tensor-train-feasibility/analysis.json
@@ -67,4 +76,3 @@ comparison:
   intentionally_unpaired_fields:
     - model_native_position_schedule
     - checkpoint_training_history
-
