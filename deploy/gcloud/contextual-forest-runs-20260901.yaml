@@ -27,6 +27,15 @@ factorial:
     - {partition: 3, vm: contextual-forest-factorial-a100-eval3-20260901, zone: us-central1-f, machine: a2-highgpu-1g, data_disk: contextual-forest-factorial-a100-eval3-data-20260901}
     - {partition: 4, vm: contextual-forest-factorial-a100-clean-eval2-20260901, zone: us-central1-f, machine: a2-highgpu-1g, data_disk: contextual-forest-factorial-a100-clean-eval2-data-20260901}
     - {partition: 5, vm: contextual-forest-factorial-a100-clean-eval5-20260901, zone: us-central1-f, machine: a2-highgpu-1g, data_disk: contextual-forest-factorial-a100-clean-eval5-data-20260901}
+  consolidation:
+    host: contextual-forest-factorial-a100-eval3-20260901
+    zone: us-central1-f
+    data_disk: contextual-forest-factorial-aggregate-data-20260902
+    disk_type: pd-balanced
+    disk_size_gb: 100
+    device_name: contextual-forest-factorial-aggregate-data
+    mount: /mnt/factorial-aggregate
+    policy: stream_only_successful_eval_directories_after_worker_services_exit
   reverse_l4_acceleration:
     controller: /mnt/contextual-forest/run_causal_primary_eval_reverse_partition.sh
     service: contextual-forest-factorial-reverse-eight-v2.service
