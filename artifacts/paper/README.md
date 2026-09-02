@@ -22,6 +22,9 @@ operational notes.
   replay summary and provenance. It does not identify a quality effect.
 - `k256-pilot/` contains the clean-revision compiled plan and fully replayed
   one-seed, two-dataset K=256 conditional-denoising aggregate.
+- `full-factorial/` contains the complete 600-job, four-arm K=128 factorial
+  analysis, its fail-closed consolidation record, and the deterministic source
+  selection audit used to resolve independently rerun partition copies.
 - `tensor-train-feasibility/` contains the complete six-cell released-baseline
   feasibility matrix, its plan, and successful exact-stack preflight.
 - `tensor-train-matched/` contains the complete 32-shard, 768-record CCF union
