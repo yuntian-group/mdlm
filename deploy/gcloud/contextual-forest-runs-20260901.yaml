@@ -57,6 +57,13 @@ tensor_train_matched:
   partition_count: 8
   expected_shards: 32
   expected_records: 768
+  completion:
+    completed_utc: 2026-09-02T02:46:50Z
+    verified_shards: 32
+    verified_records: 768
+    local_union_sha256: 6717d8ec0847ec914debce1f8ed6d112d0908668431a0018bcae50f9f9f5a9d2
+    matched_comparison_sha256: 95ab62f5d073abb88fb627ce490498e8b68ebc52b17d5c267c7e8cc991958cd4
+    all_workers_repurposed_for_guarded_reverse_factorial: true
   adapter_origin_evidence:
     path: /mnt/contextual-forest/experiments/contextual-forest-tensor-train-matched-v1/adapter-pair-origin.json
     sha256: 0c5ef69ee6bd14d1d40bbc8c8e6ea9d412eb7e65a25b42b530cd45e3d456a558

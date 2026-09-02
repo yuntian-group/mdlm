@@ -24,6 +24,9 @@ operational notes.
   one-seed, two-dataset K=256 conditional-denoising aggregate.
 - `tensor-train-feasibility/` contains the complete six-cell released-baseline
   feasibility matrix, its plan, and successful exact-stack preflight.
+- `tensor-train-matched/` contains the complete 32-shard, 768-record CCF union
+  and its fail-closed descriptive comparison with both released Tensor-Train
+  arms at matched length, sample count, NFE budgets, evaluator, and GPU model.
 - `released-backbone-preflight/` contains the strict raw-weight loading and
   length-1024 structured-forward compatibility check.  It is not a language
   quality or latency result.
