@@ -33,10 +33,12 @@ tensor_train_matched:
   protocol_file: configs/experiment/contextual-forest-tensor-train-matched-v1.yaml
   controller_git_sha: eb34bbc94f6df754ede11d4d6f813012a7943e83
   output_root: /mnt/contextual-forest/experiments/contextual-forest-tensor-train-matched-v1/ccf-origin-v1
-  service: contextual-forest-ttmatch-origin-v2.service
+  services:
+    original_workers: contextual-forest-ttmatch-origin-v3.service
+    added_workers: contextual-forest-ttmatch-origin-v6.service
   hard_stop_timer: contextual-forest-ttmatch-hard-stop.timer
   hard_stop_deadline_utc: 2026-09-03T01:09:41Z
-  partition_count: 4
+  partition_count: 8
   expected_shards: 32
   expected_records: 768
   adapter_origin_evidence:
@@ -45,8 +47,24 @@ tensor_train_matched:
   excluded_attempts:
     root: /mnt/contextual-forest/experiments/contextual-forest-tensor-train-matched-v1/ccf
     reason: adapter_origin_evidence was absent from shard manifests
+  preserved_interrupted_attempts:
+    root: /mnt/contextual-forest/experiments/contextual-forest-tensor-train-matched-v1/interrupted-attempts
+    shards: [4, 5, 6, 8, 9, 10, 11]
+    reason: services were stopped before atomic shard completion during repartitioning
+  preservation_snapshots:
+    - contextual-forest-ttmatch-scale0-data-20260901
+    - contextual-forest-ttmatch-scale1-data-20260901
+    - contextual-forest-ttmatch-scale2-data-20260901
+    - contextual-forest-ttmatch-scale3-data-20260901
   workers:
     - {partition: 0, vm: contextual-forest-ttmatch-l4-0-20260901, zone: us-east1-b, machine: g2-standard-8, data_disk: contextual-forest-ttmatch-l4-0-data-20260901}
     - {partition: 1, vm: contextual-forest-ttmatch-l4-1-20260901, zone: us-east1-c, machine: g2-standard-8, data_disk: contextual-forest-ttmatch-l4-1-data-20260901}
     - {partition: 2, vm: contextual-forest-ttmatch-l4-2-20260901, zone: us-east1-d, machine: g2-standard-8, data_disk: contextual-forest-ttmatch-l4-2-data-20260901}
     - {partition: 3, vm: contextual-forest-ttmatch-l4-3-20260901, zone: us-east1-b, machine: g2-standard-8, data_disk: contextual-forest-ttmatch-l4-3-data-20260901}
+    - {partition: 4, vm: contextual-forest-ttmatch-l4-4-20260901, zone: us-east1-b, machine: g2-standard-8, data_disk: contextual-forest-ttmatch-l4-4-data-20260901}
+    - {partition: 5, vm: contextual-forest-ttmatch-l4-5-20260901, zone: us-east1-c, machine: g2-standard-8, data_disk: contextual-forest-ttmatch-l4-5-data-20260901}
+    - {partition: 6, vm: contextual-forest-ttmatch-l4-6-20260901, zone: us-east1-d, machine: g2-standard-8, data_disk: contextual-forest-ttmatch-l4-6-data-20260901}
+    - {partition: 7, vm: contextual-forest-ttmatch-l4-7c-20260901, zone: us-east1-c, machine: g2-standard-8, data_disk: contextual-forest-ttmatch-l4-7c-data-20260901}
+  unused_preserved_disks_after_zone_stockout:
+    - {disk: contextual-forest-ttmatch-l4-7-boot-20260901, zone: us-east1-b}
+    - {disk: contextual-forest-ttmatch-l4-7-data-20260901, zone: us-east1-b}
