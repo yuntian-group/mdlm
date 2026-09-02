@@ -27,6 +27,20 @@ factorial:
     - {partition: 3, vm: contextual-forest-factorial-a100-eval3-20260901, zone: us-central1-f, machine: a2-highgpu-1g, data_disk: contextual-forest-factorial-a100-eval3-data-20260901}
     - {partition: 4, vm: contextual-forest-factorial-a100-clean-eval2-20260901, zone: us-central1-f, machine: a2-highgpu-1g, data_disk: contextual-forest-factorial-a100-clean-eval2-data-20260901}
     - {partition: 5, vm: contextual-forest-factorial-a100-clean-eval5-20260901, zone: us-central1-f, machine: a2-highgpu-1g, data_disk: contextual-forest-factorial-a100-clean-eval5-data-20260901}
+  reverse_l4_acceleration:
+    controller: /mnt/contextual-forest/run_causal_primary_eval_reverse_partition.sh
+    partition_count: 8
+    launch_rule: only_after_matched_generation_parent_exits
+    overlap_guard_git_sha: 7fe0e2343912c296dcf25e7cff2a872a4078debe
+    interrupted_prelaunch_jobs_without_success_markers:
+      - eval--static_static--s003--wikitext103--e303--m900000--k128--n0256
+      - eval--static_static--s003--wikitext103--e303--m750000--k128--n0256
+      - eval--static_static--s003--wikitext103--e303--m500000--k128--n0256
+      - eval--static_static--s003--wikitext103--e303--m250000--k128--n0256
+      - eval--static_static--s003--wikitext103--e302--m900000--k128--n0256
+      - eval--static_static--s003--wikitext103--e302--m750000--k128--n0256
+      - eval--static_static--s003--wikitext103--e302--m500000--k128--n0256
+      - eval--static_static--s003--wikitext103--e302--m250000--k128--n0256
 
 tensor_train_matched:
   protocol_id: contextual-forest-tensor-train-matched-v1
@@ -34,8 +48,7 @@ tensor_train_matched:
   controller_git_sha: eb34bbc94f6df754ede11d4d6f813012a7943e83
   output_root: /mnt/contextual-forest/experiments/contextual-forest-tensor-train-matched-v1/ccf-origin-v1
   services:
-    original_workers: contextual-forest-ttmatch-origin-v3.service
-    added_workers: contextual-forest-ttmatch-origin-v6.service
+    final_clean_rerun: contextual-forest-ttmatch-origin-v7.service
   hard_stop_timer: contextual-forest-ttmatch-hard-stop.timer
   hard_stop_deadline_utc: 2026-09-03T01:09:41Z
   partition_count: 8
@@ -51,6 +64,13 @@ tensor_train_matched:
     root: /mnt/contextual-forest/experiments/contextual-forest-tensor-train-matched-v1/interrupted-attempts
     shards: [4, 5, 6, 8, 9, 10, 11]
     reason: services were stopped before atomic shard completion during repartitioning
+  preserved_contended_attempts:
+    root: /mnt/contextual-forest/experiments/contextual-forest-tensor-train-matched-v1/contended-attempts
+    shards: [12, 13, 14, 15, 24, 25, 26, 27]
+    reason: >-
+      A reverse factorial service overlapped these in-progress shards for about
+      20 seconds. They are excluded because GPU contention invalidates timing;
+      final paper inputs use clean origin-v7 reruns.
   preservation_snapshots:
     - contextual-forest-ttmatch-scale0-data-20260901
     - contextual-forest-ttmatch-scale1-data-20260901
