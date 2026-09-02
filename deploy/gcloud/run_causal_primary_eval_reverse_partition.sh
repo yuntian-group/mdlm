@@ -19,6 +19,11 @@ if ! [[ "${partition_index}" =~ ^[0-9]+$ \
   exit 2
 fi
 
+if pgrep -f '[r]un_tensor_train_matched_ccf_partition.py' >/dev/null; then
+  echo 'refusing to overlap reverse evaluation with matched generation' >&2
+  exit 75
+fi
+
 cd "${repo_dir}"
 mapfile -t eval_jobs < <(
   jq -r '.job_ids[] | select(startswith("eval--"))' \
