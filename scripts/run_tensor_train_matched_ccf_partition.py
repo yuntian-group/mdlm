@@ -88,9 +88,10 @@ def _validate_shard(path: Path, shard_index: int) -> None:
     raise RuntimeError(f'{path}: sampling modes differ')
   if matrix.get('nfe_budgets') != [8, 16, 32]:
     raise RuntimeError(f'{path}: NFE budgets differ')
-  if manifest['artifacts']['backbone']['sha256'] != BACKBONE_SHA256:
+  if (manifest['artifacts']['backbone_checkpoint']['sha256']
+      != BACKBONE_SHA256):
     raise RuntimeError(f'{path}: backbone hash differs')
-  if manifest['artifacts']['adapter']['sha256'] != ADAPTER_SHA256:
+  if manifest['artifacts']['structured_adapter']['sha256'] != ADAPTER_SHA256:
     raise RuntimeError(f'{path}: adapter hash differs')
   origin = manifest.get('adapter_origin_evidence')
   if (not isinstance(origin, dict)
