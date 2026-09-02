@@ -1,0 +1,52 @@
+schema_version: 1
+project: interactive-training-2026
+created_utc: 2026-09-01
+source_checkout:
+  path: /mnt/contextual-forest/mdlm-causal-a574aca
+  sha: a574aca873d6de66a3b847c13efd1c7bc4efb66b
+  require_clean: true
+hard_stop:
+  timer: contextual-forest-factorial-hard-stop.timer
+  deadline_utc: 2026-09-03T00:58:26Z
+
+factorial:
+  protocol_id: contextual-forest-causal-evidence-v1
+  plan_dir: /mnt/contextual-forest/experiments/contextual-forest-causal-evidence-v1/plans/causal-primary-from-d8671a0-v1
+  compiled_plan_sha256: b75f5f213a3fc51247e1d96042710a0d1e01f7ae7049ccfd2dc26111afdfc7a9
+  jobs: {train: 12, export: 12, eval: 576}
+  service: contextual-forest-factorial-eval-six.service
+  controller: /mnt/contextual-forest/run_causal_primary_eval_partition.sh
+  partition_count: 6
+  immutable_snapshots:
+    - contextual-forest-factorial-exports-data-20260901
+    - contextual-forest-factorial-exports-boot-20260901
+  workers:
+    - {partition: 0, vm: contextual-forest-factorial-a100-eval0b-20260901, zone: us-central1-b, machine: a2-highgpu-1g, data_disk: contextual-forest-factorial-a100-eval0b-data-20260901}
+    - {partition: 1, vm: contextual-forest-factorial-a100-eval1-20260901, zone: us-central1-b, machine: a2-highgpu-1g, data_disk: contextual-forest-factorial-a100-eval1-data-20260901}
+    - {partition: 2, vm: contextual-forest-factorial-a100-eval2-20260901, zone: us-central1-c, machine: a2-highgpu-1g, data_disk: contextual-forest-factorial-a100-eval2-data-20260901}
+    - {partition: 3, vm: contextual-forest-factorial-a100-eval3-20260901, zone: us-central1-f, machine: a2-highgpu-1g, data_disk: contextual-forest-factorial-a100-eval3-data-20260901}
+    - {partition: 4, vm: contextual-forest-factorial-a100-clean-eval2-20260901, zone: us-central1-f, machine: a2-highgpu-1g, data_disk: contextual-forest-factorial-a100-clean-eval2-data-20260901}
+    - {partition: 5, vm: contextual-forest-factorial-a100-clean-eval5-20260901, zone: us-central1-f, machine: a2-highgpu-1g, data_disk: contextual-forest-factorial-a100-clean-eval5-data-20260901}
+
+tensor_train_matched:
+  protocol_id: contextual-forest-tensor-train-matched-v1
+  protocol_file: configs/experiment/contextual-forest-tensor-train-matched-v1.yaml
+  controller_git_sha: eb34bbc94f6df754ede11d4d6f813012a7943e83
+  output_root: /mnt/contextual-forest/experiments/contextual-forest-tensor-train-matched-v1/ccf-origin-v1
+  service: contextual-forest-ttmatch-origin-v2.service
+  hard_stop_timer: contextual-forest-ttmatch-hard-stop.timer
+  hard_stop_deadline_utc: 2026-09-03T01:09:41Z
+  partition_count: 4
+  expected_shards: 32
+  expected_records: 768
+  adapter_origin_evidence:
+    path: /mnt/contextual-forest/experiments/contextual-forest-tensor-train-matched-v1/adapter-pair-origin.json
+    sha256: 0c5ef69ee6bd14d1d40bbc8c8e6ea9d412eb7e65a25b42b530cd45e3d456a558
+  excluded_attempts:
+    root: /mnt/contextual-forest/experiments/contextual-forest-tensor-train-matched-v1/ccf
+    reason: adapter_origin_evidence was absent from shard manifests
+  workers:
+    - {partition: 0, vm: contextual-forest-ttmatch-l4-0-20260901, zone: us-east1-b, machine: g2-standard-8, data_disk: contextual-forest-ttmatch-l4-0-data-20260901}
+    - {partition: 1, vm: contextual-forest-ttmatch-l4-1-20260901, zone: us-east1-c, machine: g2-standard-8, data_disk: contextual-forest-ttmatch-l4-1-data-20260901}
+    - {partition: 2, vm: contextual-forest-ttmatch-l4-2-20260901, zone: us-east1-d, machine: g2-standard-8, data_disk: contextual-forest-ttmatch-l4-2-data-20260901}
+    - {partition: 3, vm: contextual-forest-ttmatch-l4-3-20260901, zone: us-east1-b, machine: g2-standard-8, data_disk: contextual-forest-ttmatch-l4-3-data-20260901}
