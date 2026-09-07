@@ -86,7 +86,8 @@ def main(argv=None):
     'metric_precision': 'enumerated FP32 probabilities renormalized in FP64; '
                         'raw normalization error recorded separately',
     'same_visible_context_for_all_targets': True, 'full_vocabulary': 2,
-    'rank': 4, 'time': 0.5, 'fixed_edge': [0, 1],
+    'rank': 'per variant_config.rank (table and oracle use rank 2)',
+    'time': 0.5, 'fixed_edge': [0, 1],
     'target_criterion': {'kl_max': 0.01, 'invalid_max': 0.01,
                          'max_marginal_error': 0.02},
     'shared_head_bound': {

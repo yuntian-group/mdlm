@@ -89,6 +89,18 @@ class TinyJointDebugTest(unittest.TestCase):
     self.assertGreaterEqual(result['kl_target_to_model'], math.log(2) - 2e-6)
     self.assertGreaterEqual(result['invalid_mass'], 0.5 - 2e-6)
 
+  def test_half_rank_directional_matches_active_capacity(self):
+    shared = train_tiny(TinyVariant('shared'), 'opposite', seed=3,
+                        max_steps=1, samples=0)
+    directional = train_tiny(TinyVariant('matched', kind='directional',
+      rank=2, init_std=0.25, warmup_steps=100), 'equal', seed=3,
+      max_steps=600, samples=0)
+    self.assertEqual(shared['gradient_active_parameter_count'],
+                     directional['gradient_active_parameter_count'])
+    self.assertEqual(shared['parameter_count'], directional['parameter_count'])
+    self.assertEqual(directional['pair_factor_rank'], 2)
+    self.assertLess(directional['invalid_mass'], 0.01)
+
 
 if __name__ == '__main__':
   unittest.main()

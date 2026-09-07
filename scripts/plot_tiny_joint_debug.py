@@ -18,12 +18,14 @@ def main(argv=None):
   parser.add_argument('--output', type=Path, default=Path(
     'artifacts/paper/staged-debugging-v1/tiny/figure.pdf'))
   parser.add_argument('--seed', type=int, default=1)
+  parser.add_argument('--directional-input', type=Path)
+  parser.add_argument('--shared-variant', default='shared_contextual_wide')
   parser.add_argument('--directional-variant', default='directional_contextual_wide')
   args = parser.parse_args(argv)
   data = json.loads(args.input.read_text())
 
-  def row(name):
-    matches = [r for r in data['runs'] if r['task'] == 'opposite'
+  def row(name, report=data):
+    matches = [r for r in report['runs'] if r['task'] == 'opposite'
                and r['variant'] == name and r['seed'] == args.seed]
     if len(matches) != 1:
       raise ValueError(f'expected exactly one {name}/seed-{args.seed} row')
@@ -32,8 +34,10 @@ def main(argv=None):
   def matrix(values):
     return np.array([values[x] for x in ('AA', 'AB', 'BA', 'BB')]).reshape(2, 2)
 
-  shared = row('shared_contextual_wide')
-  directional = row(args.directional_variant)
+  shared = row(args.shared_variant)
+  directional_data = (json.loads(args.directional_input.read_text())
+                      if args.directional_input else data)
+  directional = row(args.directional_variant, directional_data)
   probability = matrix(directional['probabilities'])
   independent = matrix(directional['independent_marginal_probabilities'])
   panels = [np.array([[0., 0.5], [0.5, 0.]]),
@@ -57,7 +61,9 @@ def main(argv=None):
     for first in range(2):
       for second in range(2):
         value = panel[first, second]
-        ax.text(second, first, f'{100 * value:.1f}%', ha='center', va='center',
+        label = (f'{100 * value:.2f}%' if 0 < value < 0.001
+                 else f'{100 * value:.1f}%')
+        ax.text(second, first, label, ha='center', va='center',
                  color='white' if value > 0.28 else '#17324d', fontsize=10)
     invalid = np.trace(panel)
     ax.text(0.5, -0.43, f'{100 * invalid:.2f}% invalid',
@@ -70,6 +76,7 @@ def main(argv=None):
   plt.close(fig)
   args.output.with_suffix('.json').write_text(json.dumps({
     'source': str(args.input), 'seed': args.seed, 'task': 'opposite',
+    'directional_source': str(args.directional_input or args.input),
     'shared_variant': shared['variant'],
     'directional_variant': directional['variant'],
     'shared_config': shared['variant_config'],

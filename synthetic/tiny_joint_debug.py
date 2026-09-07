@@ -42,6 +42,7 @@ class TinyVariant:
   factor_mode: str = 'dynamic'
   init_std: float = 0.01
   warmup_steps: int = 0
+  rank: int = 4
 
 
 VARIANTS = (
@@ -56,6 +57,10 @@ VARIANTS = (
               factor_mode='fixed', init_std=0.25),
   TinyVariant('directional_contextual_warmup', kind='directional',
               init_std=0.25, warmup_steps=100),
+  TinyVariant('directional_contextual_rank2_wide', kind='directional',
+              init_std=0.25, rank=2),
+  TinyVariant('directional_contextual_rank2_warmup', kind='directional',
+              init_std=0.25, warmup_steps=100, rank=2),
 )
 
 
@@ -68,8 +73,8 @@ def fixed_inputs(batch_size=1, dtype=torch.float32):
           torch.ones(batch_size, 2, dtype=torch.bool))
 
 
-def _head(cls=ContextualCouplingForestHead):
-  return cls(hidden_size=5, vocab_size=2, top_k=2, rank=4,
+def _head(cls=ContextualCouplingForestHead, rank=4):
+  return cls(hidden_size=5, vocab_size=2, top_k=2, rank=rank,
              time_embed_dim=8, topology_dim=8, local_window=1,
              num_anchor_slots=1, contextual_neighbors=0,
              component_size_cap=2, topology_mode='fixed')
@@ -111,7 +116,7 @@ class TinyModel(nn.Module):
     else:
       cls = (DirectionalCouplingForestHead if variant.kind == 'directional'
              else ContextualCouplingForestHead)
-      self.head = _head(cls)
+      self.head = _head(cls, rank=variant.rank)
       if variant.init_std != 0.01:
         generator = torch.Generator().manual_seed(seed + 1729)
         for name in ('token_factor_embedding', 'right_token_factor_embedding'):
@@ -273,6 +278,7 @@ def train_tiny(variant, task, seed, max_steps=600, learning_rate=0.03,
     'steps_run': step, 'stop_reason': stopped,
     'learning_rate': learning_rate, 'seconds': time.perf_counter() - start,
     'parameter_count': sum(p.numel() for p in parameters.values()),
+    'pair_factor_rank': output.pair_left_factors.shape[-1],
     'gradient_active_parameter_count': sum(parameters[n].numel()
                                            for n in active_names),
     'active_parameter_names': sorted(active_names),
