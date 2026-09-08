@@ -11,7 +11,7 @@ from unittest.mock import patch
 import torch
 
 from scripts.run_staged_fresh_training import (
-  ARMS, FreshTrainer, assert_document_disjoint, build_dev_caches,
+  ARMS, FreshTrainer, assert_document_disjoint, backbone_runtime_identity, build_dev_caches,
   evaluate_development, read_documents, save_checkpoint,
 )
 from scripts.run_staged_real_overfit import file_sha256, make_head, training_loss
@@ -174,6 +174,18 @@ class StagedFreshTrainingTest(unittest.TestCase):
       save_checkpoint(trainer, checkpoint)
       state = torch.load(checkpoint, weights_only=True)
       self.assertEqual(state['identity'], trainer.identity)
+
+  def test_backbone_identity_pins_noise_and_resolves_model_settings(self):
+    from omegaconf import OmegaConf
+    model = SimpleNamespace(config=OmegaConf.create({
+      'length': 128, 'backbone': 'dit', 'noise': {'type': 'loglinear', 'eps': 0.001},
+      'model': {'length': '${length}', 'hidden_size': 8, 'structured_decoder': {'rank': 4}}}),
+      parameterization='subs', time_conditioning=True, subs_masking=False, T=0)
+    identity = backbone_runtime_identity(model)
+    self.assertEqual(identity['model'], {'length': 128, 'hidden_size': 8})
+    self.assertEqual(identity['noise']['eps'], 0.001)
+    model.config.noise.eps = 0.01
+    self.assertNotEqual(backbone_runtime_identity(model), identity)
 
   def test_document_identity_checks_catch_overlap_even_with_different_tokens(self):
     with tempfile.TemporaryDirectory() as directory:

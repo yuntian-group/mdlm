@@ -56,6 +56,18 @@ def canonical_hash(value) -> str:
                                    allow_nan=False).encode()).hexdigest()
 
 
+def backbone_runtime_identity(model):
+  """Pin the resolved encoder/noise settings that can affect its outputs."""
+  from omegaconf import OmegaConf
+  encoder = OmegaConf.to_container(model.config.model, resolve=True)
+  encoder.pop('structured_decoder', None)
+  return {
+    'model': encoder, 'noise': OmegaConf.to_container(model.config.noise, resolve=True),
+    'parameterization': model.parameterization, 'time_conditioning': model.time_conditioning,
+    'subs_masking': model.subs_masking, 'backbone': model.config.backbone, 'T': model.T,
+  }
+
+
 def read_documents(path: Path, expected_sha256: str, count: int, length: int,
                    vocab_size: int, mask_index: int, tokenizer=None):
   """Select distinct full-length documents with explicit document identities."""
@@ -485,6 +497,7 @@ def main(argv=None):
     'dev_cache_sha256': [report['cache_sha256'] for report in cache_reports],
     'head_config': head_config, 'source_sha256': source_hashes,
     'backbone_provenance': model.structured_backbone_provenance,
+    'backbone_runtime_config': backbone_runtime_identity(model),
     'runtime': runtime, 'eval_every': args.eval_every, 'dataset': args.dataset_label,
   }
   trainer = FreshTrainer(

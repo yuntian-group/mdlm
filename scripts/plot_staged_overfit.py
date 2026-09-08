@@ -187,6 +187,12 @@ def draw(run_dir: Path, output: Path):
                                        'edgecolor': 'none', 'pad': 1.0})
   for ax in axes:
     ax.set_xlim(0, max(maximum_step, 1))
+    # Keep the final update label within the fixed-width PDF, including
+    # four-digit endpoints in longer diagnostic runs.
+    ticks = [value for value in ax.get_xticks() if 0 <= value <= maximum_step]
+    ax.set_xticks(ticks)
+    if ticks and ticks[-1] == maximum_step:
+      ax.get_xticklabels()[-1].set_horizontalalignment('right')
     ax.set_xlabel('Training updates')
     ax.grid(axis='y', alpha=0.18, linewidth=0.6)
     ax.spines[['top', 'right']].set_visible(False)
