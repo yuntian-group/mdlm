@@ -90,6 +90,8 @@ class RenderGenerationTrajectoryTest(unittest.TestCase):
       self.assertEqual(provenance['batch_row_index'], 0)
       self.assertEqual(len(provenance['panels']), 10)
       self.assertTrue(provenance['layout']['all_text_bounding_boxes_checked'])
+      # The paper includes this 7.2-inch source at 0.96 * 5.5 inches.
+      self.assertGreaterEqual(provenance['layout']['body_font_size_points'] * 0.96 * 5.5 / 7.2, 8)
       self.assertEqual(len(provenance['layout']['panel_bounding_boxes_pixels']), 10)
       self.assertGreater(max(provenance['layout']['row_heights_inches']), 0.5)
       self.assertEqual(before, json.dumps(payload, sort_keys=True))

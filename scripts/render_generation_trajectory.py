@@ -227,8 +227,10 @@ def render(
   left_margin, right_margin, column_gap = 0.22, 0.12, 0.18
   panel_width = (figure_width - left_margin - right_margin - column_gap) / 2
   padding, label_body_gap, row_gap = 0.10, 0.085, 0.12
-  top_band, bottom_band = 0.72, 0.43
-  body_font_size, label_font_size = 7.5, 7.4
+  top_band, bottom_band = 0.78, 0.55
+  # At 0.96 times the ICLR text width, the body remains about 8 pt.
+  # Row heights grow with the text rather than shrinking it to fit.
+  body_font_size, label_font_size = 11.0, 10.5
   body_font = FontProperties(family='DejaVu Sans Mono', size=body_font_size)
   line_spacing = 1.25
   fig = plt.figure(figsize=(figure_width, 1.0), dpi=100)
@@ -305,17 +307,17 @@ def render(
     panel_top -= height + row_gap
   outer_artists = [fig.text(
     0.5, 1 - 0.06 / figure_height, 'Filling the masked span',
-    ha='center', va='top', fontsize=11.3, fontweight='bold')]
+    ha='center', va='top', fontsize=15.0, fontweight='bold')]
   for column, mode in enumerate(EXPECTED_MODES):
     center = left_margin + column * (panel_width + column_gap) + panel_width / 2
     outer_artists.append(fig.text(
       center / figure_width, 1 - 0.40 / figure_height, titles[mode],
-      ha='center', va='top', fontsize=10.0, fontweight='bold', color=colors[mode]))
+      ha='center', va='top', fontsize=12.0, fontweight='bold', color=colors[mode]))
   outer_artists.append(fig.text(
     0.5, 0.065 / figure_height,
     f"Sample {batch_row['sample_index']} · 64-call budget, 63 calls used.\n"
     '⟦k masked⟧ marks k unresolved tokens.',
-    ha='center', va='bottom', fontsize=7.2, color='#4b5058', linespacing=1.2))
+    ha='center', va='bottom', fontsize=10.0, color='#4b5058', linespacing=1.2))
   layout_boxes = _assert_text_boxes_fit(
     fig, panel_artists, outer_artists, padding_inches=padding)
   fig.savefig(output)

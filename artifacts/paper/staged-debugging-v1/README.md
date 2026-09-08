@@ -56,6 +56,12 @@ across serial and batched evaluation. All fitting arms use one shared serial
 cache. `data/manifest.json` records source-document-disjoint debug-fit/dev/test
 selection, made without model scores.
 
+`real32/candidate-identity-audit.json` verifies the actual CUDA candidate paths
+at code commit `a7d141d`: full pair-head top-K and compact unary chunk top-K
+return identical ordered IDs at all 4,096 masked training/development positions.
+This includes 2,770 rows with cutoff ties and 15 tied gold targets. Candidate
+membership and retained mass agree exactly; no tie policy was changed.
+
 `checkpoints/` contains 256 observations per saved checkpoint: 32 development
 and 32 test examples, each at four mask rates and length 128. These are old
 seed-1 shared-factor checkpoints, not the new 32-example heads. The retry
