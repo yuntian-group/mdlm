@@ -33,6 +33,7 @@ def main(argv=None):
   parser = argparse.ArgumentParser(description=__doc__)
   parser.add_argument('--experiment-root', type=Path, required=True)
   parser.add_argument('--run-tag', choices=('v1', 'retry1-v1'), default='retry1-v1')
+  parser.add_argument('--seed2-resumed', action='store_true')
   parser.add_argument('--output-tag', choices=('v1',), default='v1')
   args = parser.parse_args(argv)
   root, tag = args.experiment_root.resolve(), args.output_tag
@@ -40,6 +41,8 @@ def main(argv=None):
   manifest = root / 'fresh-data-v1/manifest.json'
   pilot_run = root / 'fresh-pilot-resume-v1'
   replica_runs = [root / f'fresh-replication-seed{seed}-{args.run_tag}' for seed in (2, 3)]
+  if args.seed2_resumed:
+    replica_runs[0] = root / 'fresh-replication-seed2-resume-v1'
   selection23 = root / f'fresh-selection-seed23-{tag}'
   selection123 = root / f'fresh-selection-seed123-{tag}'
   test23 = root / f'fresh-test-seed23-{tag}'

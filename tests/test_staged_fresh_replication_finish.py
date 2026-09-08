@@ -57,6 +57,17 @@ class ReplicationFinishTest(unittest.TestCase):
       evaluate.assert_not_called()
       aggregate.assert_not_called()
 
+  def test_resumed_seed2_keeps_seed3_in_its_fresh_namespace(self):
+    with tempfile.TemporaryDirectory() as directory, \
+         mock.patch.object(finish, 'seal', side_effect=ValueError('incomplete')) as seal, \
+         mock.patch.object(finish, 'evaluate') as evaluate, mock.patch.dict(finish.os.environ):
+      with self.assertRaisesRegex(ValueError, 'incomplete'):
+        finish.main(['--experiment-root', directory, '--seed2-resumed'])
+      self.assertEqual([path.name for path in seal.call_args.args[0]],
+                       ['fresh-replication-seed2-resume-v1',
+                        'fresh-replication-seed3-retry1-v1'])
+      evaluate.assert_not_called()
+
   def test_existing_outputs_are_never_overwritten(self):
     with tempfile.TemporaryDirectory() as directory, mock.patch.object(finish, 'seal') as seal:
       (Path(directory) / 'fresh-selection-seed23-v1').mkdir()
