@@ -257,15 +257,24 @@ class ContextualUnaryAdapter(nn.Module):
           stop = min(start + vocab_chunk_size, self.vocab_size)
 
           def chunk_log_mass(base_chunk, context, embedding):
-            return torch.logsumexp(
-              base_chunk + (context @ embedding.T).to(base_chunk.dtype), dim=-1)
+            corrected = base_chunk + (context @ embedding.T).to(base_chunk.dtype)
+            nonempty = ~torch.isneginf(corrected).all(dim=-1)
+            safe = torch.where(nonempty[:, None], corrected, torch.zeros_like(corrected))
+            # A chunk containing only excluded tokens has zero probability.
+            # Evaluate its reduction at finite values before masking it out,
+            # so backward never encounters the undefined all--inf derivative.
+            return torch.logsumexp(safe, dim=-1).masked_fill(~nonempty, -torch.inf)
 
           args = (base[:, start:stop], feat, self.token_embedding.weight[start:stop])
           if checkpoint_chunks and torch.is_grad_enabled():
             mass = checkpoint(chunk_log_mass, *args, use_reentrant=False)
           else:
             mass = chunk_log_mass(*args)
-          normalizer = torch.logaddexp(normalizer, mass)
+          nonempty = ~torch.isneginf(normalizer) | ~torch.isneginf(mass)
+          normalizer = torch.logaddexp(
+            torch.where(nonempty, normalizer, torch.zeros_like(normalizer)),
+            torch.where(nonempty, mass, torch.zeros_like(mass)),
+          ).masked_fill(~nonempty, -torch.inf)
       values.append(target_logits - normalizer)
     if values:
       result = result.index_copy(0, selected, torch.cat(values))

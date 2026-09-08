@@ -186,6 +186,33 @@ class ContextualUnaryTest(unittest.TestCase):
         self.assertTrue(bool(torch.isfinite(base.grad).all()))
         torch.testing.assert_close(base.grad, dense_base.grad, atol=1e-12, rtol=1e-12)
 
+  def test_full_mode_excluded_only_chunks_have_finite_exact_gradients(self):
+    for checkpoint_chunks in (False, True):
+      for excluded_token in (0, 10):
+        with self.subTest(checkpoint=checkpoint_chunks, excluded=excluded_token):
+          chunked = self.activate(self.head('full')).double()
+          dense = copy.deepcopy(chunked)
+          base = self.base.double().clone()
+          base[..., excluded_token] = -torch.inf
+          base.requires_grad_()
+          dense_base = base.detach().clone().requires_grad_()
+          targets = self.targets.clone()
+          targets[targets == excluded_token] = 1
+          actual = chunked.target_log_probs(
+            self.hidden.double(), base, self.time.double(), targets, self.active,
+            vocab_chunk_size=1, checkpoint_chunks=checkpoint_chunks)
+          expected = dense(self.hidden.double(), dense_base, self.time.double())
+          expected = expected.log_softmax(-1).gather(-1, targets[..., None]).squeeze(-1)
+          expected = torch.where(self.active, expected, torch.zeros_like(expected))
+          torch.testing.assert_close(actual, expected, atol=1e-12, rtol=1e-12)
+          (-actual.sum()).backward()
+          (-expected.sum()).backward()
+          for (name, parameter), (_, reference) in zip(chunked.named_parameters(), dense.named_parameters()):
+            self.assertTrue(bool(torch.isfinite(parameter.grad).all()), name)
+            torch.testing.assert_close(parameter.grad, reference.grad, atol=1e-11, rtol=1e-10)
+          self.assertTrue(bool(torch.isfinite(base.grad).all()))
+          torch.testing.assert_close(base.grad, dense_base.grad, atol=1e-12, rtol=1e-12)
+
   def test_empty_mask_returns_differentiable_zero(self):
     head = self.head()
     active = torch.zeros_like(self.active)
