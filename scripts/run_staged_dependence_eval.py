@@ -163,7 +163,7 @@ def _load_model(args, manifest):
 
   expectations = load_production_expectations(args.expectations, expected_sha256=args.expectations_sha256)
   model = build_production_model(
-    model_config='contextual-forest-small', data_config='openwebtext',
+    model_config='contextual-forest-small', data_config='train_openwebtext_pinned',
     backbone_checkpoint=args.checkpoint, expectations=expectations,
     overrides=identity_overrides(manifest['structured_decoder_identity'], args.length),
     runtime_mode='ppl_eval')
