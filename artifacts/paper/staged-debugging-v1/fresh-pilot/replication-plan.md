@@ -1,5 +1,10 @@
 # Unchanged-seed replication, 2026-09-08
 
+Completed: all three seeds finished training and held-out scoring before the
+fixed GPU deadline. The authenticated combined results and full rate profile
+are in `../fresh-three-seeds`. The unchanged plan and recovery history below
+are retained as provenance, not a pending launch queue.
+
 The completed seed-1 reserved-test comparison shows useful dependence for the
 separate-factor head (+0.002837 nats per masked token, paired document 95% CI
 [0.001925, 0.003746]), but no overall advantage over the trained unary adapter

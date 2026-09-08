@@ -56,6 +56,19 @@ the original scores, and plots every development curve and test rate. It
 refuses to overwrite an existing output directory. New timestamps and local
 paths change manifest file hashes, not scores or the canonical selection.
 
+Independently check the reported arithmetic, using only NumPy and the Python
+standard library (no production statistics imports):
+
+```bash
+python scripts/audit_staged_fresh_three_seeds_v1.py \
+  --experiment-root /path/to/staged-debugging-v1 \
+  --combined-results /path/to/new-output-directory/test/results.json
+```
+
+This second check pins the original score files and validates all 240 estimates
+and interval endpoints. It complements, rather than replaces, the recipe's
+checkpoint and development-grid authentication.
+
 Completed aggregate result file SHA256:
 `4aefe030903e42746c79ae9baa67e04758d5bb3bb7247bd7fd67fe88e049be7f`.
 Canonical combined selection:
