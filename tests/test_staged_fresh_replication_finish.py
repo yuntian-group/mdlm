@@ -13,7 +13,7 @@ from deploy.gcloud import finish_staged_fresh_replication_v1 as finish
 class ReplicationFinishTest(unittest.TestCase):
   def test_seal_all_runs_but_score_only_new_unique_checkpoint_files(self):
     with tempfile.TemporaryDirectory() as directory:
-      root = Path(directory)
+      root = Path(directory).resolve()
       files = []
       for seed in (2, 3):
         for arm, step in [('shared', 900), ('directional', 900), ('unary', 1000)]:
