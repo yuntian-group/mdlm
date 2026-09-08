@@ -55,9 +55,13 @@ has 827,312 trainable parameters, in addition to the frozen unary adapter's
    base plus coupling costs twice the original unary adapter's parameter
    count. A win over the frozen base alone does not establish a better use
    of that budget.
-5. **Simultaneous decisions.** Integrate the authenticated head with the
-   generation runner. With identical contexts, reveal order, and RNG, group
-   size one must agree exactly with the frozen unary reference. Then test
+5. **Simultaneous decisions.** The backbone bridge and specialized FP64
+   residual decoder now have generation unit tests. With identical contexts,
+   reveal order, and RNG, tested group-size-one trajectories agree exactly
+   with the selected-test-precision frozen unary reference, including after
+   nonzero couplings. Existing ordinary-output sampler paths are unchanged.
+   This does not claim bitwise equivalence between FP32 and FP64 residual
+   normalization. Add an authenticated real-text launch, then test
    group sizes 2/4/8/16, logging committed edges, quality, and wall time.
    Use a genuinely untouched corpus for the final confirmation.
 
