@@ -152,16 +152,12 @@ def draw(run_dir: Path, output: Path):
                               'axis_limits': list(limits)}
       if inside:
         ax.axhline(floor, color='#979797', linestyle=':', linewidth=1.2)
-        ax.annotate(f'Lower bound {floor:.2f}', (0.98, floor),
+        ax.annotate(f'Lower bound {floor:.2f}', (0.025, floor),
                      xycoords=('axes fraction', 'data'), xytext=(0, 3),
-                     textcoords='offset points', ha='right', va='bottom',
+                     textcoords='offset points', ha='left', va='bottom',
                      fontsize=7.5, color='#666666')
-      else:
-        direction = 'below' if floor < limits[0] else 'above'
-        ax.text(0.98, 0.03, f'Lower bound {floor:.2f} ({direction} axis)',
-                 transform=ax.transAxes, ha='right', va='bottom', fontsize=7.5,
-                 color='#666666', bbox={'facecolor': 'white', 'alpha': 0.8,
-                                        'edgecolor': 'none', 'pad': 1.0})
+      # Bounds outside the plotted loss range remain in the sidecar. Drawing
+      # an extra label inside this axis can obscure the backbone reference.
     ax.set_title(title)
     ax.set_ylabel('NLL per masked token')
   dependence_values = [0.0]
