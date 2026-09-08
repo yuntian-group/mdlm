@@ -8,7 +8,7 @@ ranking or idle denoising steps enter this controlled experiment.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, is_dataclass, replace
 import math
 from typing import Callable, Optional, Sequence
 
@@ -35,8 +35,9 @@ class FixedGroupStep:
   ``row_indices`` maps this possibly shortened batch to original prompts.
   Edges follow the model's original padded edge layout.  An edge counts as
   jointly committed only when both endpoints enter ``revealed_mask`` here.
-  ``proposal_tokens`` preserves context and includes draws for every active
-  position; only positions in ``revealed_mask`` are copied to ``tokens_after``.
+  ``proposal_tokens`` preserves context. Multi-token rows include draws for
+  every active position; singleton rows draw only their selected position,
+  leaving other masks untouched. Only ``revealed_mask`` is committed.
   """
 
   step: int
@@ -143,6 +144,41 @@ def _sample_exact_marginals(output, logits, inference, generator):
   return tokens
 
 
+def _sample_selected_marginals(output, logits, inference, selected, generator):
+  """Sample only selected nodes, with the unchanged base conditional tail.
+
+  For one committed node this is exactly the joint law marginalized over all
+  uncommitted nodes. Both comparison modes call this same function, so their
+  categorical draws, residual draws, and RNG consumption agree exactly.
+  """
+  probabilities = inference.marginals.node_log_marginals[selected].exp()
+  states = torch.multinomial(probabilities, 1, generator=generator).squeeze(-1)
+  candidates = output.candidate_ids[selected]
+  explicit_count = candidates.shape[-1]
+  tokens = candidates.gather(
+    -1, states.clamp_max(explicit_count - 1).unsqueeze(-1)).squeeze(-1)
+  residual = states.eq(explicit_count)
+  if bool(residual.any()):
+    rows, positions = selected.nonzero(as_tuple=True)
+    tail = logits[rows[residual], positions[residual]].clone()
+    tail.scatter_(-1, candidates[residual], -torch.inf)
+    tokens[residual] = torch.multinomial(
+      tail.softmax(dim=-1), 1, generator=generator).squeeze(-1)
+  return tokens
+
+
+def _batch_rows(bundle, rows):
+  """Slice the batch axis of the output/inference dataclass tensor bundles."""
+  changes = {}
+  for field in fields(bundle):
+    value = getattr(bundle, field.name)
+    if torch.is_tensor(value):
+      changes[field.name] = value.index_select(0, rows)
+    elif is_dataclass(value):
+      changes[field.name] = _batch_rows(value, rows)
+  return replace(bundle, **changes)
+
+
 @torch.no_grad()
 def generate_fixed_groups(
     model: ModelCallback,
@@ -172,6 +208,12 @@ def generate_fixed_groups(
   A supplied sampling generator is used only for token identities. If absent,
   a local generator on the input device uses seed zero. Reveal seeds always
   use separate CPU generators and never consume this identity RNG.
+
+  Rows committing one token use the same selected-node marginal draw in joint
+  and marginal modes. At group_size=1, identical callbacks, orders, and initial
+  RNG states therefore give identical trajectories and final RNG states.
+  In mixed-quota batches, singleton rows draw first in original row order;
+  other rows retain the full-forest joint or product-marginal sampling law.
   """
   if initial_tokens.ndim != 2 or initial_tokens.dtype != torch.long or min(initial_tokens.shape) < 1:
     raise ValueError('initial_tokens must be a nonempty long [B,L] tensor')
@@ -202,6 +244,16 @@ def generate_fixed_groups(
     sigma = -torch.log1p(-effective_rate)
     output, logits = model(current.clone(), sigma, current_active.clone())
     _validate_output(output, logits, current, current_active, mask_index)
+
+    # Choose the quota before sampling so singleton rows can marginalize out
+    # every uncommitted node instead of drawing and discarding a full forest.
+    ordered_active = torch.gather(current_active, 1, current_order)
+    selected_in_order = ordered_active & (ordered_active.long().cumsum(-1) <= group_size)
+    revealed = torch.zeros_like(current_active).scatter(1, current_order, selected_in_order)
+    expected_quota = current_active.sum(-1).clamp_max(group_size)
+    if not torch.equal(revealed.sum(-1), expected_quota):
+      raise AssertionError('reveal quota drifted')
+
     if mode == 'backbone':
       proposed = current.clone()
       proposed[current_active] = torch.multinomial(
@@ -209,23 +261,35 @@ def generate_fixed_groups(
         generator=sampling_generator).squeeze(-1)
     else:
       inference = infer_structured_distribution(output, current_active, inference_backend)
-      if mode == 'joint':
-        sampled = sample_structured_tokens(
-          output, logits, current_active, num_samples=1,
-          generator=sampling_generator, inference=inference)[:, 0]
-      else:
-        sampled = _sample_exact_marginals(output, logits, inference, sampling_generator)
-      proposed = torch.where(current_active, sampled, current)
-    if bool(proposed[current_active].eq(mask_index).any()):
+      proposed = current.clone()
+      singleton_rows = expected_quota.eq(1)
+      singleton_selected = revealed & singleton_rows[:, None]
+      if bool(singleton_rows.any()):
+        proposed[singleton_selected] = _sample_selected_marginals(
+          output, logits, inference, singleton_selected, sampling_generator)
+      multiple_rows = (~singleton_rows).nonzero().flatten()
+      if multiple_rows.numel():
+        # Leave the original all-multi-token path untouched. In mixed batches
+        # remove singleton rows from both random draws and tail expansion.
+        if bool(singleton_rows.any()):
+          draw_output = _batch_rows(output, multiple_rows)
+          draw_inference = _batch_rows(inference, multiple_rows)
+          draw_logits = logits.index_select(0, multiple_rows)
+          draw_active = current_active.index_select(0, multiple_rows)
+        else:
+          draw_output, draw_inference = output, inference
+          draw_logits, draw_active = logits, current_active
+        if mode == 'joint':
+          sampled = sample_structured_tokens(
+            draw_output, draw_logits, draw_active, num_samples=1,
+            generator=sampling_generator, inference=draw_inference)[:, 0]
+        else:
+          sampled = _sample_exact_marginals(
+            draw_output, draw_logits, draw_inference, sampling_generator)
+        proposed[multiple_rows] = torch.where(
+          draw_active, sampled, current.index_select(0, multiple_rows))
+    if bool(proposed[revealed].eq(mask_index).any()):
       raise ValueError('sampler returned the absorbing mask as a clean token')
-
-    # Filtering the same immutable permutation fixes the next quota exactly.
-    ordered_active = torch.gather(current_active, 1, current_order)
-    selected_in_order = ordered_active & (ordered_active.long().cumsum(-1) <= group_size)
-    revealed = torch.zeros_like(current_active).scatter(1, current_order, selected_in_order)
-    expected_quota = current_active.sum(-1).clamp_max(group_size)
-    if not torch.equal(revealed.sum(-1), expected_quota):
-      raise AssertionError('reveal quota drifted')
     updated = torch.where(revealed, proposed, current)
     next_active = current_active & ~revealed
     edges = output.edge_index.clamp(0, tokens.shape[1] - 1)

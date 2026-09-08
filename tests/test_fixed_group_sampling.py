@@ -1,11 +1,15 @@
 import math
 import dataclasses
 import unittest
+from unittest import mock
 
 import torch
 
-from evaluation.fixed_group_sampling import generate_fixed_groups, make_reveal_order
+from evaluation.fixed_group_sampling import (
+  _sample_exact_marginals, generate_fixed_groups, make_reveal_order,
+)
 from models.structured_decoder import StructuredDecoderOutput
+from structured_objective import infer_structured_distribution, sample_structured_tokens
 
 
 def _output(logits, active, edge_index=None, edge_mask=None, left=None, right=None):
@@ -65,7 +69,129 @@ class UniformOracle:
     return _output(logits, active), logits
 
 
+class DynamicResidualOracle:
+  """Context-sensitive active chain with two candidates and a two-token tail."""
+
+  def __init__(self, generator):
+    self.generator = generator
+    self.rng_states = []
+
+  def __call__(self, tokens, sigma, active):
+    self.rng_states.append(self.generator.get_state().clone())
+    batch, length = tokens.shape
+    logits = torch.tensor([0.1, 0.15, 0.45, 0.3]).log().expand(batch, length, 4).clone()
+    context = torch.where(active, 0, tokens).sum(-1).float()
+    logits[..., 0] += 0.17 * context[:, None] + sigma[:, None]
+    logits[..., 2] -= 0.11 * context[:, None]
+    edges = torch.zeros(batch, max(0, length - 1), 2, dtype=torch.long)
+    edge_mask = torch.zeros(batch, max(0, length - 1), dtype=torch.bool)
+    for row in range(batch):
+      positions = active[row].nonzero().flatten()
+      count = max(0, len(positions) - 1)
+      edges[row, :count] = torch.stack((positions[:-1], positions[1:]), -1)
+      edge_mask[row, :count] = True
+    left = torch.tensor([[2.0, 0.2], [0.1, 1.3]]).expand(batch, edges.shape[1], 2, 2).clone()
+    right = torch.tensor([[0.2, 1.0], [1.8, 0.1]]).expand_as(left).clone()
+    output = _output(logits, active, edges, edge_mask, left, right)
+    residual = logits[..., 2:].logsumexp(-1)
+    output = dataclasses.replace(
+      output, candidate_ids=torch.tensor([0, 1]).expand(batch, length, 2),
+      unary_log_potentials=torch.cat((logits[..., :2], residual[..., None]), -1),
+      candidate_state_mask=torch.ones(batch, length, 3, dtype=torch.bool),
+      residual_log_mass=residual,
+      retained_mass=logits.softmax(-1)[..., :2].sum(-1))
+    return output, logits
+
+
 class FixedGroupSamplingTest(unittest.TestCase):
+
+  def test_group_one_has_identical_trajectories_and_rng_for_dynamic_residual_forests(self):
+    initial = torch.tensor([
+      [4, 4, 4, 4, 4], [4, 0, 4, 1, 4], [0, 1, 4, 2, 3], [0, 1, 2, 3, 0],
+    ]).repeat(12, 1)
+    order = make_reveal_order(5, list(range(len(initial))))
+    for backend in ('dense', 'low_rank'):
+      results, states, final_states = [], [], []
+      for mode in ('joint', 'marginal'):
+        generator = torch.Generator().manual_seed(131)
+        oracle = DynamicResidualOracle(generator)
+        # A singleton joint draw must never sample and discard other nodes.
+        with mock.patch('evaluation.fixed_group_sampling.sample_structured_tokens',
+                        side_effect=AssertionError('singleton invoked full-forest sampling')):
+          result = generate_fixed_groups(
+            oracle, initial, mask_index=4, group_size=1, mode=mode,
+            reveal_order=order, sampling_generator=generator, inference_backend=backend)
+        results.append(result)
+        states.append(oracle.rng_states)
+        final_states.append(generator.get_state())
+      self.assertTrue(torch.equal(results[0].final_tokens, results[1].final_tokens))
+      self.assertTrue(torch.equal(final_states[0], final_states[1]))
+      self.assertEqual(len(states[0]), 5)
+      for first, second in zip(states[0], states[1]):
+        self.assertTrue(torch.equal(first, second))
+      for first, second in zip(results[0].steps, results[1].steps):
+        for name in ('tokens_before', 'tokens_after', 'proposal_tokens', 'revealed_mask',
+                     'active_before', 'active_after', 'row_indices', 'edge_index', 'edge_mask'):
+          self.assertTrue(torch.equal(getattr(first, name), getattr(second, name)), name)
+        uncommitted = first.active_before & ~first.revealed_mask
+        self.assertTrue(bool(first.proposal_tokens[uncommitted].eq(4).all()))
+      generated = results[0].final_tokens[initial.eq(4)]
+      self.assertTrue(bool(generated.eq(2).any()))
+      self.assertTrue(bool(generated.eq(3).any()))
+
+  def test_mixed_quotas_draw_singletons_first_and_leave_only_multitoken_rows_in_joint(self):
+    initial = torch.tensor([
+      [4, 4, 4, 4, 4], [0, 4, 1, 2, 3], [4, 0, 4, 1, 4], [0, 1, 2, 3, 0],
+    ])
+    order = torch.arange(5).expand_as(initial)
+    results = []
+    for backend in ('dense', 'low_rank'):
+      for mode in ('joint', 'marginal'):
+        generator = torch.Generator().manual_seed(202)
+        oracle = DynamicResidualOracle(generator)
+        with mock.patch('evaluation.fixed_group_sampling.sample_structured_tokens',
+                        wraps=sample_structured_tokens) as joint_draw:
+          result = generate_fixed_groups(
+            oracle, initial, mask_index=4, group_size=4, mode=mode,
+            reveal_order=order, sampling_generator=generator, inference_backend=backend)
+        if mode == 'joint':
+          self.assertEqual(joint_draw.call_count, 1)
+          args = joint_draw.call_args.args
+          self.assertEqual(args[0].candidate_ids.shape[0], 2)
+          self.assertEqual(args[2].sum(-1).tolist(), [5, 3])
+        else:
+          self.assertEqual(joint_draw.call_count, 0)
+        self.assertEqual(result.nfe.tolist(), [2, 1, 1, 0])
+        self.assertEqual(result.steps[0].revealed_mask.sum(-1).tolist(), [4, 1, 3])
+        self.assertEqual(result.steps[1].revealed_mask.sum(-1).tolist(), [1])
+        self.assertTrue(torch.equal(result.final_tokens[initial.ne(4)], initial[initial.ne(4)]))
+        results.append(result)
+      # On the first mixed step both modes start with the same RNG. Its
+      # singleton draw precedes either mode's different multi-token draws.
+      self.assertEqual(results[-2].final_tokens[1, 1].item(), results[-1].final_tokens[1, 1].item())
+
+  def test_all_multitoken_path_preserves_original_draws_and_rng(self):
+    initial = torch.tensor([[4, 4, 4], [4, 0, 4]])
+    active = initial.eq(4)
+    sigma = -torch.log1p(-active.float().mean(-1).clamp_max(0.999))
+    for backend in ('dense', 'low_rank'):
+      for mode in ('joint', 'marginal'):
+        reference_rng = torch.Generator().manual_seed(907)
+        output, logits = DynamicResidualOracle(reference_rng)(initial, sigma, active)
+        inference = infer_structured_distribution(output, active, backend)
+        if mode == 'joint':
+          expected = sample_structured_tokens(
+            output, logits, active, generator=reference_rng, inference=inference)[:, 0]
+        else:
+          expected = _sample_exact_marginals(output, logits, inference, reference_rng)
+        expected = torch.where(active, expected, initial)
+        actual_rng = torch.Generator().manual_seed(907)
+        result = generate_fixed_groups(
+          DynamicResidualOracle(actual_rng), initial, mask_index=4, group_size=4,
+          mode=mode, reveal_order=torch.arange(3).expand_as(initial),
+          sampling_generator=actual_rng, inference_backend=backend)
+        self.assertTrue(torch.equal(result.final_tokens, expected))
+        self.assertTrue(torch.equal(actual_rng.get_state(), reference_rng.get_state()))
 
   def test_pair_joint_generation_preserves_both_modes_but_marginals_break_pairs(self):
     count = 1500
