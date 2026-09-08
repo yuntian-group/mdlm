@@ -86,12 +86,13 @@ def draw(run_dir, test_dir, selection_path, output):
   ax.axhline(0, color='#333333', linewidth=.8)
   ax.set(title='Checkpoint selection on development documents',
          xlabel='Training updates', ylabel='Gain over backbone\n(nats per masked token)')
-  ax.legend(loc='best', frameon=False, fontsize=8)
+  ax.legend(loc='lower right', frameon=True, facecolor='white',
+             edgecolor='none', framealpha=1, fontsize=8)
   ax.text(1, -.32, 'Dots mark selected checkpoints. Higher is better.',
            transform=ax.transAxes, ha='right', fontsize=8, color='#555555')
   rates = sorted(test['by_mask_rate'], key=float)
   groups = [test['overall']] + [test['by_mask_rate'][rate] for rate in rates]
-  labels = ['All masks'] + [f'{float(rate):.0%}' for rate in rates]
+  labels = ['Pooled'] + [f'{float(rate):.0%}' for rate in rates]
   for index, (key, title) in enumerate((
       ('directional_vs_unary', 'Separate factors vs. unary'),
       ('directional_dependence_gain', 'Joint vs. its own marginals'))):
