@@ -86,7 +86,7 @@ def draw(run_dir, test_dir, selection_path, output):
   ax.axhline(0, color='#333333', linewidth=.8)
   ax.set(title='Checkpoint selection on development documents',
          xlabel='Training updates', ylabel='Gain over backbone\n(nats per masked token)')
-  ax.legend(loc='lower right', frameon=True, facecolor='white',
+  ax.legend(loc='center right', bbox_to_anchor=(1, .4), frameon=True, facecolor='white',
              edgecolor='none', framealpha=1, fontsize=8)
   ax.text(1, -.32, 'Dots mark selected checkpoints. Higher is better.',
            transform=ax.transAxes, ha='right', fontsize=8, color='#555555')
