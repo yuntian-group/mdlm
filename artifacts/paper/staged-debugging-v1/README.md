@@ -78,6 +78,15 @@ not replace or be pooled into the existing four-corpus benchmark.
 Full diagnostic heads and logs are backed up in the workspace output folder
 and retained on the new experiment disk, not added as large Git objects.
 
+Cloud recovery locations: project `interactive-training-2026`, zone
+`us-central1-a`, VM `diffusion-staged-debug-l4-20260907`, new disk
+`diffusion-staged-debug-data-20260907`, experiment root
+`/mnt/contextual-forest/staged-debug-20260907`. The exact original training
+checkout remains detached at `bdb505b` in `code/`; later diagnostics use
+separate checkouts. The initial failed tokenizer log is retained along with
+the successful retry logs. Saved caches and head weights are under
+`overfit32-v1/`; they are not benchmark-trained checkpoints.
+
 ## Direct dependence controls
 
 `evaluation/dependence_diagnostics.py` separates the joint score into singleton

@@ -1,5 +1,26 @@
 # Paper and Experiment Strategy
 
+## Current direction: 2026-09-07
+
+The dated execution snapshot below is historical, not the current launch
+queue. Start with `artifacts/paper/staged-debugging-v1/README.md` for the
+completed staged diagnosis and its machine-readable records.
+
+The shared scorer fails balanced AB/BA with uniform unaries for a provable
+capacity reason. Separate endpoints repair that restriction. In the completed
+32-example text fit, however, the separate head's lower training loss comes
+from better token marginals; the learned dependence does not transfer to
+development documents. A unary adapter fits much closer to the support bound.
+
+Next: inspect the still-decreasing pair training curves before diagnosing
+convergence, then train on fresh corruptions with a strong unary control and
+separate singleton/dependence reporting. Only a setting with useful held-out
+dependence advances to fixed-group joint-versus-marginal generation at group
+sizes 1/2/4/8/16. Replicate a surviving effect before broadening the benchmark.
+Do not launch the historical grid or treat old pending-job notes as live jobs.
+
+## Historical implementation snapshot (2026-08-31)
+
 Status: implementation and verified-evidence snapshot, 2026-08-31. This
 document is the contract between the paper claims and the experiments. It must
 be revised whenever evidence contradicts the current story.
