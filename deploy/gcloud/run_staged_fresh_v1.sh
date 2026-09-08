@@ -23,6 +23,7 @@ export HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 TRANSFORMERS_OFFLINE=1 PYTHONUNBUF
   --expectations "${RELEASE}/expectations/production-expectations-v2.json" \
   --expected-expectations-sha256 a978c17befc2788b0b773eee7cd608ac0200379947a63a0ba8699a0b9818c956 \
   --output-dir "${EXPERIMENT_ROOT}/fresh-${RUN_MODE}-v1" \
+  --override model.length=128 \
   --train-examples "${train_count}" --dev-examples "${dev_count}" --length 128 \
   --steps "${updates}" --warmup-steps "${warmup}" --eval-every "${interval}" \
   --batch-size 4 --backbone-batch-size 1 --learning-rate .0003 \
