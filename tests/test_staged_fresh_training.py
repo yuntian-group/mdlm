@@ -28,8 +28,8 @@ class StagedFreshTrainingTest(unittest.TestCase):
     self.tokens = torch.tensor([[1, 2, 3, 4, 5, 6], [2, 3, 4, 5, 6, 7],
                                 [3, 4, 5, 6, 7, 8], [4, 5, 6, 7, 8, 9]])
 
-  def trainer(self, *, batch_size=2, warmup=0, identity=None):
-    backbone = copy.deepcopy(self.backbone)
+  def trainer(self, *, batch_size=2, warmup=0, identity=None, device='cpu'):
+    backbone = copy.deepcopy(self.backbone).to(device)
     call_counter = {'count': 0}
 
     def encode(*args, **kwargs):
@@ -41,7 +41,7 @@ class StagedFreshTrainingTest(unittest.TestCase):
                             _structured_backbone_output=encode)
     heads = {arm: make_head(arm, 8, 11, seed=3, rank=4, unary_rank=4,
                             top_k=4, time_embed_dim=6, init_std=0.25) for arm in ARMS}
-    trainer = FreshTrainer(model, heads, self.tokens, seed=3,
+    trainer = FreshTrainer(model, heads, self.tokens, seed=3, device=device,
                             batch_size=batch_size, backbone_batch_size=1,
                             mask_rates=(0.5, 0.75), learning_rate=0.01,
                             pair_warmup_steps=warmup, identity=identity)
@@ -137,6 +137,76 @@ class StagedFreshTrainingTest(unittest.TestCase):
     wrong, _ = self.trainer(warmup=0)
     with self.assertRaisesRegex(ValueError, 'configuration differs'):
       wrong.load_state_dict(resumed.state_dict())
+
+  @unittest.skipUnless(torch.cuda.is_available(), 'CUDA resume regression requires a GPU')
+  def test_cuda_map_location_resume_matches_uninterrupted_updates_exactly(self):
+    """Exercise the production CUDA load, including relocated Adam step tensors.
+
+    No optimizer-state normalization or runner patch is applied in this test:
+    if CUDA relocation changes updates, the strict comparison must expose it.
+    """
+    for backend in (torch.backends.cuda.matmul, torch.backends.cudnn):
+      previous = backend.allow_tf32
+      self.addCleanup(setattr, backend, 'allow_tf32', previous)
+      backend.allow_tf32 = False
+    uninterrupted, _ = self.trainer(warmup=2, device='cuda')
+    for _ in range(6):
+      uninterrupted.train_step()
+    expected = copy.deepcopy(uninterrupted.state_dict())
+    interrupted, _ = self.trainer(warmup=2, device='cuda')
+    for _ in range(3):
+      interrupted.train_step()
+    # Default non-capturable AdamW creates CPU scalar step counters even when
+    # its parameters and moment estimates are on CUDA.
+    for optimizer in interrupted.optimizers.values():
+      self.assertTrue(optimizer.state)
+      for parameter_state in optimizer.state.values():
+        self.assertEqual(parameter_state['step'].device.type, 'cpu')
+    with tempfile.TemporaryDirectory() as directory:
+      checkpoint = Path(directory) / 'step-000003.pt'
+      save_checkpoint(interrupted, checkpoint)
+      resumed, _ = self.trainer(warmup=2, device='cuda')
+      loaded = torch.load(checkpoint, map_location='cuda', weights_only=True)
+      for optimizer_state in loaded['optimizers'].values():
+        for parameter_state in optimizer_state['state'].values():
+          self.assertEqual(parameter_state['step'].device.type, 'cuda')
+      resumed.load_state_dict(loaded)
+      for _ in range(3):
+        resumed.train_step()
+    actual = resumed.state_dict()
+    for key in ('completed_steps', 'cursor', 'epoch', 'config', 'identity'):
+      self.assertEqual(actual[key], expected[key], key)
+    for key in ('permutation', 'order_rng_state', 'mask_rng_state',
+                'rate_rng_state', 'torch_rng_state'):
+      torch.testing.assert_close(actual[key].cpu(), expected[key].cpu(), atol=0, rtol=0)
+    self.assertEqual(len(actual['cuda_rng_states']), len(expected['cuda_rng_states']))
+    self.assertTrue(actual['cuda_rng_states'])
+    for actual_rng, expected_rng in zip(actual['cuda_rng_states'], expected['cuda_rng_states']):
+      torch.testing.assert_close(actual_rng.cpu(), expected_rng.cpu(), atol=0, rtol=0)
+    for arm in ARMS:
+      with self.subTest(arm=arm):
+        for name, value in actual['heads'][arm].items():
+          torch.testing.assert_close(value, expected['heads'][arm][name], atol=0, rtol=0)
+        optimizer_actual, optimizer_expected = actual['optimizers'][arm], expected['optimizers'][arm]
+        self.assertEqual(optimizer_actual['param_groups'], optimizer_expected['param_groups'])
+        self.assertEqual(optimizer_actual['state'].keys(), optimizer_expected['state'].keys())
+        for parameter, values in optimizer_actual['state'].items():
+          self.assertEqual(values.keys(), optimizer_expected['state'][parameter].keys())
+          for name, value in values.items():
+            reference = optimizer_expected['state'][parameter][name]
+            if torch.is_tensor(value):
+              torch.testing.assert_close(value.cpu(), reference.cpu(), atol=0, rtol=0)
+            else:
+              self.assertEqual(value, reference)
+    self.assertEqual(len(actual['step_history']), 6)
+    for actual_step, expected_step in zip(actual['step_history'], expected['step_history']):
+      for key in ('document_indices', 'mask_rate', 'active_token_count', 'mask_sha256',
+                  'clean_token_sha256', 'corrupted_token_sha256'):
+        self.assertEqual(actual_step[key], expected_step[key], key)
+      for arm in ARMS:
+        for key in ('nll_per_masked_token', 'nll_sum', 'gradient_norm_before_clip', 'factor_mode'):
+          self.assertEqual(actual_step['arms'][arm][key], expected_step['arms'][arm][key],
+                           f'step {actual_step["step"]}: {arm}/{key}')
 
   def test_fixed_dev_cache_records_pair_and_include_step_zero(self):
     trainer, _ = self.trainer()
