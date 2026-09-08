@@ -292,6 +292,21 @@ class StagedFreshTestAggregationTest(unittest.TestCase):
       summary, _ = self.call(fixture, run_dirs={1: moved})
       self.assertEqual(summary['overall']['training_seeds'], 3)
 
+  def test_combined_seal_can_be_created_from_verified_relocated_runs(self):
+    with tempfile.TemporaryDirectory() as directory:
+      fixture = self.fixture(Path(directory))
+      original = {shard[0]: shard[0].read_bytes() for shard in fixture['shards']}
+      moved = Path(directory) / 'relocated-seed1'
+      fixture['runs'][0].rename(moved)
+      new_seal = Path(directory) / 'combined-after-relocation'
+      seal([moved, *fixture['runs'][1:]], fixture['data'], file_sha256(fixture['data']), new_seal)
+      fixture['combined'] = new_seal / 'selection-manifest.json'
+      summary, lineage = self.call(fixture, run_dirs={1: moved})
+      self.assertEqual(summary['overall']['training_seeds'], 3)
+      self.assertEqual(lineage['training_runs'][0]['authenticated_run_dir'], str(moved.resolve()))
+      for path, payload in original.items():
+        self.assertEqual(path.read_bytes(), payload)
+
 
 if __name__ == '__main__':
   unittest.main()

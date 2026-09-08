@@ -233,7 +233,11 @@ def _load_shard(spec, combined, data_manifest, data_digest, run_dirs):
           'test commitment uses another backbone')
     if seed not in combined['reports']:
       raise ValueError('test shard seed is absent from the combined seal')
-    _same(seal['reports'][seed], combined['reports'][seed],
+    # A new combined seal may be made from authenticated local backups. The
+    # location is not training content; both copies have already passed the
+    # complete grid and final-ledger checks above. Keep every other field exact.
+    _same({key: value for key, value in seal['reports'][seed].items() if key != 'run_dir'},
+          {key: value for key, value in combined['reports'][seed].items() if key != 'run_dir'},
           'combined seal changes an original sealed training run')
   source = results['test_source']
   if (source['file_sha256'] != commitment['test_file_sha256']
