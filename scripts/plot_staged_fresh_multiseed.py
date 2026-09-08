@@ -82,8 +82,10 @@ def read_inputs(run_dirs, test_dir, selection_path):
 def draw(run_dirs, test_dir, selection_path, output):
   runs, test, selection, sources = read_inputs(run_dirs, test_dir, selection_path)
   sources['plot_script'] = sha(Path(__file__))
-  plt.rcParams.update({'font.family': 'DejaVu Sans', 'font.size': 9,
-                       'axes.labelsize': 9, 'axes.titlesize': 10, 'pdf.fonttype': 42})
+  # The 6.6-inch source is printed at 5.5 inches in the manuscript. Keep the
+  # smallest native type at 9.6 points so the final figure remains >=8 points.
+  plt.rcParams.update({'font.family': 'DejaVu Sans', 'font.size': 9.6,
+                       'axes.labelsize': 9.6, 'axes.titlesize': 10.5, 'pdf.fonttype': 42})
   fig = plt.figure(figsize=(6.6, 6.3))
   outer = fig.add_gridspec(2, 1, left=.13, right=.97, top=.84, bottom=.14, hspace=.82)
   development = outer[0].subgridspec(1, len(runs), wspace=.18)
@@ -109,14 +111,14 @@ def draw(run_dirs, test_dir, selection_path, output):
     panel.axhline(0, color='#555555', linewidth=.7)
     panel.set(title=f'Seed {seed}', xlabel='Updates', ylim=limits,
                xticks=[0, run['target_steps'] // 2, run['target_steps']])
-    panel.tick_params(labelsize=8, labelleft=index == 0)
+    panel.tick_params(labelsize=9.6, labelleft=index == 0)
     if index == 0:
       panel.set_ylabel('Gain over backbone\n(nats per masked token)')
   fig.suptitle('Development checkpoint selection', y=.96, fontsize=11)
   fig.legend(handles=handles, loc='upper center', bbox_to_anchor=(.55, .925),
-               ncol=3, frameon=False, fontsize=8)
-  fig.text(.55, .515, 'Dots mark selected checkpoints. Higher is better.',
-             ha='center', color='#555555', fontsize=8)
+               ncol=3, frameon=False, fontsize=9.6)
+  fig.text(.55, .49, 'Dots mark selected checkpoints. Higher is better.',
+             ha='center', color='#555555', fontsize=9.6)
   panels = outer[1].subgridspec(1, 2, wspace=.48)
   rates = sorted(test['by_mask_rate'], key=float)
   groups = [test['overall']] + [test['by_mask_rate'][rate] for rate in rates]
@@ -133,15 +135,15 @@ def draw(run_dirs, test_dir, selection_path, output):
     panel.axvline(0, color='#555555', linewidth=.8)
     panel.set_yticks(range(len(labels)), labels)
     panel.invert_yaxis()
-    panel.set_title(title, fontsize=9)
-    panel.set_xlabel('Test log-score gain\n(nats per masked token)', fontsize=8)
+    panel.set_title(title, fontsize=10)
+    panel.set_xlabel('Test log-score gain\n(nats per masked token)', fontsize=9.6)
     panel.grid(axis='x', alpha=.16)
-    panel.tick_params(labelsize=8)
+    panel.tick_params(labelsize=9.6)
     panel.ticklabel_format(axis='x', style='plain', useOffset=False)
   for panel in fig.axes:
     panel.spines[['top', 'right']].set_visible(False)
-  fig.text(.55, .035, f'95% crossed seed/document-bootstrap intervals; {len(runs)} training seeds.',
-             ha='center', fontsize=8, color='#555555')
+  fig.text(.55, .016, f'95% crossed seed/document-bootstrap intervals; {len(runs)} training seeds.',
+             ha='center', fontsize=9.6, color='#555555')
   output.parent.mkdir(parents=True, exist_ok=True)
   fig.savefig(output)
   fig.savefig(output.with_suffix('.png'), dpi=180)
