@@ -191,7 +191,10 @@ def _validate_run(run_dir, manifest):
     'dev_documents': dev_documents, 'mask_rates': rates,
     'protocol_file_sha256': protocol_sha, 'results_file_sha256': result_sha,
     'dev_records_file_sha256': ledger['dev-records.jsonl'], 'hash_ledger_file_sha256': ledger_sha,
-    'identity_sha256': protocol['identity_sha256'], 'checkpoint_hashes': checkpoint_hashes,
+    'identity_sha256': protocol['identity_sha256'],
+    # JSON object keys are strings. Canonicalize before hashing so numeric
+    # step ordering cannot change to lexicographic ordering after a roundtrip.
+    'checkpoint_hashes': {str(step): digest for step, digest in checkpoint_hashes.items()},
     'best_dev_checkpoints': results['best_dev_checkpoints'],
     'training_config': config,
   }

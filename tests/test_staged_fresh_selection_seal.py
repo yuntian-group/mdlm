@@ -17,7 +17,7 @@ class StagedFreshSelectionSealTest(unittest.TestCase):
   def write_json(path, value):
     path.write_text(json.dumps(value, indent=2, sort_keys=True) + '\n')
 
-  def fixture(self, root, *, seed=3):
+  def fixture(self, root, *, seed=3, final_step=3, interval=2):
     run = root / f'run-{seed}'
     (run / 'checkpoints').mkdir(parents=True)
     manifest = {
@@ -33,7 +33,7 @@ class StagedFreshSelectionSealTest(unittest.TestCase):
     self.write_json(manifest_path, manifest)
     rates = [0.25, 0.5]
     identity = {
-      'dataset': 'corpus', 'eval_every': 2,
+      'dataset': 'corpus', 'eval_every': interval,
       'source_sha256': {name: file_sha256(REPO_ROOT / name) for name in SOURCE_FILES},
       **{f'{split}_source': {'examples': 2, 'length': 8, 'file_sha256': sha(split),
                             'document_ids_sha256': canonical_sha256(manifest['splits'][split]['source_document_sha256'])}
@@ -44,12 +44,12 @@ class StagedFreshSelectionSealTest(unittest.TestCase):
       'test_data_access': False, 'document_disjoint': True, 'step_zero_included': True,
       'identity': identity, 'identity_sha256': canonical_sha256(identity),
       'training_config': {'seed': seed, 'mask_rates': rates, 'backbone_batch_size': 1, 'batch_size': 2},
-      'arguments': {'steps': 3, 'eval_every': 2, 'seed': seed, 'mask_rates': rates,
+      'arguments': {'steps': final_step, 'eval_every': interval, 'seed': seed, 'mask_rates': rates,
                     'train_examples': 2, 'dev_examples': 2},
     }
     self.write_json(run / 'protocol.json', protocol)
     rows, evaluations = [], []
-    for step in (0, 2, 3):
+    for step in sorted({0, final_step, *range(interval, final_step + 1, interval)}):
       checkpoint = run / 'checkpoints' / f'step-{step:06d}.pt'
       # The sealer hashes checkpoint bytes but must not deserialize them.
       checkpoint.write_bytes(f'non-pickle fixture: seed={seed}, step={step}'.encode())
@@ -59,7 +59,7 @@ class StagedFreshSelectionSealTest(unittest.TestCase):
         group = []
         for index, document in enumerate(manifest['splits']['dev']['source_document_sha256']):
           for rate_index, rate in enumerate(rates):
-            gain = (0.6 if step == 2 else 0.4) if arm == 'directional' else 0.1 * step
+            gain = (0.6 if step == interval else 0.4) if arm == 'directional' else 0.1 * step / (final_step / 3)
             row = observation(arm, seed, step, document, rate, gain=gain)
             row.update(checkpoint_sha256=checkpoint_hash, example_index=index,
                        corruption_seed=seed + 900000 + rate_index)
@@ -75,9 +75,9 @@ class StagedFreshSelectionSealTest(unittest.TestCase):
       choice = min(evaluations, key=lambda row: (row['arms'][arm]['joint_nll_per_masked_token'], row['step']))
       best[arm] = {'step': choice['step'], 'checkpoint_sha256': choice['checkpoint_sha256'],
                    'dev_joint_nll_per_masked_token': choice['arms'][arm]['joint_nll_per_masked_token']}
-    results = {'completed': True, 'completed_steps': 3, 'target_steps': 3,
+    results = {'completed': True, 'completed_steps': final_step, 'target_steps': final_step,
                'protocol_sha256': file_sha256(run / 'protocol.json'),
-               'training_mask_rate_histogram': {'0.25': 1, '0.5': 2},
+               'training_mask_rate_histogram': {'0.25': final_step // 2, '0.5': final_step - final_step // 2},
                'evaluations': evaluations, 'best_dev_checkpoints': best}
     self.write_json(run / 'results.json', results)
     self.rehash(run)
@@ -109,6 +109,20 @@ class StagedFreshSelectionSealTest(unittest.TestCase):
         {key: value for key, value in sidecar.items() if key != 'manifest_sha256'}))
       with self.assertRaises(FileExistsError):
         self.call_seal(root, run, manifest_path)
+
+  def test_sidecar_digest_survives_json_roundtrip_with_step_1000(self):
+    with tempfile.TemporaryDirectory() as directory:
+      root = Path(directory)
+      run, manifest_path, _ = self.fixture(root, final_step=1000, interval=100)
+      selection, sidecar = self.call_seal(root, run, manifest_path)
+      loaded = json.loads((root / 'selection' / 'selection-manifest.json').read_text())
+      expected = {str(step) for step in range(0, 1001, 100)}
+      self.assertEqual(set(sidecar['runs'][0]['checkpoint_hashes']), expected)
+      self.assertEqual(sidecar, loaded)
+      self.assertEqual(loaded['manifest_sha256'], canonical_sha256(
+        {key: value for key, value in loaded.items() if key != 'manifest_sha256'}))
+      self.assertEqual(load_selection(root / 'selection' / 'selection.json',
+                                      loaded['selection_file_sha256']), selection)
 
   def test_entire_missing_step_document_or_rate_fails_even_with_updated_ledger(self):
     filters = [lambda row: row['checkpoint_step'] != 0,

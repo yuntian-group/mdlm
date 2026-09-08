@@ -3,6 +3,8 @@ set -euo pipefail
 
 readonly EXPERIMENT_ROOT=/mnt/contextual-forest/staged-debug-20260907
 readonly CODE_DIR="${1:?supply the unchanged training checkout}"
+readonly RUN_TAG="${2:-v1}"
+case "${RUN_TAG}" in v1|retry1-v1) ;; *) exit 2 ;; esac
 readonly RELEASE=/mnt/contextual-forest/releases/contextual-forest-adapter-cf8b808-20260831T131607Z
 cd "${CODE_DIR}"
 export HF_HOME=/mnt/contextual-forest/hf-home
@@ -21,12 +23,12 @@ for training_seed in 2 3; do
     --backbone-checkpoint "${RELEASE}/inputs/mdlm-owt-backbone-schema-v2.pt" \
     --expectations "${RELEASE}/expectations/production-expectations-v2.json" \
     --expected-expectations-sha256 a978c17befc2788b0b773eee7cd608ac0200379947a63a0ba8699a0b9818c956 \
-    --output-dir "${EXPERIMENT_ROOT}/fresh-replication-seed${training_seed}-v1" \
+    --output-dir "${EXPERIMENT_ROOT}/fresh-replication-seed${training_seed}-${RUN_TAG}" \
     --override model.length=128 \
     --train-examples 2048 --dev-examples 64 --length 128 \
     --steps 1000 --warmup-steps 100 --eval-every 100 \
     --batch-size 4 --backbone-batch-size 1 --learning-rate .0003 \
     --mask-rates .25 .5 .75 .9 --rank 16 --directional-rank 8 --unary-rank 16 \
     --top-k 64 --factor-init-std .25 --seed "${training_seed}" --device cuda \
-    > "${EXPERIMENT_ROOT}/logs/fresh-replication-seed${training_seed}-v1.log" 2>&1
+    > "${EXPERIMENT_ROOT}/logs/fresh-replication-seed${training_seed}-${RUN_TAG}.log" 2>&1
 done

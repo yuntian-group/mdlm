@@ -25,3 +25,10 @@ The existing L4 VM and dedicated experiment disk are reused. The original
 absolute shutdown deadline, 2026-09-08 04:49:24 UTC, is unchanged. A bounded
 sequential queue runs seeds 2 and 3; an interrupted or failed run is retained
 and cannot pass the complete-run selection sealer.
+
+The first queue was preempted at 03:01:44 UTC during seed 2's initial
+development evaluation, before any training updates were saved. Its
+step-zero checkpoint and partial outputs are retained. The retry uses fresh
+`retry1-v1` output directories and the same initialization and settings;
+this is a restart from initialization, not an optimizer resume. The original
+absolute shutdown deadline is restored after VM restart.
