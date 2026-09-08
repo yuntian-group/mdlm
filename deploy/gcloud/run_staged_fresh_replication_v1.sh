@@ -5,6 +5,13 @@ readonly EXPERIMENT_ROOT=/mnt/contextual-forest/staged-debug-20260907
 readonly CODE_DIR="${1:?supply the unchanged training checkout}"
 readonly RUN_TAG="${2:-v1}"
 case "${RUN_TAG}" in v1|retry1-v1) ;; *) exit 2 ;; esac
+training_seeds=(2 3)
+if (( $# > 2 )); then
+  training_seeds=("${@:3}")
+  for training_seed in "${training_seeds[@]}"; do
+    case "${training_seed}" in 2|3) ;; *) exit 2 ;; esac
+  done
+fi
 readonly RELEASE=/mnt/contextual-forest/releases/contextual-forest-adapter-cf8b808-20260831T131607Z
 cd "${CODE_DIR}"
 export HF_HOME=/mnt/contextual-forest/hf-home
@@ -14,7 +21,7 @@ export HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 TRANSFORMERS_OFFLINE=1 PYTHONUNBUF
 # Replicate the full prespecified mask-rate profile after the seed-1 pilot.
 # No setting, data split, selection rule, or primary comparison is changed.
 # The VM's original absolute shutdown deadline remains in force.
-for training_seed in 2 3; do
+for training_seed in "${training_seeds[@]}"; do
   /mnt/contextual-forest/venv/bin/python scripts/run_staged_fresh_training.py \
     --train-jsonl "${EXPERIMENT_ROOT}/fresh-data-v1/train.jsonl" \
     --dev-jsonl "${EXPERIMENT_ROOT}/fresh-data-v1/dev.jsonl" \

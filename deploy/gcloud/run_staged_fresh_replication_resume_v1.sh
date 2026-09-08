@@ -5,6 +5,8 @@ readonly EXPERIMENT_ROOT=/mnt/contextual-forest/staged-debug-20260907
 readonly CODE_DIR="${1:?supply the unchanged training checkout}"
 readonly RESUME_STEP="${2:?supply the verified saved update}"
 readonly RESUME_SHA="${3:?supply the saved checkpoint SHA256}"
+readonly QUEUE_MODE="${4:-both}"
+case "${QUEUE_MODE}" in both|seed2-only) ;; *) exit 2 ;; esac
 [[ "${RESUME_STEP}" =~ ^[0-9]+$ && "${RESUME_SHA}" =~ ^[0-9a-f]{64}$ ]]
 (( RESUME_STEP >= 0 && RESUME_STEP <= 1000 && RESUME_STEP % 100 == 0 ))
 readonly RELEASE=/mnt/contextual-forest/releases/contextual-forest-adapter-cf8b808-20260831T131607Z
@@ -48,6 +50,7 @@ for ((step=0; step<RESUME_STEP; step+=100)); do
   cp -n "${SOURCE_RUN}/checkpoints/${prefix_filename}" "${RESUMED_RUN}/checkpoints/${prefix_filename}"
 done
 wait "${training_pid}"
+[[ "${QUEUE_MODE}" == both ]] || exit 0
 /mnt/contextual-forest/venv/bin/python scripts/run_staged_fresh_training.py "${common[@]}" \
   --seed 3 --output-dir "${EXPERIMENT_ROOT}/fresh-replication-seed3-retry1-v1" \
   > "${EXPERIMENT_ROOT}/logs/fresh-replication-seed3-retry1-v1.log" 2>&1
