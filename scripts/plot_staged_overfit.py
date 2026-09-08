@@ -125,7 +125,13 @@ def draw(run_dir: Path, output: Path):
   plt.rcParams.update({'font.family': 'DejaVu Sans', 'font.size': 9,
                        'axes.titlesize': 10, 'axes.labelsize': 9,
                        'pdf.fonttype': 42, 'ps.fonttype': 42})
-  fig, axes = plt.subplots(1, 3, figsize=(9.1, 3.3))
+  # Export at the paper's actual 5.5-inch text width. A wide three-panel
+  # source shrinks nominal 8pt labels below 5pt when included in the paper.
+  fig = plt.figure(figsize=(5.5, 6.0))
+  grid = fig.add_gridspec(2, 2, left=0.16, right=0.98, bottom=0.185,
+                          top=0.95, wspace=0.42, hspace=0.60)
+  axes = [fig.add_subplot(grid[0, 0]), fig.add_subplot(grid[0, 1]),
+          fig.add_subplot(grid[1, :])]
   maximum_step = max(rows[-1]['step'] for rows in curves.values())
   baselines, floor_display = {}, {}
   for ax, split, title in zip(axes[:2], ('train', 'dev'),
@@ -155,7 +161,7 @@ def draw(run_dir: Path, output: Path):
         ax.annotate(f'Lower bound {floor:.2f}', (0.025, floor),
                      xycoords=('axes fraction', 'data'), xytext=(0, 3),
                      textcoords='offset points', ha='left', va='bottom',
-                     fontsize=7.5, color='#666666')
+                     fontsize=8, color='#666666')
       # Bounds outside the plotted loss range remain in the sidecar. Drawing
       # an extra label inside this axis can obscure the backbone reference.
     ax.set_title(title)
@@ -176,7 +182,7 @@ def draw(run_dir: Path, output: Path):
   axes[2].set_title('Do token relationships help?')
   axes[2].set_ylabel('Joint − independent log probability\n(nats per held-out masked token)')
   axes[2].text(0.98, 0.03, 'Below zero: joint prediction hurts',
-                transform=axes[2].transAxes, ha='right', va='bottom', fontsize=7.4,
+                transform=axes[2].transAxes, ha='right', va='bottom', fontsize=8,
                 color='#7d4444', bbox={'facecolor': 'white', 'alpha': 0.8,
                                        'edgecolor': 'none', 'pad': 1.0})
   for ax in axes:
@@ -189,14 +195,14 @@ def draw(run_dir: Path, output: Path):
                     linewidth=1.8, label=ARMS[name][0]) for name in curves]
   legend.append(Line2D([0], [0], color='#252525', linestyle=(0, (5, 3)),
                          linewidth=1, label='Frozen backbone (NLL panels)'))
-  fig.legend(handles=legend, loc='lower center', ncol=len(legend), frameon=False,
+  fig.legend(handles=legend, loc='lower center', ncol=2, frameon=False,
                bbox_to_anchor=(0.5, 0.015), fontsize=8.5, handlelength=2.8)
-  fig.subplots_adjust(left=0.065, right=0.99, bottom=0.24, top=0.91, wspace=0.43)
   output = output.resolve()
   output.parent.mkdir(parents=True, exist_ok=True)
-  fig.savefig(output, bbox_inches='tight', pad_inches=0.06)
-  fig.savefig(output.with_suffix('.png'), dpi=180,
-                bbox_inches='tight', pad_inches=0.06)
+  # Avoid bbox_inches='tight': it changes the PDF width and thus the final
+  # font size under LaTeX's width=\linewidth scaling.
+  fig.savefig(output)
+  fig.savefig(output.with_suffix('.png'), dpi=180)
   plt.close(fig)
   arguments = protocol.get('arguments', {})
   metadata = {
@@ -216,6 +222,9 @@ def draw(run_dir: Path, output: Path):
     'sign': 'positive helps; negative hurts relative to the same singleton marginals',
     'uncertainty': 'single-run diagnostic curves; no confidence intervals estimated',
     'note': 'support bounds do not expand the observed NLL axes',
+    'layout': {'width_inches': 5.5, 'height_inches': 6.0,
+               'minimum_font_size_pt': 8,
+               'panels': 'two NLL panels above one full-width dependence panel'},
   }
   output.with_suffix('.json').write_text(json.dumps(metadata, indent=2,
                                                    allow_nan=False) + '\n')

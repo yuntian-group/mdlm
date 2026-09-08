@@ -12,7 +12,7 @@
     "/Users/yuntiandeng/Documents/ChatGPT/diffusion lm/mdlm_crf_recovery/artifacts/paper/staged-debugging-v1/real32/unary-curve.jsonl": "2cfe89429d530b43237371c5634e81032e1665d304654ed0c334802a3b73c81d",
     "/Users/yuntiandeng/Documents/ChatGPT/diffusion lm/mdlm_crf_recovery/artifacts/paper/staged-debugging-v1/real32/support-floor-train.json": "a8ab663b63d30b2ef53ca9f66617270fcb6e66b5dc35330a44dfed8933960cdc",
     "/Users/yuntiandeng/Documents/ChatGPT/diffusion lm/mdlm_crf_recovery/artifacts/paper/staged-debugging-v1/real32/support-floor-dev.json": "f0fabf6e58aebd6b77bb9c1f4f5161167bafc0c1f688b0130fb13a3bc7211ee4",
-    "/Users/yuntiandeng/Documents/ChatGPT/diffusion lm/mdlm_crf_recovery/scripts/plot_staged_overfit.py": "618b80eff4736d7c8348ef12a0332434b58fdbf0b2a375629e787227cd64d805"
+    "/Users/yuntiandeng/Documents/ChatGPT/diffusion lm/mdlm_crf_recovery/scripts/plot_staged_overfit.py": "a69a573d3c767ab060f18e639bcd51a67a71c8efe46a267b41df8c29027e5925"
   },
   "run_marked_completed": true,
   "train_examples": 32,
@@ -481,5 +481,11 @@
   "dependence_definition": "held-out log joint probability minus sum of log singleton marginals from that same model, divided by masked tokens",
   "sign": "positive helps; negative hurts relative to the same singleton marginals",
   "uncertainty": "single-run diagnostic curves; no confidence intervals estimated",
-  "note": "support bounds do not expand the observed NLL axes"
+  "note": "support bounds do not expand the observed NLL axes",
+  "layout": {
+    "width_inches": 5.5,
+    "height_inches": 6.0,
+    "minimum_font_size_pt": 8,
+    "panels": "two NLL panels above one full-width dependence panel"
+  }
 }
