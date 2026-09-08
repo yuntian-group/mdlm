@@ -18,6 +18,7 @@ from contextlib import contextmanager
 import torch
 from torch import nn
 
+from models.centered_forest import FrozenUnaryCenteredForestHead
 from models.contextual_unary import ContextualUnaryAdapter
 from models.structured_decoder import (
   ContextualCouplingForestHead, StructuredDecoderOutput,
@@ -91,6 +92,8 @@ class StagedGenerationAdapter:
   output and raw FP32 backbone logits. Shared and separate-endpoint forest
   heads retain their configured topology/factor modes. A candidate-only unary
   head returns an edgeless structured output with the same residual decoder.
+  The experimental centered head retains its FP64 normalized beliefs, factors,
+  and specialized residual decoder; its raw backbone logits still stay FP32.
   Inference handles inactive-node cancellation; the generation driver keeps
   observed tokens fixed. This adapter never replaces or reveals input tokens.
 
@@ -108,7 +111,8 @@ class StagedGenerationAdapter:
     if not isinstance(model, nn.Module) or not callable(
         getattr(model, '_structured_backbone_output', None)):
       raise TypeError('model must expose the production structured backbone path')
-    if not isinstance(head, (ContextualCouplingForestHead, ContextualUnaryAdapter)):
+    if not isinstance(head, (ContextualCouplingForestHead, ContextualUnaryAdapter,
+                             FrozenUnaryCenteredForestHead)):
       raise TypeError('head must be a selected staged forest or unary adapter')
     if isinstance(head, ContextualUnaryAdapter) and head.correction_domain != 'candidates':
       raise ValueError('staged generation requires a candidate-only unary adapter')

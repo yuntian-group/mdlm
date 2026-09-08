@@ -137,10 +137,17 @@ def _sample_exact_marginals(output, logits, inference, generator):
     states.clamp_max(explicit_count - 1).unsqueeze(-1)).squeeze(-1)
   residual = states.eq(explicit_count)
   if bool(residual.any()):
-    tail = logits[residual].clone()
-    tail.scatter_(-1, output.candidate_ids[residual], -torch.inf)
+    if type(output).residual_log_probs is StructuredDecoderOutput.residual_log_probs:
+      # Keep the original ordinary-output arithmetic and RNG path unchanged.
+      tail = logits[residual].clone()
+      tail.scatter_(-1, output.candidate_ids[residual], -torch.inf)
+      tail_probabilities = tail.softmax(dim=-1)
+    else:
+      # Specialized outputs may define a higher-precision conditional. Do not
+      # silently replace it with a softmax in the raw backbone-logit dtype.
+      tail_probabilities = output.residual_log_probs(logits)[residual].exp()
     tokens[residual] = torch.multinomial(
-      tail.softmax(dim=-1), num_samples=1, generator=generator).squeeze(-1)
+      tail_probabilities, num_samples=1, generator=generator).squeeze(-1)
   return tokens
 
 
@@ -160,10 +167,15 @@ def _sample_selected_marginals(output, logits, inference, selected, generator):
   residual = states.eq(explicit_count)
   if bool(residual.any()):
     rows, positions = selected.nonzero(as_tuple=True)
-    tail = logits[rows[residual], positions[residual]].clone()
-    tail.scatter_(-1, candidates[residual], -torch.inf)
+    if type(output).residual_log_probs is StructuredDecoderOutput.residual_log_probs:
+      tail = logits[rows[residual], positions[residual]].clone()
+      tail.scatter_(-1, candidates[residual], -torch.inf)
+      tail_probabilities = tail.softmax(dim=-1)
+    else:
+      tail_probabilities = output.residual_log_probs(logits)[
+        rows[residual], positions[residual]].exp()
     tokens[residual] = torch.multinomial(
-      tail.softmax(dim=-1), 1, generator=generator).squeeze(-1)
+      tail_probabilities, 1, generator=generator).squeeze(-1)
   return tokens
 
 

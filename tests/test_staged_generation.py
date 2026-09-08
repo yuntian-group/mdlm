@@ -7,8 +7,12 @@ from unittest import mock
 
 import torch
 
-from evaluation.fixed_group_sampling import generate_fixed_groups, make_reveal_order
+from evaluation.fixed_group_sampling import (
+  _sample_exact_marginals, _sample_selected_marginals,
+  generate_fixed_groups, make_reveal_order,
+)
 from evaluation.staged_generation import StagedGenerationAdapter
+from models.centered_forest import CenteredForestOutput, FrozenUnaryCenteredForestHead
 from models.contextual_unary import ContextualUnaryAdapter
 from models.directional_forest import DirectionalCouplingForestHead
 from models.structured_decoder import ContextualCouplingForestHead, StructuredDecoderOutput
@@ -24,10 +28,11 @@ MASK_INDEX = VOCAB_SIZE - 1
 class RecordingBackbone(torch.nn.Module):
   """The production encoder interface, with observable dropout and buffers."""
 
-  def __init__(self, mask_index=MASK_INDEX, output_dtype=torch.float32):
+  def __init__(self, mask_index=MASK_INDEX, output_dtype=torch.float32, mixed_support=False):
     super().__init__()
     self.mask_index = mask_index
     self.output_dtype = output_dtype
+    self.mixed_support = mixed_support
     self.backbone = torch.nn.ModuleDict({
       'embedding': torch.nn.Embedding(max(VOCAB_SIZE, mask_index + 1), HIDDEN_SIZE),
       'normalization': torch.nn.BatchNorm1d(HIDDEN_SIZE),
@@ -56,6 +61,10 @@ class RecordingBackbone(torch.nn.Module):
     logits = self.backbone['output'](hidden).to(self.output_dtype)
     if self.mask_index < VOCAB_SIZE:
       logits[..., self.mask_index] = -torch.inf
+    if self.mixed_support:
+      # Exactly top_k clean states at alternating positions: these nodes
+      # have zero residual mass alongside ordinary nonempty residuals.
+      logits[:, ::2, 3:] = -torch.inf
     hidden = hidden.to(self.output_dtype)
     record.update(hidden=hidden, logits=logits,
                   hidden_before=hidden.clone(), logits_before=logits.clone())
@@ -78,6 +87,45 @@ def make_head(variant):
   return cls(**common, topology_dim=4, local_window=1, num_anchor_slots=1,
              contextual_neighbors=0, component_size_cap=3,
              topology_mode='fixed', factor_mode='dynamic')
+
+
+def activate_centered_head(head):
+  with torch.no_grad():
+    head.right_token_embedding.weight.normal_(std=0.8)
+    for projection in (head.left_hidden_projection, head.right_hidden_projection,
+                       head.left_time_projection, head.right_time_projection):
+      projection.weight.normal_(std=0.3)
+      if projection.bias is not None:
+        projection.bias.normal_(std=0.2)
+  return head
+
+
+def fp64_frozen_unary_callback(adapter):
+  """Selected-test unary reference: FP32 lattice arithmetic, FP64 normalize.
+
+  Coupling features never enter this edgeless reference. The ordinary unary
+  adapter's default output remains FP32; promotion is explicit and test-only.
+  """
+  def callback(tokens, sigma, active):
+    ordinary, raw = adapter(tokens, sigma, active)
+    values = {
+      field.name: (getattr(ordinary, field.name).double()
+                   if torch.is_tensor(getattr(ordinary, field.name))
+                   and getattr(ordinary, field.name).is_floating_point()
+                   else getattr(ordinary, field.name))
+      for field in dataclasses.fields(ordinary)
+    }
+    log_beliefs = ordinary.unary_log_potentials.double().log_softmax(-1)
+    values.update(unary_log_potentials=log_beliefs,
+                  candidate_state_mask=torch.isfinite(log_beliefs),
+                  retained_mass=log_beliefs[..., :-1].exp().sum(-1),
+                  residual_log_mass=log_beliefs[..., -1])
+    with torch.no_grad():
+      tail_mass = adapter.head._tail_log_mass(raw.double(), ordinary.candidate_ids, 4096)
+    return CenteredForestOutput(
+      **values, base_tail_log_mass=tail_mass,
+      scoring_active_mask=active.clone(), vocab_size=adapter.head.vocab_size), raw
+  return callback
 
 
 def module_snapshot(*roots):
@@ -422,6 +470,213 @@ class StagedGenerationAdapterTest(unittest.TestCase):
         self.assertFalse(bool(output.candidate_ids.eq(mask_index).any()))
         with self.assertRaises((TypeError, ValueError)):
           StagedGenerationAdapter(model, head, mask_index=mask_index + 1)
+
+  def test_centered_adapter_preserves_frozen_unary_beliefs_precision_and_state(self):
+    for dependent in (False, True):
+      for mixed_support in (False, True):
+        with self.subTest(dependent=dependent, mixed_support=mixed_support):
+          model = RecordingBackbone(mixed_support=mixed_support)
+          unary = make_head('unary')
+          head = FrozenUnaryCenteredForestHead(unary, feature_dim=3, eta=0.95)
+          if dependent:
+            activate_centered_head(head)
+          model.train()
+          model.backbone['embedding'].eval()
+          model.backbone['normalization'].eval()
+          head.train()
+          head.hidden_norm.eval()
+          head.time_embedding.mlp[0].eval()
+          next(model.parameters()).grad = torch.full_like(next(model.parameters()), 0.125)
+          head.right_token_embedding.weight.grad = torch.full_like(head.right_token_embedding.weight, 0.25)
+          before = module_snapshot(model, unary, head)
+          inputs = tuple(value.clone() for value in (self.tokens, self.sigma, self.active))
+          rng = torch.random.get_rng_state()
+          adapter = StagedGenerationAdapter(model, head)
+          with torch.enable_grad(), torch.autocast('cpu', dtype=torch.bfloat16):
+            output, raw = adapter(self.tokens, self.sigma, self.active)
+            self.assertTrue(torch.is_grad_enabled())
+            self.assertTrue(torch.is_autocast_enabled('cpu'))
+          self.assertIs(type(output), CenteredForestOutput)
+          self.assertEqual(adapter.logical_batch_calls, 1)
+          self.assertEqual(adapter.physical_encoder_calls, len(self.tokens))
+          self.assertEqual(raw.dtype, torch.float32)
+          self.assertEqual(output.unary_log_potentials.dtype, torch.float64)
+          self.assertEqual(output.pair_left_factors.dtype, torch.float64)
+          self.assertEqual(output.pair_right_factors.dtype, torch.float64)
+          self.assertEqual(output.base_tail_log_mass.dtype, torch.float64)
+          self.assert_modules_unchanged(before, model, unary, head)
+          self.assertTrue(torch.equal(rng, torch.random.get_rng_state()))
+          for actual, expected in zip((self.tokens, self.sigma, self.active), inputs):
+            torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+          for row, call in enumerate(model.calls):
+            self.assertFalse(any(call['training']))
+            self.assertFalse(call['grad_enabled'])
+            self.assertTrue(call['force_no_grad'])
+            torch.testing.assert_close(call['conditioning'], self.sigma[row:row + 1, None], atol=0, rtol=0)
+            torch.testing.assert_close(call['logits'], call['logits_before'], atol=0, rtol=0)
+            torch.testing.assert_close(call['hidden'], call['hidden_before'], atol=0, rtol=0)
+          torch.testing.assert_close(raw, torch.cat([call['logits_before'] for call in model.calls]), atol=0, rtol=0)
+          self.assertFalse(raw.requires_grad)
+          self.assertFalse(head._frozen_unary.training)
+          self.assertTrue(all(not parameter.requires_grad for parameter in head._frozen_unary.parameters()))
+          for field in dataclasses.fields(output):
+            value = getattr(output, field.name)
+            if torch.is_tensor(value):
+              self.assertFalse(value.requires_grad, field.name)
+          self.assert_no_edges_to_context(output, self.active)
+          hidden = torch.cat([call['hidden'] for call in model.calls]).float()
+          with torch.no_grad():
+            lattice = head._frozen_unary.candidate_lattice(hidden, raw, self.sigma, self.active)
+          expected_log_beliefs = lattice.unary_log_potentials.double().log_softmax(-1)
+          # The ordinary unary default keeps its existing FP32 normalization.
+          # Its small rounding difference is separate from learned dependence.
+          fp32_beliefs = lattice.unary_log_potentials.log_softmax(-1).exp().double()
+          precision_difference = (fp32_beliefs - expected_log_beliefs.exp())[self.active].abs().max()
+          self.assertGreater(float(precision_difference), 0.0)
+          self.assertLess(float(precision_difference), 2e-7)
+          torch.testing.assert_close(output.candidate_ids, lattice.candidate_ids, atol=0, rtol=0)
+          torch.testing.assert_close(output.unary_log_potentials, expected_log_beliefs, atol=0, rtol=0)
+          candidate_mask = torch.zeros_like(raw, dtype=torch.bool).scatter(-1, lattice.candidate_ids, True)
+          tail_logits = raw.double().masked_fill(candidate_mask, -torch.inf)
+          tail_mass = tail_logits.logsumexp(-1)
+          has_tail = torch.isfinite(tail_mass)
+          expected_tail = tail_logits - torch.where(has_tail, tail_mass, 0.0)[..., None]
+          fallback = torch.full_like(tail_logits, -torch.inf).scatter(-1, lattice.candidate_ids[..., :1], 0.0)
+          expected_tail = torch.where(has_tail[..., None], expected_tail, fallback)
+          actual_tail = output.residual_log_probs(raw)
+          self.assertEqual(actual_tail.dtype, torch.float64)
+          torch.testing.assert_close(output.base_tail_log_mass, tail_mass, atol=2e-15, rtol=0)
+          torch.testing.assert_close(actual_tail, expected_tail, atol=2e-15, rtol=0)
+          self.assertTrue(bool(torch.isfinite(actual_tail.exp()).all()))
+          torch.testing.assert_close(actual_tail.exp().sum(-1), torch.ones_like(tail_mass), atol=2e-15, rtol=0)
+          if mixed_support:
+            self.assertTrue(bool(has_tail[self.active].any()))
+            self.assertTrue(bool((~has_tail[self.active]).any()))
+            self.assertFalse(bool(output.candidate_state_mask[..., -1][~has_tail].any()))
+          expected_full = expected_log_beliefs[..., -1:].exp() * expected_tail.exp()
+          expected_full.scatter_add_(-1, lattice.candidate_ids, expected_log_beliefs[..., :-1].exp())
+          for backend in ('dense', 'low_rank'):
+            inferred = infer_structured_distribution(output, self.active, backend)
+            torch.testing.assert_close(inferred.marginals.node_marginals[self.active],
+                                       expected_log_beliefs.exp()[self.active], atol=2e-14, rtol=0)
+            expanded = full_vocabulary_marginals(output, raw, self.active, inferred)
+            torch.testing.assert_close(expanded[self.active], expected_full[self.active], atol=2e-14, rtol=0)
+            self.assertTrue(bool(inferred.clamped_states[~self.active].eq(0).all()))
+          pair_factors = output.materialize_pair_factors()[output.edge_mask]
+          if dependent:
+            self.assertGreater(float((pair_factors - 1).abs().max()), 1e-6)
+          else:
+            torch.testing.assert_close(pair_factors, torch.ones_like(pair_factors), atol=3e-15, rtol=0)
+
+  def test_centered_generation_matches_frozen_unary_reference_with_specialized_tails(self):
+    tokens = torch.cat((torch.full((2, 5), MASK_INDEX, dtype=torch.long), self.tokens))
+    order = make_reveal_order(tokens.shape[1], [12, 13, 14, 15, 16])
+    tail_method = CenteredForestOutput.residual_log_probs
+    observed_tail_calls = {1: 0, 2: 0}
+    observed_helper_tail_calls = {'exact': 0, 'selected': 0}
+    for dependent in (False, True):
+      for mixed_support in (False, True):
+        for group_size in (1, 2):
+          with self.subTest(dependent=dependent, mixed_support=mixed_support, group_size=group_size):
+            model = RecordingBackbone(mixed_support=mixed_support)
+            head = FrozenUnaryCenteredForestHead(make_head('unary'), feature_dim=3, eta=0.95)
+            if dependent:
+              activate_centered_head(head)
+            before = module_snapshot(model, head)
+            runs, rng_histories, final_rng, call_histories = [], [], [], []
+            # G=1 also checks the joint path; G=2 exercises the full marginal
+            # helper plus the selected-node helper on each row's final reveal.
+            arms = ('reference', 'marginal', 'joint') if group_size == 1 else ('reference', 'marginal')
+            for arm in arms:
+              adapter = StagedGenerationAdapter(model, head._frozen_unary if arm == 'reference' else head)
+              callback = fp64_frozen_unary_callback(adapter) if arm == 'reference' else adapter
+              generator = torch.Generator().manual_seed(1803)
+              history = []
+              calls = []
+              helper_context = []
+
+              def record(current, sigma, active):
+                history.append(generator.get_state().clone())
+                calls.append(tuple(value.clone() for value in (current, sigma, active)))
+                return callback(current, sigma, active)
+
+              def decode_tail(output, raw):
+                decoded = tail_method(output, raw)
+                self.assertEqual(decoded.dtype, torch.float64)
+                self.assertTrue(bool(torch.isfinite(decoded.exp()).all()))
+                observed_tail_calls[group_size] += 1
+                self.assertEqual(len(helper_context), 1)
+                observed_helper_tail_calls[helper_context[0]] += 1
+                return decoded
+
+              def exact_marginals(*args, **kwargs):
+                helper_context.append('exact')
+                try:
+                  return _sample_exact_marginals(*args, **kwargs)
+                finally:
+                  helper_context.pop()
+
+              def selected_marginals(*args, **kwargs):
+                helper_context.append('selected')
+                try:
+                  return _sample_selected_marginals(*args, **kwargs)
+                finally:
+                  helper_context.pop()
+
+              with mock.patch.object(CenteredForestOutput, 'residual_log_probs', autospec=True,
+                                     side_effect=decode_tail), \
+                   mock.patch('evaluation.fixed_group_sampling._sample_exact_marginals',
+                              side_effect=exact_marginals), \
+                   mock.patch('evaluation.fixed_group_sampling._sample_selected_marginals',
+                              side_effect=selected_marginals):
+                result = generate_fixed_groups(
+                  record, tokens, mask_index=MASK_INDEX, group_size=group_size,
+                  mode='joint' if arm == 'joint' else 'marginal', reveal_order=order,
+                  sampling_generator=generator)
+              self.assertEqual(adapter.logical_batch_calls, result.batch_calls)
+              self.assertEqual(adapter.physical_encoder_calls, int(result.nfe.sum()))
+              self.assert_modules_unchanged(before, model, head)
+              self.assertFalse(bool(result.final_tokens.eq(MASK_INDEX).any()))
+              torch.testing.assert_close(result.final_tokens[tokens.ne(MASK_INDEX)],
+                                         tokens[tokens.ne(MASK_INDEX)], atol=0, rtol=0)
+              for step in result.steps:
+                if arm == 'reference':
+                  self.assertFalse(bool(step.edge_mask.any()))
+                for row in range(len(step.row_indices)):
+                  edges = step.edge_index[row, step.edge_mask[row]]
+                  self.assertTrue(bool(step.active_before[row, edges].all()))
+                if group_size == 1:
+                  self.assertFalse(bool(step.jointly_committed_edge_mask.any()))
+              runs.append(result)
+              rng_histories.append(history)
+              call_histories.append(calls)
+              final_rng.append(generator.get_state())
+            for index in range(1, len(runs)):
+              for name in ('final_tokens', 'nfe', 'reveal_order'):
+                torch.testing.assert_close(getattr(runs[0], name), getattr(runs[index], name), atol=0, rtol=0)
+              self.assertEqual(runs[0].batch_calls, runs[index].batch_calls)
+              self.assertTrue(torch.equal(final_rng[0], final_rng[index]))
+              self.assertEqual(len(rng_histories[0]), len(rng_histories[index]))
+              for reference_rng, actual_rng in zip(rng_histories[0], rng_histories[index]):
+                self.assertTrue(torch.equal(reference_rng, actual_rng))
+              for reference_call, actual_call in zip(call_histories[0], call_histories[index]):
+                for reference_value, actual_value in zip(reference_call, actual_call):
+                  torch.testing.assert_close(reference_value, actual_value, atol=0, rtol=0)
+              self.assertEqual(len(runs[0].steps), len(runs[index].steps))
+              for reference_step, actual_step in zip(runs[0].steps, runs[index].steps):
+                for field in dataclasses.fields(reference_step):
+                  if field.name in ('edge_index', 'edge_mask', 'jointly_committed_edge_mask'):
+                    continue  # The reference is edgeless; its token history is exact.
+                  reference_value = getattr(reference_step, field.name)
+                  actual_value = getattr(actual_step, field.name)
+                  if torch.is_tensor(reference_value):
+                    torch.testing.assert_close(reference_value, actual_value, atol=0, rtol=0, msg=field.name)
+                  else:
+                    self.assertEqual(reference_value, actual_value, field.name)
+    self.assertGreater(observed_tail_calls[1], 0)
+    self.assertGreater(observed_tail_calls[2], 0)
+    self.assertGreater(observed_helper_tail_calls['exact'], 0)
+    self.assertGreater(observed_helper_tail_calls['selected'], 0)
 
   def test_group_one_joint_and_marginal_have_identical_trajectories_and_rng(self):
     order = make_reveal_order(self.tokens.shape[1], [12, 13, 14])
