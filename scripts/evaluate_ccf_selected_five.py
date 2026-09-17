@@ -58,6 +58,8 @@ def matrix(suite='selected'):
     cells.append(dict(family='B', arm=arm, step=7000, rank=16, embedding='shared',
                       checkpoint=str(checkpoint), mode='structured_joint'))
   cells.insert(0, dict(cells[0], family='A', mode='factorized'))
+  if suite == 'basic_7k':
+    return cells
   for rank, steps, family in ((8, (2000, 6000), 'C'), (16, (2000, 4000), 'D')):
     for arm in ('fixed_dynamic', 'dynamic_dynamic'):
       for step in steps:
@@ -82,12 +84,14 @@ def save(path, value):
 
 def generation_args(cell, out, adapter_sha, manifest_sha):
   topology, factor, weight = ARMS[cell['arm']]
+  samples = cell.get('num_samples', 5)
+  sampling_steps = cell.get('sampling_steps', 1000)
   args = ['--backbone-checkpoint', str(CACHE / 'checkpoints/mdlm-owt-backbone.pt'),
     '--backbone-sha256', BACKBONE_SHA, '--adapter', str(out / 'adapter.safetensors'),
     '--adapter-sha256', adapter_sha, '--adapter-manifest', str(out / 'adapter.manifest.json'),
     '--adapter-manifest-sha256', manifest_sha, '--output-dir', str(out / 'generation'),
-    '--num-samples', '5', '--sequence-length', '1024', '--batch-size', '1',
-    '--base-seed', '91001', '--modes', cell['mode'], '--nfe-budgets', '1001',
+    '--num-samples', str(samples), '--sequence-length', '1024', '--batch-size', '1',
+    '--base-seed', '91001', '--modes', cell['mode'], '--nfe-budgets', str(sampling_steps + 1),
     '--device', 'cuda', '--model-config', 'contextual-forest-small',
     '--data-config', 'train_openwebtext_pinned', '--allow-dirty',
     '--reference-lm', 'gpt2-large', '--reference-lm-revision', '32b71b12589c2f8d625668d2335a01cac3249519',
@@ -140,7 +144,7 @@ def gated_pilot(pilot, cell, out, args):
       report = dict(status='passed' if all(checks.values()) else 'failed', checks=checks,
         reference=reference, candidate='level_draws', reference_timing=old_timing, candidate_timing=timing,
         torch=torch.__version__, gpu=torch.cuda.get_device_name(),
-        scope='One full 1000-transition first sample on the same loaded model/GPU; final tokens/NFE/RNG, not every intermediate state.')
+        scope=f'One full {cell.get("sampling_steps", 1000)}-transition first sample on the same loaded model/GPU; final tokens/NFE/RNG, not every intermediate state.')
       if reference == 'v1' and cell['step'] in HISTORICAL_R8:
         old_dir = CACHE / 'runs' / HISTORICAL_R8[cell['step']]
         historical = json.loads((old_dir / 'samples.jsonl').read_text().splitlines()[0])
@@ -165,13 +169,19 @@ def main():
   parser = argparse.ArgumentParser(description=__doc__)
   parser.add_argument('--index', type=int)
   parser.add_argument('--inventory', action='store_true')
-  parser.add_argument('--suite', choices=('selected', 'original_5k6k', 'all_1k'), default='selected')
+  parser.add_argument('--suite', choices=('selected', 'original_5k6k', 'all_1k', 'basic_7k'), default='selected')
+  parser.add_argument('--num-samples', type=int, default=5)
+  parser.add_argument('--sampling-steps', type=int, default=1000)
   parser.add_argument('--output-root', type=Path)
   options = parser.parse_args()
+  if options.num_samples < 1 or options.sampling_steps < 1:
+    parser.error('num-samples and sampling-steps must be positive')
   cells = matrix(options.suite)
+  for cell in cells:
+    cell.update(num_samples=options.num_samples, sampling_steps=options.sampling_steps)
   if options.inventory:
     missing = [c['checkpoint'] for c in cells if not Path(c['checkpoint']).is_file()]
-    print(json.dumps(dict(cells=cells, samples=5 * len(cells), missing=missing), indent=2))
+    print(json.dumps(dict(cells=cells, samples=options.num_samples * len(cells), missing=missing), indent=2))
     assert not missing
     return
   cell = cells[options.index]
@@ -190,8 +200,9 @@ def main():
       '--independent-mode', 'false', '--topology-weight', str(weight)], check=True, stdout=log)
   args = generation_args(cell, out, sha(out / 'adapter.safetensors'), sha(out / 'adapter.manifest.json'))
   save(out / 'request.json', dict(cell=cell, checkpoint_sha256=checkpoint_sha, pilot_arguments=args,
-    suite=options.suite, samples=5, sampling_steps=1000, base_seed=91001, snapshot=str(ROOT),
-    pairing='Standard five-sample pilot: replicate-0000 through replicate-0004; identical across cells.',
+    suite=options.suite, samples=options.num_samples, sampling_steps=options.sampling_steps,
+    base_seed=91001, snapshot=str(ROOT),
+    pairing=f'Standard pilot: replicate-0000 through replicate-{options.num_samples - 1:04d}; identical across cells.',
     source_sha256={name: sha(ROOT / name) for name in (
       'scripts/evaluate_ccf_selected_five.py', 'scripts/run_generation_pilot.py',
       'scripts/audit_ccf_sampling_v3.py', 'scripts/audit_ccf_sampling_v4.py', 'structured_utils.py',
@@ -201,7 +212,7 @@ def main():
   from scripts import run_generation_pilot as pilot
   result = pilot.main(args) if cell['mode'] == 'factorized' else gated_pilot(pilot, cell, out, args)
   assert result == 0
-  save(out / 'completed.json', dict(status='completed', samples=5, cell=cell))
+  save(out / 'completed.json', dict(status='completed', samples=options.num_samples, cell=cell))
   print(json.dumps(dict(status='completed', output=str(out))), flush=True)
 
 

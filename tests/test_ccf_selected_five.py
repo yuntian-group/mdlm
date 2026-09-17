@@ -10,6 +10,22 @@ import structured_utils as utils
 
 
 class SelectedFiveTest(unittest.TestCase):
+  def test_basic_low_steps_preserves_cleanup_and_twenty_samples(self):
+    cells = matrix('basic_7k')
+    self.assertEqual(len(cells), 5)
+    self.assertEqual([c['mode'] for c in cells], ['factorized'] + ['structured_joint'] * 4)
+    self.assertEqual([c['arm'] for c in cells[1:]],
+                     ['static_static', 'fixed_dynamic', 'dynamic_fixed', 'dynamic_dynamic'])
+    self.assertEqual({c['step'] for c in cells}, {7000})
+    for steps in (16, 32):
+      for cell in cells:
+        args = generation_args(dict(cell, num_samples=20, sampling_steps=steps),
+                               Path('/tmp/test'), 'a', 'm')
+        for flag, value in (('--num-samples', '20'), ('--nfe-budgets', str(steps + 1)),
+                            ('--batch-size', '1'), ('--sequence-length', '1024'),
+                            ('--base-seed', '91001')):
+          self.assertEqual(args[args.index(flag) + 1], value)
+
   def test_all_1k_matrix(self):
     cells = matrix('all_1k')
     self.assertEqual(len(cells), 8)
