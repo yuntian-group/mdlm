@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Approved A+B7k+C/D five-sample matrix, with a same-GPU first-sample gate.
+"""CCF checkpoint evaluation matrices, with a same-GPU first-sample gate.
 
 Built from the repository's existing export/pilot/verification workflows.
 Sampler algorithm/code credits: docs/ccf-fast-generation.md.
@@ -37,6 +37,23 @@ HISTORICAL_R8 = {
 
 
 def matrix(suite='selected'):
+  if suite == 'low_steps_sweep':
+    # Basic 7k and both MDLM budgets are reused from completed array 1545882.
+    cells = []
+    for step in range(1000, 7001, 1000):
+      if step < 7000:
+        run = ('stale/four_arm_s001_k128_run-baseline-1k' if step == 1000 else
+               'four_arm_continue_s001_k128_to3k_run-continue-3k' if step <= 3000 else
+               'four_arm_continue_s001_k128_3k_to6k_run-continue-6k')
+        for arm in ARMS:
+          cells.append(dict(family='B', arm=arm, step=step, rank=16,
+                            embedding='shared', mode='structured_joint',
+                            checkpoint=str(CACHE / 'runs' / run / arm / 'checkpoints' / f'0-{step}.ckpt')))
+      for (rank, arm), run in SEPARATE_RUNS.items():
+        cells.append(dict(family='C' if rank == 8 else 'D', arm=arm, step=step,
+                          rank=rank, embedding='separate', mode='structured_joint',
+                          checkpoint=str(CACHE / 'runs' / run / 'training/checkpoints' / f'0-{step}.ckpt')))
+    return cells
   if suite == 'all_1k':
     archive = CACHE / 'runs/stale/four_arm_s001_k128_run-baseline-1k'
     cells = [dict(family='B', arm=arm, step=1000, rank=16, embedding='shared',
@@ -145,7 +162,8 @@ def gated_pilot(pilot, cell, out, args):
         reference=reference, candidate='level_draws', reference_timing=old_timing, candidate_timing=timing,
         torch=torch.__version__, gpu=torch.cuda.get_device_name(),
         scope=f'One full {cell.get("sampling_steps", 1000)}-transition first sample on the same loaded model/GPU; final tokens/NFE/RNG, not every intermediate state.')
-      if reference == 'v1' and cell['step'] in HISTORICAL_R8:
+      if (reference == 'v1' and cell['step'] in HISTORICAL_R8
+          and cell.get('sampling_steps', 1000) == 1000):
         old_dir = CACHE / 'runs' / HISTORICAL_R8[cell['step']]
         historical = json.loads((old_dir / 'samples.jsonl').read_text().splitlines()[0])
         report['historical_replay'] = dict(
@@ -169,7 +187,7 @@ def main():
   parser = argparse.ArgumentParser(description=__doc__)
   parser.add_argument('--index', type=int)
   parser.add_argument('--inventory', action='store_true')
-  parser.add_argument('--suite', choices=('selected', 'original_5k6k', 'all_1k', 'basic_7k'), default='selected')
+  parser.add_argument('--suite', choices=('selected', 'original_5k6k', 'all_1k', 'basic_7k', 'low_steps_sweep'), default='selected')
   parser.add_argument('--num-samples', type=int, default=5)
   parser.add_argument('--sampling-steps', type=int, default=1000)
   parser.add_argument('--output-root', type=Path)

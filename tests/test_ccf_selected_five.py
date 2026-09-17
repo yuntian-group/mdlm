@@ -10,6 +10,32 @@ import structured_utils as utils
 
 
 class SelectedFiveTest(unittest.TestCase):
+  def test_low_steps_sweep_covers_requested_grid_without_reused_cells(self):
+    cells = matrix('low_steps_sweep')
+    actual = {(c['family'], c['arm'], c['step']) for c in cells}
+    expected = {(family, arm, step)
+                for family, arms, steps in (
+                  ('B', ('static_static', 'fixed_dynamic', 'dynamic_fixed', 'dynamic_dynamic'), range(1000, 6001, 1000)),
+                  ('C', ('fixed_dynamic', 'dynamic_dynamic'), range(1000, 7001, 1000)),
+                  ('D', ('fixed_dynamic', 'dynamic_dynamic'), range(1000, 7001, 1000)))
+                for arm in arms for step in steps}
+    self.assertEqual(actual, expected)
+    self.assertEqual(len(cells), 52)
+    self.assertEqual(len({c['checkpoint'] for c in cells}), 52)
+    for cell in cells:
+      self.assertTrue(cell['checkpoint'].endswith(f"0-{cell['step']}.ckpt"))
+      if cell['family'] == 'B':
+        source = 'run-baseline-1k' if cell['step'] == 1000 else 'run-continue-3k' if cell['step'] <= 3000 else 'run-continue-6k'
+        self.assertIn(source, cell['checkpoint'])
+        self.assertEqual((cell['embedding'], cell['rank']), ('shared', 16))
+      else:
+        self.assertEqual((cell['embedding'], cell['rank']),
+                         ('separate', 8 if cell['family'] == 'C' else 16))
+      for steps in (16, 32):
+        args = generation_args(dict(cell, num_samples=20, sampling_steps=steps), Path('/tmp/test'), 'a', 'm')
+        self.assertEqual(args[args.index('--num-samples') + 1], '20')
+        self.assertEqual(args[args.index('--nfe-budgets') + 1], str(steps + 1))
+
   def test_basic_low_steps_preserves_cleanup_and_twenty_samples(self):
     cells = matrix('basic_7k')
     self.assertEqual(len(cells), 5)
@@ -69,7 +95,7 @@ class SelectedFiveTest(unittest.TestCase):
                           ('--batch-size', '1'), ('--base-seed', '91001')):
         self.assertEqual(args[args.index(flag) + 1], value)
 
-  def exercise_gate(self, mismatch):
+  def exercise_gate(self, mismatch, samples=5):
     old_sampler = utils.sample_forest_low_rank
     calls = []
     def sample(*args, **kwargs):
@@ -78,7 +104,7 @@ class SelectedFiveTest(unittest.TestCase):
       return [{'sample_token_ids': [int(fast and mismatch)]}], {'measured_nfe': 1000}
     pilot = SimpleNamespace(run_sampling_group=sample)
     def main(args):
-      for _ in range(5):
+      for _ in range(samples):
         pilot.run_sampling_group(None)
       return 0
     pilot.main = main
@@ -91,12 +117,15 @@ class SelectedFiveTest(unittest.TestCase):
         self.assertEqual(calls, [False, True])
       else:
         self.assertEqual(gated_pilot(pilot, matrix()[1], Path(directory), []), 0)
-        self.assertEqual(calls, [False] + [True] * 5)
+        self.assertEqual(calls, [False] + [True] * samples)
     self.assertIs(utils.sample_forest_low_rank, old_sampler)
     self.assertIs(pilot.run_sampling_group, sample)
 
   def test_gate_reuses_verified_first_sample(self):
     self.exercise_gate(False)
+
+  def test_twenty_samples_reuse_verified_first_sample(self):
+    self.exercise_gate(False, samples=20)
 
   def test_failed_gate_stops_before_remaining_samples(self):
     self.exercise_gate(True)
