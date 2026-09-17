@@ -108,6 +108,8 @@ class _ForestTopology:
   order: Tuple[int, ...]
   component: Tuple[int, ...]
   active_edges: Tuple[int, ...]
+  # Already transferred by _build_topology; avoid per-edge GPU .item() calls.
+  edge_left: Tuple[int, ...]
 
 
 @dataclass(frozen=True)
@@ -272,7 +274,8 @@ def _build_topology(edge_index: torch.Tensor,
       parent_edge=tuple(parent_edge),
       order=tuple(order),
       component=tuple(component),
-      active_edges=tuple(active_edges)))
+      active_edges=tuple(active_edges),
+      edge_left=tuple(edge[0] for edge in host_edges[batch_index])))
   return topologies
 
 
@@ -1039,7 +1042,7 @@ def _single_low_rank_sum_product(
       if neighbor != parent:
         local = local + messages[(neighbor, node)]
     edge_id = topology.parent_edge[node]
-    left = int(edge_index[edge_id, 0].item())
+    left = topology.edge_left[edge_id]
     if left == node:
       source, target = (
         left_log_factors[edge_id], right_log_factors[edge_id])
@@ -1231,7 +1234,7 @@ def sample_forest_low_rank(
       for neighbor, _, _ in topology.adjacency[node]:
         if neighbor != parent:
           local = local + messages[(neighbor, node)]
-      left = int(edge_index[batch_index, edge_id, 0].item())
+      left = topology.edge_left[edge_id]
       if left == parent:
         source, target = (
           left_log_factors[batch_index, edge_id],
