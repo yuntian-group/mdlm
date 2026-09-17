@@ -32,11 +32,12 @@ their recorded values and sample counts without claiming a new raw-data audit.
 
 Activate an environment with the repository's dependencies before submission.
 Set `CCF_CACHE_ROOT` to a directory containing `checkpoints/`, `huggingface/`,
-and `runs/`. `CCF_CODE_ROOT` defaults to this checkout and can be overridden for
-an isolated snapshot. The backbone is expected at
+and `runs/`. Explicitly export `CCF_CODE_ROOT` before `sbatch` so Slurm’s
+spooled script uses the intended checkout or isolated snapshot. The backbone is expected at
 `$CCF_CACHE_ROOT/checkpoints/mdlm-owt-backbone.pt`.
 
 ```bash
+export CCF_CODE_ROOT=/path/to/this/checkout
 export CCF_CACHE_ROOT=/path/to/ccf-cache
 sbatch scripts/train_four_ccf_matched_1k.sh
 

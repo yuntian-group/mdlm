@@ -1,12 +1,12 @@
 # Twenty-sample basic four-arm evaluation at 16/32 transitions
 
-Historical evaluation completed September 16–17, 2026. Saved results, not a new run. All 10 cells completed on the same H200 NVL host. All200 scored samples completed,20 per cell. All8 CCF same-GPU
+Historical evaluation completed September 16–17, 2026. Saved results, not a new run. All 10 cells completed on the same H200 NVL host. All 200 scored samples completed, 20 per cell. All 8 CCF same-GPU
 reference/optimized first-sample comparisons passed final-token, NFE and
 CPU/CUDA RNG checks. No unresolved mask tokens were reported.
 
-CCF sampler: **L, level-batched optimized**. CCF: shared rank16, constant-LR training-update7000 checkpoints. MDLM:
-released frozen backbone in factorized mode. Length1024, batch1, matched
-seeds91001–91020. All10 cells have the same pairing digest.
+CCF sampler: **L, level-batched optimized**. CCF: shared rank 16, constant-LR training-update 7,000 checkpoints. MDLM:
+released frozen backbone in factorized mode. Length 1,024, batch 1, matched
+seeds 91001–91020. All 10 cells have the same pairing digest.
 
 | Model | 16-step PPL | 32-step PPL | 16-step seconds/sample | 32-step seconds/sample |
 |---|---:|---:|---:|---:|
@@ -18,8 +18,8 @@ seeds91001–91020. All10 cells have the same pairing digest.
 
 PPL is exp(token-weighted GPT2-large mean NLL), using the unchanged
 first-nonleading-EOS policy. Times are generation only, excluding loading,
-verification duplicates and GPT2 scoring. Actual model calls were17/33 for
-MDLM and16/32 for CCF, because of the existing cleanup/early-stop behavior.
+verification duplicates and GPT2 scoring. Actual model calls were 17/33 for
+MDLM and 16/32 for CCF, because of the existing cleanup/early-stop behavior.
 Thus these are matched reverse-transition settings, not identical measured
 model-call counts or wall-clock budgets.
 
@@ -31,8 +31,8 @@ model-call counts or wall-clock budgets.
 | CCF dynamic/fixed | 12318 | 11862 | 0.269% | 0.583% |
 | CCF dynamic/dynamic | 10113 | 12994 | 0.573% | 0.544% |
 
-At16 steps, both contextual-factor CCF arms have lower aggregate PPL than
-MDLM; at32 steps, MDLM has lower aggregate PPL than every CCF arm. This initial report makes no confidence-interval or significance claim; later
+At 16 steps, both contextual-factor CCF arms have lower aggregate PPL than
+MDLM; at 32 steps, MDLM has lower aggregate PPL than every CCF arm. This initial report makes no confidence-interval or significance claim; later
 checkpoint-sweep analysis is reported separately.
 Scored lengths vary because of EOS, and lower evaluator PPL alone does not
 establish better overall text quality.
