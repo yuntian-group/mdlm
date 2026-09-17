@@ -10,6 +10,30 @@ import structured_utils as utils
 
 
 class SelectedFiveTest(unittest.TestCase):
+  def test_full_sweep_includes_fresh_baseline_and_every_checkpoint_at_eight_steps(self):
+    cells = matrix('full_checkpoint_sweep')
+    self.assertEqual(len(cells), 57)
+    self.assertEqual(cells[0], matrix('basic_7k')[0])
+    self.assertEqual([c['mode'] for c in cells], ['factorized'] + ['structured_joint'] * 56)
+    expected = {(family, arm, step)
+                for family, arms in (
+                  ('B', ('static_static', 'fixed_dynamic', 'dynamic_fixed', 'dynamic_dynamic')),
+                  ('C', ('fixed_dynamic', 'dynamic_dynamic')),
+                  ('D', ('fixed_dynamic', 'dynamic_dynamic')))
+                for arm in arms for step in range(1000, 7001, 1000)}
+    self.assertEqual({(c['family'], c['arm'], c['step']) for c in cells[1:]}, expected)
+    self.assertEqual(len({c['checkpoint'] for c in cells[1:]}), 56)
+    self.assertEqual([c['step'] for c in cells[1:]],
+                     [step for step in range(1000, 7001, 1000) for _ in range(8)])
+    for start in range(1, 57, 8):
+      self.assertEqual([c['family'] for c in cells[start:start + 8]], ['B'] * 4 + ['C'] * 2 + ['D'] * 2)
+    for cell in cells:
+      args = generation_args(dict(cell, num_samples=20, sampling_steps=8), Path('/tmp/test'), 'a', 'm')
+      for flag, value in (('--num-samples', '20'), ('--nfe-budgets', '9'),
+                          ('--base-seed', '91001'), ('--sequence-length', '1024'),
+                          ('--batch-size', '1')):
+        self.assertEqual(args[args.index(flag) + 1], value)
+
   def test_low_steps_sweep_covers_requested_grid_without_reused_cells(self):
     cells = matrix('low_steps_sweep')
     actual = {(c['family'], c['arm'], c['step']) for c in cells}

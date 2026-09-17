@@ -37,6 +37,13 @@ HISTORICAL_R8 = {
 
 
 def matrix(suite='selected'):
+  if suite == 'full_checkpoint_sweep':
+    basic_7k = matrix('basic_7k')
+    cells = matrix('low_steps_sweep') + basic_7k[1:]
+    arm_order = {arm: index for index, arm in enumerate(ARMS)}
+    cells.sort(key=lambda cell: (cell['step'], cell['family'], arm_order[cell['arm']]))
+    # One released MDLM baseline, then all 56 CCF checkpoints. No result reuse.
+    return [basic_7k[0]] + cells
   if suite == 'low_steps_sweep':
     # Basic 7k and both MDLM budgets are reused from completed array 1545882.
     cells = []
@@ -187,7 +194,7 @@ def main():
   parser = argparse.ArgumentParser(description=__doc__)
   parser.add_argument('--index', type=int)
   parser.add_argument('--inventory', action='store_true')
-  parser.add_argument('--suite', choices=('selected', 'original_5k6k', 'all_1k', 'basic_7k', 'low_steps_sweep'), default='selected')
+  parser.add_argument('--suite', choices=('selected', 'original_5k6k', 'all_1k', 'basic_7k', 'low_steps_sweep', 'full_checkpoint_sweep'), default='selected')
   parser.add_argument('--num-samples', type=int, default=5)
   parser.add_argument('--sampling-steps', type=int, default=1000)
   parser.add_argument('--output-root', type=Path)
