@@ -25,6 +25,5 @@ sha256sum structured_utils.py structured_objective.py \
 srun --ntasks=1 python -m unittest tests.test_ccf_sampling_optimization -v \
   > "$ATTEMPT/tests.log" 2>&1
 srun --ntasks=1 python -u scripts/verify_ccf_sampling_v2.py --device cuda \
-  --v1-utils ${CCF_CACHE_ROOT}/code/ccf_sampling_speed_v1.ihSeMi/structured_utils.py \
   --real-step-check > "$ATTEMPT/report.json"
 echo "V2 verification passed. Results: $ATTEMPT"

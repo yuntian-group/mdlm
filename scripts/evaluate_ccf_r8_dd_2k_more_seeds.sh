@@ -14,7 +14,7 @@ CCF_CODE_ROOT="${CCF_CODE_ROOT:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." &
 : "${CCF_CACHE_ROOT:?Set CCF_CACHE_ROOT to your checkpoints/cache/runs directory}"
 export CCF_CODE_ROOT CCF_CACHE_ROOT
 CACHE_ROOT=${CCF_CACHE_ROOT}
-cd "$CACHE_ROOT/code/ccf_sampling_speed_v2_checked.iZJBw9"
+cd "$CCF_CODE_ROOT"
 SEED=$((91002 + ${SLURM_ARRAY_TASK_ID:?Submit as array}))
 SOURCE="$CACHE_ROOT/runs/ccf_separate_checkpoints_run-separate-r8-checkpoints/dynamic_dynamic/step2000/attempt-0.sGG8eC"
 ADAPTER="$SOURCE/dynamic_dynamic.safetensors"
@@ -27,7 +27,7 @@ export HF_HUB_CACHE="$CACHE_ROOT/huggingface"
 export TOKENIZERS_PARALLELISM=false
 sha256sum structured_utils.py structured_objective.py diffusion.py models/structured_decoder.py evaluation/generation_harness.py scripts/run_generation_pilot.py "$ADAPTER" "$MANIFEST" > "$ATTEMPT/source-sha256.txt"
 printf '%s\n' "${CCF_EVAL_COMMIT:?Record local script commit}" > "$ATTEMPT/local-eval-commit.txt"
-printf '%s\n' 'Production v2 commit 4fc49fb7a82290d235aad332d64e44bb1e4e8fd7; GPU verification 1544303 passed. Independent one-sample jobs: pair key replicate-0000, seeds 91002–91010.' > "$ATTEMPT/provenance.txt"
+printf '%s\n' 'V2 sampler; source hashes recorded above. Reverify equivalence in the current runtime. Independent one-sample jobs: pair key replicate-0000, seeds 91002–91010.' > "$ATTEMPT/provenance.txt"
 srun --ntasks=1 python -u scripts/run_generation_pilot.py \
   --backbone-checkpoint "$BACKBONE" --backbone-sha256 7508daae475e7c0aa39dd7014e786fa9788fe1fc37f040c076e2df021e45f605 \
   --adapter "$ADAPTER" --adapter-sha256 e72e981045ba19c0867e313e74a36cc1066fbe9da6c3a8f54a55c7dbf0901255 \

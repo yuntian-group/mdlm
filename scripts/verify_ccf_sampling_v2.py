@@ -26,7 +26,7 @@ def main():
   parser.add_argument('--real-step-check', action='store_true')
   args = parser.parse_args()
   source = (args.v1_utils.read_bytes() if args.v1_utils else subprocess.check_output(
-    ['git', 'show', '34a7f1107dcc86120a8affacebe0c00437ac00de:structured_utils.py'], cwd=ROOT))
+    ['git', 'cat-file', 'blob', 'd8d05932ede6125cea511f654884d1ee64812131'], cwd=ROOT))
   assert hashlib.sha256(source).hexdigest() == '61892523cb59ad6da842326df3fcf319989d5b9efb50da8d0b039aa99e0a15bf'
   v1 = types.ModuleType('_ccf_v1_reference')
   sys.modules[v1.__name__] = v1

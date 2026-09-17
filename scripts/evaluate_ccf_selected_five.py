@@ -45,7 +45,7 @@ def matrix(suite='selected'):
     # One released MDLM baseline, then all 56 CCF checkpoints. No result reuse.
     return [basic_7k[0]] + cells
   if suite == 'low_steps_sweep':
-    # Basic 7k and both MDLM budgets are reused from completed array 1545882.
+    # Basic 7k and both MDLM budgets reuse the completed twenty-sample study.
     cells = []
     for step in range(1000, 7001, 1000):
       if step < 7000:
@@ -143,7 +143,9 @@ def gated_pilot(pilot, cell, out, args):
   reference = 'v1' if cell['family'] == 'C' and cell['arm'] == 'dynamic_dynamic' else 'v2'
   v1 = None
   if reference == 'v1':
-    source = (CACHE / 'code/ccf_sampling_speed_v1.ihSeMi/structured_utils.py').read_bytes()
+    # Content-addressed source survives replaying the collaborator patches.
+    source = subprocess.check_output(
+      ['git', 'cat-file', 'blob', 'd8d05932ede6125cea511f654884d1ee64812131'], cwd=ROOT)
     assert hashlib.sha256(source).hexdigest() == V1_SHA
     v1 = types.ModuleType('_ccf_selected_v1_reference')
     sys.modules[v1.__name__] = v1

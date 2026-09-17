@@ -22,6 +22,7 @@ set -euo pipefail
 # Activate the Python environment before submitting this script.
 CCF_CODE_ROOT="${CCF_CODE_ROOT:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)}"
 : "${CCF_CACHE_ROOT:?Set CCF_CACHE_ROOT to your local checkpoints/cache/runs directory}"
+export CCF_CODE_ROOT CCF_CACHE_ROOT
 cd "$CCF_CODE_ROOT"
 
 BACKBONE=${CCF_CACHE_ROOT}/checkpoints/mdlm-owt-backbone.pt
