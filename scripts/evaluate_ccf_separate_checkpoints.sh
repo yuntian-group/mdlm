@@ -9,7 +9,7 @@
 #SBATCH --error=slurm-%x-%A_%a.err
 #SBATCH --mail-type=ALL,TIME_LIMIT,TIME_LIMIT_90,TIME_LIMIT_80,TIME_LIMIT_50,ARRAY_TASKS
 
-# #1 separate rank8: three checkpoints for each of the two dynamic-factor arms.
+# Separate-embedding checkpoint sweeps for both dynamic-factor arms.
 # Require afterok on GPU speed verification when using the optimized snapshot.
 # Existing 7k samples are reused; original training outputs are read-only.
 set -euo pipefail
@@ -19,17 +19,26 @@ CCF_CODE_ROOT="${CCF_CODE_ROOT:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." &
 export CCF_CODE_ROOT CCF_CACHE_ROOT
 cd "${CCF_CODE_ROOT:-${SLURM_SUBMIT_DIR:-.}}"
 IDX="${SLURM_ARRAY_TASK_ID:-${1:-}}"
-if [[ ! "$IDX" =~ ^[0-5]$ ]]; then
-  echo "Expected task index 0 through 5"
-  exit 2
-fi
-STEPS=(2000 4000 6000)
 ARMS=(fixed_dynamic dynamic_dynamic)
 TOPOLOGIES=(fixed dynamic)
 WEIGHTS=(0.0 0.1)
 SOURCE_RUNS=(ccf_separate_r8_fixed_dynamic_s001_step7000_run-separate-r8-fd ccf_separate_r8_dynamic_dynamic_s001_step7000_run-separate-r8-dd)
-ARM_INDEX=$((IDX / 3))
-STEP="${STEPS[$((IDX % 3))]}"
+RANK=8
+case "${CCF_SWEEP_SET:-original}" in
+  original) STEPS=(2000 4000 6000) ;;
+  rank8_followup) STEPS=(1500 2500 5500 6500) ;;
+  rank16_followup)
+    RANK=16
+    STEPS=(2000 4000 6000)
+    SOURCE_RUNS=(ccf_separate_r16_fixed_dynamic_s001_step7000_run-separate-r16-fd ccf_separate_r16_dynamic_dynamic_s001_step7000_run-separate-r16-dd)
+    ;;
+  *) echo "Unknown CCF_SWEEP_SET"; exit 2 ;;
+esac
+if [[ ! "$IDX" =~ ^[0-9]+$ ]] || ((IDX >= 2 * ${#STEPS[@]})); then
+  echo "Invalid task index for this checkpoint sweep"; exit 2
+fi
+ARM_INDEX=$((IDX / ${#STEPS[@]}))
+STEP="${STEPS[$((IDX % ${#STEPS[@]}))]}"
 ARM="${ARMS[$ARM_INDEX]}"
 CACHE_ROOT=${CCF_CACHE_ROOT}
 CHECKPOINT="$CACHE_ROOT/runs/${SOURCE_RUNS[$ARM_INDEX]}/training/checkpoints/0-$STEP.ckpt"
@@ -37,7 +46,7 @@ BACKBONE="$CACHE_ROOT/checkpoints/mdlm-owt-backbone.pt"
 HF_CACHE="$CACHE_ROOT/huggingface"
 export HF_HUB_CACHE="$HF_CACHE"
 export TOKENIZERS_PARALLELISM=false
-RUN_ROOT="$CACHE_ROOT/runs/ccf_separate_checkpoints_job${SLURM_ARRAY_JOB_ID:?Submit as Slurm array}/$ARM/step$STEP"
+RUN_ROOT="$CACHE_ROOT/runs/ccf_separate_r${RANK}_checkpoints_job${SLURM_ARRAY_JOB_ID:?Submit as Slurm array}/$ARM/step$STEP"
 test -f "$CHECKPOINT"
 test -f "$BACKBONE"
 mkdir -p "$RUN_ROOT"
@@ -89,7 +98,7 @@ srun --ntasks=1 python -u scripts/run_generation_pilot.py \
   --reference-lm-max-length 1024 --reference-lm-dtype float32 \
   --override "data.cache_dir=$HF_CACHE" \
   --override model.structured_decoder.top_k=128 \
-  --override model.structured_decoder.rank=8 \
+  --override "model.structured_decoder.rank=$RANK" \
   --override ++model.structured_decoder.factor_embedding_mode=separate \
   --override ++model.structured_decoder.factor_conditioner_hidden_dim=0 \
   --override "model.structured_decoder.topology_mode=${TOPOLOGIES[$ARM_INDEX]}" \
