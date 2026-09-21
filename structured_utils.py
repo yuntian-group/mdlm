@@ -30,6 +30,8 @@ from typing import List, Optional, Sequence, Tuple
 import torch
 import torch.nn.functional as F
 
+import runtime_validation
+
 
 @dataclass(frozen=True)
 class ForestMarginals:
@@ -108,6 +110,8 @@ class _ForestTopology:
   order: Tuple[int, ...]
   component: Tuple[int, ...]
   active_edges: Tuple[int, ...]
+  # Already transferred by _build_topology; avoid per-edge GPU .item() calls.
+  edge_left: Tuple[int, ...]
 
 
 @dataclass(frozen=True)
@@ -272,7 +276,8 @@ def _build_topology(edge_index: torch.Tensor,
       parent_edge=tuple(parent_edge),
       order=tuple(order),
       component=tuple(component),
-      active_edges=tuple(active_edges)))
+      active_edges=tuple(active_edges),
+      edge_left=tuple(edge[0] for edge in host_edges[batch_index])))
   return topologies
 
 
@@ -293,9 +298,10 @@ def _constrain_nodes(node_log_potentials: torch.Tensor,
       clamped_states, dtype=torch.long, device=node_log_potentials.device)
     _require(clamped_states.shape == (batch_size, num_nodes),
              'clamped_states must have shape (batch, nodes)')
-    _require(bool(((clamped_states >= -1)
-                   & (clamped_states < num_states)).all().item()),
-             'clamped state indices must be -1 or valid state indices')
+    if runtime_validation.enabled():
+      _require(bool(((clamped_states >= -1)
+                     & (clamped_states < num_states)).all().item()),
+               'clamped state indices must be -1 or valid state indices')
     is_clamped = clamped_states >= 0
     state_ids = torch.arange(
       num_states, device=node_log_potentials.device)
@@ -304,8 +310,9 @@ def _constrain_nodes(node_log_potentials: torch.Tensor,
       | (state_ids == clamped_states.clamp_min(0).unsqueeze(-1)))
     allowed = allowed & clamp_allowed
 
-  _require(bool(allowed.any(dim=-1).all().item()),
-           'every node must retain at least one allowed state')
+  if runtime_validation.enabled():
+    _require(bool(allowed.any(dim=-1).all().item()),
+             'every node must retain at least one allowed state')
   return node_log_potentials.masked_fill(~allowed, -torch.inf)
 
 
@@ -340,12 +347,14 @@ def _validate_inputs(
            'node and pair potentials have different batch sizes')
   _require(log_pair_factors.shape[2:] == (num_states, num_states),
            'pair-factor state axes must match node state count')
-  _require(not bool(torch.isnan(node_log_potentials).any().item())
-           and not bool(torch.isposinf(node_log_potentials).any().item()),
-           'node_log_potentials may contain -inf, but not NaN or +inf')
-  # Strict positivity of pair factors is equivalent to finite log factors.
-  _require(bool(torch.isfinite(log_pair_factors).all().item()),
-           'all pair factors must be strictly positive (finite in log-space)')
+  if runtime_validation.enabled():
+    _require(not bool(torch.isnan(node_log_potentials).any().item())
+             and not bool(torch.isposinf(node_log_potentials).any().item()),
+             'node_log_potentials may contain -inf, but not NaN or +inf')
+    # Strict positivity of pair factors is equivalent to finite log factors.
+    _require(bool(torch.isfinite(log_pair_factors).all().item()),
+             'all pair factors must be strictly positive '
+             '(finite in log-space)')
 
   edge_count = log_pair_factors.shape[1]
   edge_index, edge_mask = _canonical_topology(
@@ -398,18 +407,19 @@ def _validate_low_rank_inputs(
            'endpoint factors need positive state and rank dimensions')
   _require(num_states == explicit_states + 1,
            'node states must be explicit endpoint states plus one residual')
-  invalid_nodes = (
-    torch.isnan(node_log_potentials).any()
-    | torch.isposinf(node_log_potentials).any())
-  _require(not bool(invalid_nodes.item()),
-           'node_log_potentials may contain -inf, but not NaN or +inf')
-  valid_factors = (
-    torch.isfinite(left_factors).all()
-    & torch.isfinite(right_factors).all()
-    & (left_factors > 0).all()
-    & (right_factors > 0).all())
-  _require(bool(valid_factors.item()),
-           'all endpoint factors must be finite and strictly positive')
+  if runtime_validation.enabled():
+    invalid_nodes = (
+      torch.isnan(node_log_potentials).any()
+      | torch.isposinf(node_log_potentials).any())
+    _require(not bool(invalid_nodes.item()),
+             'node_log_potentials may contain -inf, but not NaN or +inf')
+    valid_factors = (
+      torch.isfinite(left_factors).all()
+      & torch.isfinite(right_factors).all()
+      & (left_factors > 0).all()
+      & (right_factors > 0).all())
+    _require(bool(valid_factors.item()),
+             'all endpoint factors must be finite and strictly positive')
 
   edge_index, edge_mask = _canonical_topology(
     edge_index, edge_mask, batch_size, edge_count,
@@ -528,6 +538,25 @@ def _single_forest_sum_product(
   return log_partition, node_log_marginals, edge_log_marginals
 
 
+def _forest_sum_product_from_validated(
+    constrained_nodes: torch.Tensor,
+    log_pair_factors: torch.Tensor,
+    edge_index: torch.Tensor,
+    topologies: Sequence[_ForestTopology],
+    ) -> ForestMarginals:
+  """Compute dense forest marginals from already validated inputs."""
+  outputs = [
+    _single_forest_sum_product(
+      constrained_nodes[batch_index], log_pair_factors[batch_index],
+      edge_index[batch_index], topologies[batch_index])
+    for batch_index in range(constrained_nodes.shape[0])
+  ]
+  return ForestMarginals(
+    log_partition=torch.stack([output[0] for output in outputs]),
+    node_log_marginals=torch.stack([output[1] for output in outputs]),
+    edge_log_marginals=torch.stack([output[2] for output in outputs]))
+
+
 def forest_sum_product(
     node_log_potentials: torch.Tensor,
     log_pair_factors: torch.Tensor,
@@ -562,24 +591,14 @@ def forest_sum_product(
   constrained_nodes, edge_index, _, topologies = _validate_inputs(
     node_log_potentials, log_pair_factors, edge_index, edge_mask,
     state_mask, clamped_states, max_components, max_component_size)
-  outputs = [
-    _single_forest_sum_product(
-      constrained_nodes[batch_index], log_pair_factors[batch_index],
-      edge_index[batch_index], topologies[batch_index])
-    for batch_index in range(node_log_potentials.shape[0])
-  ]
-  return ForestMarginals(
-    log_partition=torch.stack([output[0] for output in outputs]),
-    node_log_marginals=torch.stack([output[1] for output in outputs]),
-    edge_log_marginals=torch.stack([output[2] for output in outputs]))
+  return _forest_sum_product_from_validated(
+    constrained_nodes, log_pair_factors, edge_index, topologies)
 
 
 def _sample_rows(logits: torch.Tensor,
                  generator: Optional[torch.Generator]) -> torch.Tensor:
   probabilities = torch.softmax(logits, dim=-1)
-  _require(bool(torch.isfinite(probabilities).all().item())
-           and bool((probabilities.sum(dim=-1) > 0).all().item()),
-           'cannot sample from an empty or non-finite categorical row')
+  # multinomial already validates its weights; avoid two extra host syncs.
   return torch.multinomial(
     probabilities, num_samples=1, replacement=True,
     generator=generator).squeeze(-1)
@@ -607,14 +626,11 @@ def sample_forest(
   """
   _require(isinstance(num_samples, int) and num_samples > 0,
            'num_samples must be a positive integer')
-  result = forest_sum_product(
-    node_log_potentials, log_pair_factors, edge_index,
-    edge_mask=edge_mask, state_mask=state_mask,
-    clamped_states=clamped_states, max_components=max_components,
-    max_component_size=max_component_size)
-  _, canonical_edges, canonical_mask, topologies = _validate_inputs(
+  constrained_nodes, canonical_edges, _, topologies = _validate_inputs(
     node_log_potentials, log_pair_factors, edge_index, edge_mask,
     state_mask, clamped_states, max_components, max_component_size)
+  result = _forest_sum_product_from_validated(
+    constrained_nodes, log_pair_factors, canonical_edges, topologies)
 
   batch_samples = []
   for batch_index, topology in enumerate(topologies):
@@ -1025,7 +1041,8 @@ def _single_low_rank_sum_product(
     right_log_factors: torch.Tensor,
     edge_index: torch.Tensor,
     topology: _ForestTopology,
-    ) -> Tuple[torch.Tensor, torch.Tensor, dict]:
+    *, sampling_only: bool = False,
+    ) -> tuple:
   num_nodes = node_log_potentials.shape[0]
   messages = {}
 
@@ -1039,7 +1056,7 @@ def _single_low_rank_sum_product(
       if neighbor != parent:
         local = local + messages[(neighbor, node)]
     edge_id = topology.parent_edge[node]
-    left = int(edge_index[edge_id, 0].item())
+    left = topology.edge_left[edge_id]
     if left == node:
       source, target = (
         left_log_factors[edge_id], right_log_factors[edge_id])
@@ -1049,8 +1066,8 @@ def _single_low_rank_sum_product(
     messages[(node, parent)] = _low_rank_message(
       local, source, target)
 
-  # Roots to leaves.
-  for node in topology.order:
+  # Joint sampling needs only upward messages; full marginals need both ways.
+  for node in (() if sampling_only else topology.order):
     neighbors = topology.adjacency[node]
     incoming = [messages[(neighbor, node)]
                 for neighbor, _, _ in neighbors]
@@ -1080,12 +1097,12 @@ def _single_low_rank_sum_product(
       messages[(node, neighbor)] = _low_rank_message(
         local, source, target)
 
-  node_beliefs = []
-  for node in range(num_nodes):
+  node_beliefs = {}
+  for node in (topology.roots if sampling_only else range(num_nodes)):
     belief = node_log_potentials[node]
     for neighbor, _, _ in topology.adjacency[node]:
       belief = belief + messages[(neighbor, node)]
-    node_beliefs.append(belief)
+    node_beliefs[node] = belief
 
   component_log_partitions = torch.stack([
     torch.logsumexp(node_beliefs[root], dim=-1)
@@ -1094,13 +1111,15 @@ def _single_low_rank_sum_product(
   _require(bool(torch.isfinite(component_log_partitions).all().item()),
            'constraints leave the forest with no finite-probability state')
   log_partition = component_log_partitions.sum()
-  node_log_marginals = []
-  for node, belief in enumerate(node_beliefs):
+  node_log_marginals = {}
+  for node, belief in node_beliefs.items():
     log_marginal = (
       belief - component_log_partitions[topology.component[node]])
     log_marginal = log_marginal - torch.logsumexp(log_marginal, dim=-1)
-    node_log_marginals.append(log_marginal)
-  return log_partition, torch.stack(node_log_marginals), messages
+    node_log_marginals[node] = log_marginal
+  if not sampling_only:
+    node_log_marginals = torch.stack(list(node_log_marginals.values()))
+  return log_partition, node_log_marginals, messages
 
 
 def forest_sum_product_low_rank(
@@ -1214,7 +1233,7 @@ def sample_forest_low_rank(
     _, node_log_marginals, messages = _single_low_rank_sum_product(
       constrained_nodes[batch_index],
       left_log_factors[batch_index], right_log_factors[batch_index],
-      edge_index[batch_index], topology)
+      edge_index[batch_index], topology, sampling_only=True)
     samples = torch.empty(
       num_samples, node_log_potentials.shape[1], dtype=torch.long,
       device=node_log_potentials.device)
@@ -1231,7 +1250,7 @@ def sample_forest_low_rank(
       for neighbor, _, _ in topology.adjacency[node]:
         if neighbor != parent:
           local = local + messages[(neighbor, node)]
-      left = int(edge_index[batch_index, edge_id, 0].item())
+      left = topology.edge_left[edge_id]
       if left == parent:
         source, target = (
           left_log_factors[batch_index, edge_id],

@@ -368,6 +368,10 @@ class Diffusion(L.LightningModule):
         topology_mode=str(
           structured_cfg.get('topology_mode', 'dynamic')),
         factor_mode=str(structured_cfg.get('factor_mode', 'dynamic')),
+        factor_embedding_mode=str(
+          structured_cfg.get('factor_embedding_mode', 'shared')),
+        factor_conditioner_hidden_dim=structured_cfg.get(
+          'factor_conditioner_hidden_dim', 0),
         independent_mode=bool(
           structured_cfg.get('independent_mode', False)),
         min_edge_score=structured_cfg.get('min_edge_score', None)))
@@ -1933,14 +1937,12 @@ class Diffusion(L.LightningModule):
     else:
       t = self._sample_t(
         x0.shape[0], x0.device, generator=corruption_generator)
-    if fixed_mask_rate is not None:
-      pass
-    elif self.change_of_variables:
+    if fixed_mask_rate is None and self.change_of_variables:
       conditioning = t[:, None]
       f_T = torch.log1p(-torch.exp(-self.noise.sigma_max))
       f_0 = torch.log1p(-torch.exp(-self.noise.sigma_min))
       move_chance = torch.exp(f_0 + t * (f_T - f_0))[:, None]
-    else:
+    elif fixed_mask_rate is None:
       sigma, _ = self.noise(t)
       conditioning = sigma[:, None]
       move_chance = 1 - torch.exp(-sigma[:, None])
@@ -1972,15 +1974,12 @@ class Diffusion(L.LightningModule):
       unary_logits=unary_logits,
       clean_tokens=x0,
       active_mask=active_mask)
-    target_is_explicit = output.candidate_ids.eq(
-      x0[:, :, None]).any(dim=-1)
     self._last_structured_example_metrics = {
       'nll_sum': denoising.per_example_nll.detach(),
       'active_tokens': active_mask.sum(dim=-1).detach(),
-      'candidate_hits': (
-        target_is_explicit & active_mask).sum(dim=-1).detach(),
-      'retained_mass_sum': output.retained_mass.masked_fill(
-        ~active_mask, 0.0).sum(dim=-1).detach(),
+      'candidate_hits': denoising.candidate_hits_per_example.detach(),
+      'retained_mass_sum': (
+        denoising.retained_mass_sum_per_example.detach()),
     }
     if (record_pairing and self.conditional_records_enabled
         and self.conditional_record_schema_version == 2):

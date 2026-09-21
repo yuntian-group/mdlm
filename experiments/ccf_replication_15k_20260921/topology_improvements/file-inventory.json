@@ -1,0 +1,111 @@
+{
+  "files": {
+    "README.md": {
+      "sha256": "ba157b2838e35784e1fe114db1785ea2e00eddfb9d7482de32b7105f8ed7c5dc",
+      "bytes": 7046
+    },
+    "RESULTS.md": {
+      "sha256": "0c5cd8466c49144bc89f3a3bb50e66ecbf1d0d021a845402d9a722b063b11b09",
+      "bytes": 794
+    },
+    "analysis.json": {
+      "sha256": "68bb2b2f93a03f6527f7b953e4aedf45879c237b32f09ffa1145e3d169f8478b",
+      "bytes": 823
+    },
+    "analyze_results.py": {
+      "sha256": "74568b818cb962b4d5544f446696beb15090beccece51f001361733df0db801d",
+      "bytes": 5395
+    },
+    "collect_results.py": {
+      "sha256": "1f760c6f956774a33a7e838c674b31f07646dcbc767387070f2d26e17f0f7ce1",
+      "bytes": 3646
+    },
+    "deploy_improvements.py": {
+      "sha256": "187776dfd41bbc2788a03794fb7412bd68f8a5f4e463acaa1b45f35332104901",
+      "bytes": 3782
+    },
+    "deploy_repairs.py": {
+      "sha256": "0875e0513f4359f6b7b6721ca6964fdac21dfeaaa9bc3de267eefbf7b24604ec",
+      "bytes": 2968
+    },
+    "deployment-receipt-before-retry2.json": {
+      "sha256": "0807505f77d43a28d5f27a19122bceceaa792ec332def27277446cbe1e0db141",
+      "bytes": 7882
+    },
+    "deployment-receipt.json": {
+      "sha256": "23d2b19cd104a85ec455cb621be505c9ee448d489a5e63d41bb6c73a30231eb9",
+      "bytes": 8478
+    },
+    "evaluate_trained.py": {
+      "sha256": "be60bd32164c1a19e17a7c9a0c4d27d0b7fb729c6a79825424a1337a35149d71",
+      "bytes": 1502
+    },
+    "generation_worker.py": {
+      "sha256": "71b973833373aef44d5e346e2e2be5356ce4d6bc12661aaf042f741cc80c0ab4",
+      "bytes": 1566
+    },
+    "local-tests.log": {
+      "sha256": "9ff06149f68a99a624015293f8e8598c779304eaf8fe5eb2b8a65395e827fb81",
+      "bytes": 1511
+    },
+    "protocol.json": {
+      "sha256": "e292b80bf90e772febfcc8c150cb55a58b815f0bc739d2bed840e88c328aa60d",
+      "bytes": 1630
+    },
+    "repair-receipt.json": {
+      "sha256": "fe30f1644222b81eba6dbe680e88dd69a477c88aca0a7e861ff2854b288566c1",
+      "bytes": 3336
+    },
+    "repairs/graph_generation.py": {
+      "sha256": "815a91ee81efd449bd76b46f865b82f7dbaaad48649f40da520e611694d25a29",
+      "bytes": 1926
+    },
+    "repairs/run_graph_intervention.py": {
+      "sha256": "52109a287ae19cf5c60acc4002034ec80504ec0b7f6ae1fec3759091d5825b50",
+      "bytes": 3426
+    },
+    "repairs/weight_trial.py": {
+      "sha256": "c919d739eb8283ca6a4a3cd369408f1d3f38f902bb9f14f043bad25619ad9112",
+      "bytes": 1628
+    },
+    "results-snapshot.json.gz": {
+      "sha256": "010f2f829f0813c4623f27badf555b61b78e6969fe527c55d667bdf35bbb5945",
+      "bytes": 2225
+    },
+    "retry_gate.py": {
+      "sha256": "cf81c8d77883ec86b798386c56dba891275d415627e1027b333f012c5f158152",
+      "bytes": 3321
+    },
+    "run_variant_generation.py": {
+      "sha256": "9244dbe123f536d226210f3e2e83082a71c0804760ce4acf283fb26ef261be89",
+      "bytes": 3006
+    },
+    "smoke_gate.py": {
+      "sha256": "01631611bd82dfca673532b3c6b87db556ab700c886014ed777fbaa10db79c1b",
+      "bytes": 2709
+    },
+    "test_analysis.py": {
+      "sha256": "fd40f600bbdf66f5e05a5d30554262ac3a8a4765add173c380967abe7146a756",
+      "bytes": 1055
+    },
+    "test_topology_variants.py": {
+      "sha256": "cfb1a1c5d5cc2ab3035e062e6b6f962c4b22a43a5bd02e3c76170f336c472883",
+      "bytes": 6288
+    },
+    "topology_variants.py": {
+      "sha256": "a85246d5c51a77954c9964ea3e0f5ea4bf6112b4a7703fa867178d9fd33453e3",
+      "bytes": 9563
+    },
+    "train_variant.py": {
+      "sha256": "ca33ec640e237f87fb4e1fa34d8270c085ca02555515414b4d2c3de719a4ad03",
+      "bytes": 1663
+    },
+    "variant_observer.py": {
+      "sha256": "7a63a404efefd47d16f8b972acef703bd2813662cd6dac9d9f10bc4fb883be1c",
+      "bytes": 2284
+    }
+  },
+  "retry_changed_runtime_files_match": true,
+  "local_tests": "10 passed; see local-tests.log",
+  "gpu_gate": "1557045 submitted; prior failed gate retained"
+}

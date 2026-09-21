@@ -7,6 +7,7 @@ from typing import Optional, Union
 
 import torch
 
+import runtime_validation
 import structured_utils
 from models.structured_decoder import StructuredDecoderOutput
 
@@ -46,9 +47,42 @@ def compressed_states_for_tokens(
   states = torch.where(explicit, explicit_state, residual)
   allowed = torch.gather(
     output.candidate_state_mask, -1, states[:, :, None]).squeeze(-1)
-  if not bool(allowed.all().item()):
+  if (runtime_validation.enabled()
+      and not bool(allowed.all().item())):
     raise ValueError('a token maps to a disabled residual state')
   return states
+
+
+def _validate_token_inputs(
+    output: StructuredDecoderOutput,
+    unary_logits: torch.Tensor,
+    token_ids: torch.Tensor) -> None:
+  if unary_logits.shape[:2] != token_ids.shape:
+    raise ValueError('unary_logits and token_ids leading shapes differ')
+  if (runtime_validation.enabled()
+      and unary_logits.shape[-1] <= int(output.candidate_ids.max().item())):
+    raise ValueError('unary_logits vocabulary is incompatible with candidates')
+
+
+def _structured_clamped_states(active_mask: torch.Tensor) -> torch.Tensor:
+  # Forest edges already connect active nodes only.  Clamping every inactive
+  # isolated node to an arbitrary valid candidate makes its unary cancel
+  # exactly between the assignment score and partition function.
+  return torch.where(
+    active_mask,
+    torch.full_like(active_mask, -1, dtype=torch.long),
+    torch.zeros_like(active_mask, dtype=torch.long))
+
+
+def _structured_backend(output: StructuredDecoderOutput, backend: str) -> str:
+  if backend == 'auto':
+    # Tiny synthetic lattices are faster with dense kernels; realistic top-K
+    # heads use the endpoint path to avoid K-squared time and memory.
+    backend = (
+      'dense' if output.candidate_ids.shape[-1] <= 16 else 'low_rank')
+  if backend not in {'dense', 'low_rank'}:
+    raise ValueError("backend must be 'auto', 'dense', or 'low_rank'")
+  return backend
 
 
 def infer_structured_distribution(
@@ -57,20 +91,17 @@ def infer_structured_distribution(
     backend: str = 'auto') -> StructuredInference:
   """Run exact sum-product, cancelling nodes outside the masked set."""
   active_mask = _validate_active_mask(output, active_mask)
-  # Forest edges already connect active nodes only.  Clamping every inactive
-  # isolated node to an arbitrary valid candidate makes its unary cancel
-  # exactly between the assignment score and partition function.
-  clamped_states = torch.where(
-    active_mask,
-    torch.full_like(active_mask, -1, dtype=torch.long),
-    torch.zeros_like(active_mask, dtype=torch.long))
-  if backend == 'auto':
-    # Tiny synthetic lattices are faster with dense kernels; realistic top-K
-    # heads use the endpoint path to avoid K-squared time and memory.
-    backend = (
-      'dense' if output.candidate_ids.shape[-1] <= 16 else 'low_rank')
-  if backend not in {'dense', 'low_rank'}:
-    raise ValueError("backend must be 'auto', 'dense', or 'low_rank'")
+  return _infer_structured_distribution_from_validated(
+    output, active_mask, backend)
+
+
+def _infer_structured_distribution_from_validated(
+    output: StructuredDecoderOutput,
+    active_mask: torch.Tensor,
+    backend: str = 'auto') -> StructuredInference:
+  """Run inference after the public boundary validated ``active_mask``."""
+  clamped_states = _structured_clamped_states(active_mask)
+  backend = _structured_backend(output, backend)
   log_pair_factors = None
   if backend == 'dense':
     log_pair_factors = structured_utils.positive_pair_factors_to_log(
@@ -113,14 +144,12 @@ def structured_token_log_probability(
   are clamped and cancel from the normalized likelihood.
   """
   active_mask = _validate_active_mask(output, active_mask)
-  if unary_logits.shape[:2] != token_ids.shape:
-    raise ValueError('unary_logits and token_ids leading shapes differ')
-  if unary_logits.shape[-1] <= int(output.candidate_ids.max().item()):
-    raise ValueError('unary_logits vocabulary is incompatible with candidates')
+  _validate_token_inputs(output, unary_logits, token_ids)
   states = compressed_states_for_tokens(output, token_ids)
   states = torch.where(
     active_mask, states, torch.zeros_like(states))
-  inference = inference or infer_structured_distribution(output, active_mask)
+  inference = inference or _infer_structured_distribution_from_validated(
+    output, active_mask)
 
   node_score = torch.gather(
     output.unary_log_potentials, -1, states[:, :, None]).squeeze(-1).sum(-1)
@@ -190,12 +219,10 @@ def structured_marginal_token_log_probability(
   prohibitively large for the released MDLM vocabulary.
   """
   active_mask = _validate_active_mask(output, active_mask)
-  if unary_logits.shape[:2] != token_ids.shape:
-    raise ValueError('unary_logits and token_ids leading shapes differ')
-  if unary_logits.shape[-1] <= int(output.candidate_ids.max().item()):
-    raise ValueError('unary_logits vocabulary is incompatible with candidates')
+  _validate_token_inputs(output, unary_logits, token_ids)
 
-  inference = inference or infer_structured_distribution(output, active_mask)
+  inference = inference or _infer_structured_distribution_from_validated(
+    output, active_mask)
   states = compressed_states_for_tokens(output, token_ids)
   states = torch.where(active_mask, states, torch.zeros_like(states))
   compressed_log_probability = torch.gather(
@@ -252,7 +279,8 @@ def full_vocabulary_marginals(
     inference: Optional[StructuredInference] = None) -> torch.Tensor:
   """Expand exact compressed node marginals back to the full vocabulary."""
   active_mask = _validate_active_mask(output, active_mask)
-  inference = inference or infer_structured_distribution(output, active_mask)
+  inference = inference or _infer_structured_distribution_from_validated(
+    output, active_mask)
   vocab_size = unary_logits.shape[-1]
   result = unary_logits.new_zeros(
     *unary_logits.shape, dtype=inference.marginals.node_marginals.dtype)
@@ -274,16 +302,28 @@ def sample_structured_tokens(
     inference: Optional[StructuredInference] = None) -> torch.Tensor:
   """Jointly sample full-vocabulary tokens; output shape is [B,S,L]."""
   active_mask = _validate_active_mask(output, active_mask)
-  inference = inference or infer_structured_distribution(output, active_mask)
-  if inference.backend == 'dense':
+  if inference is None:
+    # Both joint samplers compute their own messages and marginals. The old
+    # prepass's marginal tensors were never consumed here. Prepare only the
+    # same backend/clamps/factors; preserve every subsequent random draw.
+    backend = _structured_backend(output, 'auto')
+    clamped_states = _structured_clamped_states(active_mask)
+    log_pair_factors = (
+      structured_utils.positive_pair_factors_to_log(
+        output.materialize_pair_factors()) if backend == 'dense' else None)
+  else:
+    backend = inference.backend
+    clamped_states = inference.clamped_states
+    log_pair_factors = inference.log_pair_factors
+  if backend == 'dense':
     states = structured_utils.sample_forest(
       output.unary_log_potentials,
-      inference.log_pair_factors,
+      log_pair_factors,
       output.edge_index,
       num_samples=num_samples,
       edge_mask=output.edge_mask,
       state_mask=output.candidate_state_mask,
-      clamped_states=inference.clamped_states,
+      clamped_states=clamped_states,
       generator=generator)
   else:
     states = structured_utils.sample_forest_low_rank(
@@ -294,7 +334,7 @@ def sample_structured_tokens(
       num_samples=num_samples,
       edge_mask=output.edge_mask,
       state_mask=output.candidate_state_mask,
-      clamped_states=inference.clamped_states,
+      clamped_states=clamped_states,
       generator=generator)
   batch_size, _, sequence_length = states.shape
   explicit_states = states.clamp_max(output.candidate_ids.shape[-1] - 1)
@@ -332,7 +372,6 @@ def sample_structured_marginal_tokens(
   """
   if num_samples < 1:
     raise ValueError('num_samples must be positive')
-  active_mask = _validate_active_mask(output, active_mask)
   probabilities = full_vocabulary_marginals(
     output=output,
     unary_logits=unary_logits,
