@@ -6,14 +6,18 @@ has full token support, but is not an exact full-vocabulary pairwise CRF.
 """
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Union
 
 import torch
 from torch import Tensor
 
 
 def _logsumexp(x: Tensor, dim: int) -> Tensor:
-    """A logsumexp whose gradient is zero on an all-negative-infinity slice."""
+    """Reduce finite/-inf log scores, protecting impossible-slice gradients."""
+    if not torch.is_grad_enabled():
+        # Native logsumexp already returns -inf for an impossible slice.
+        # Only its backward derivative needs the guarded path below.
+        return torch.logsumexp(x, dim=dim)
     valid = torch.isfinite(x).any(dim=dim, keepdim=True)
     safe = torch.where(valid, x, torch.zeros_like(x))
     out = torch.logsumexp(safe, dim=dim)
@@ -31,9 +35,18 @@ def _inputs(unary: Tensor, edge: Tensor):
 
 
 def _forward(unary: Tensor, edge: Tensor):
-    messages = [unary[:, 0]]
-    for pos in range(1, unary.shape[1]):
-        messages.append(unary[:, pos] + _logsumexp(messages[-1].unsqueeze(-1) + edge[:, pos - 1], -2))
+    with torch.profiler.record_function('crf.forward_filter'):
+        # Keep autograd, CPU, FP64 and large-state inference on the reference
+        # path. The optional CUDA kernel performs the same recurrence in one
+        # launch, including impossible-state handling.
+        if not torch.is_grad_enabled() and unary.is_cuda and unary.dtype == torch.float32:
+            from .cuda_forward import fused_forward
+            fused = fused_forward(unary, edge)
+            if fused is not None:
+                return list(fused.unbind(dim=1))
+        messages = [unary[:, 0]]
+        for pos in range(1, unary.shape[1]):
+            messages.append(unary[:, pos] + _logsumexp(messages[-1].unsqueeze(-1) + edge[:, pos - 1], -2))
     return messages
 
 
@@ -63,9 +76,10 @@ def chain_log_marginals(unary: Tensor, edge: Tensor) -> Tensor:
     log_z = _logsumexp(alpha[-1], -1)
     beta = torch.zeros_like(unary[:, -1])
     marginals = [alpha[-1] - log_z[:, None]]
-    for pos in range(unary.shape[1] - 2, -1, -1):
-        beta = _logsumexp(edge[:, pos] + (unary[:, pos + 1] + beta).unsqueeze(-2), -1)
-        marginals.append(alpha[pos] + beta - log_z[:, None])
+    with torch.profiler.record_function('crf.backward_messages'):
+        for pos in range(unary.shape[1] - 2, -1, -1):
+            beta = _logsumexp(edge[:, pos] + (unary[:, pos + 1] + beta).unsqueeze(-2), -1)
+            marginals.append(alpha[pos] + beta - log_z[:, None])
     return torch.stack(marginals[::-1], dim=1)
 
 
@@ -74,17 +88,42 @@ def chain_marginals(unary: Tensor, edge: Tensor) -> Tensor:
     return chain_log_marginals(unary, edge).exp()
 
 
+def _sampling_probs(log_scores: Tensor) -> Tensor:
+    """Normalize categorical scores in FP64 without CUDA's softmax kernel.
+
+    The installed torch 2.5.1+cu121 CUDA softmax fails on valid FP64 rows
+    (including [23,1001] point masses from segment padding). Separate stable
+    reductions avoid that path without reducing sampling precision. Invalid
+    distributions remain invalid; do not replace their NaNs with probabilities.
+    """
+    scores = log_scores.double()
+    if not scores.is_cuda:
+        return scores.softmax(-1)
+    weights = (scores - scores.amax(dim=-1, keepdim=True)).exp()
+    return weights / weights.sum(dim=-1, keepdim=True)
+
+
 @torch.no_grad()
 def sample_chain(unary: Tensor, edge: Tensor, generator: Optional[torch.Generator] = None) -> Tensor:
-    """Forward filtering/backward sampling; returns a joint draw [B,L]."""
+    """Forward filtering/backward sampling; returns a joint draw [B,L].
+
+    The fused CUDA sampler preserves the joint law, but consumes RNG in a
+    different order from the reference path (same seeds can yield new draws).
+    """
     unary, edge = _inputs(unary, edge)
     alpha = _forward(unary, edge)
-    states = torch.empty(unary.shape[:2], dtype=torch.long, device=unary.device)
-    states[:, -1] = torch.multinomial(alpha[-1].double().softmax(-1), 1, generator=generator).squeeze(-1)
-    for pos in range(unary.shape[1] - 2, -1, -1):
-        selected_edge = edge[:, pos].gather(-1, states[:, pos + 1, None, None].expand(-1, unary.shape[-1], 1)).squeeze(-1)
-        probs = (alpha[pos] + selected_edge).double().softmax(-1)
-        states[:, pos] = torch.multinomial(probs, 1, generator=generator).squeeze(-1)
+    with torch.profiler.record_function('crf.backward_sample'):
+        if unary.is_cuda and unary.dtype == torch.float32:
+            from .cuda_sampling import fused_backward_sample
+            fused = fused_backward_sample(alpha, edge, generator)
+            if fused is not None:
+                return fused
+        states = torch.empty(unary.shape[:2], dtype=torch.long, device=unary.device)
+        states[:, -1] = torch.multinomial(_sampling_probs(alpha[-1]), 1, generator=generator).squeeze(-1)
+        for pos in range(unary.shape[1] - 2, -1, -1):
+            selected_edge = edge[:, pos].gather(-1, states[:, pos + 1, None, None].expand(-1, unary.shape[-1], 1)).squeeze(-1)
+            probs = _sampling_probs(alpha[pos] + selected_edge)
+            states[:, pos] = torch.multinomial(probs, 1, generator=generator).squeeze(-1)
     return states
 
 
@@ -106,21 +145,83 @@ class CandidateBatch:
     gold_tail_logprob: Optional[Tensor]
     normalized_log_probs: Tensor
 
+    def residual_distribution(self, residual: Tensor):
+        tail_lp = self.normalized_log_probs[residual].clone()
+        explicit = self.candidate_ids[residual]
+        tail_lp.scatter_(-1, explicit[:, :-1], -torch.inf)
+        return tail_lp, None
+
+
+@dataclass
+class SamplingCandidateBatch:
+    """Inference support without a second full normalized [B,L,V] tensor.
+
+    Uncapped draws retain the caller's scores by reference and gather only
+    residuals that will be revealed. Capped draws retain [masked_rows,C] scores
+    and token IDs, so tail sampling never reconstructs a full-vocabulary row.
+    This packet is for sampling, not gold likelihoods or autograd.
+    """
+
+    candidate_ids: Tensor
+    unary: Tensor
+    masked: Tensor
+    source_log_probs: Optional[Tensor]
+    mask_id: int
+    temperature: float
+    row_index: Optional[Tensor] = None
+    cap_ids: Optional[Tensor] = None
+    cap_log_probs: Optional[Tensor] = None
+
+    def residual_distribution(self, residual: Tensor):
+        if self.cap_ids is not None:
+            rows = self.row_index[residual]
+            k = self.candidate_ids.shape[-1] - 1
+            return self.cap_log_probs[rows, k:], self.cap_ids[rows, k:]
+        # Row-wise normalization constants cancel in the conditional tail
+        # softmax. Gather only consumed residual rows and never mutate source.
+        tail_lp = self.source_log_probs[residual].to(self.unary.dtype)
+        if self.temperature != 1.:
+            tail_lp = tail_lp / self.temperature
+        tail_lp[..., self.mask_id] = -torch.inf
+        explicit = self.candidate_ids[residual]
+        tail_lp.scatter_(-1, explicit[:, :-1], -torch.inf)
+        return tail_lp, None
+
+
+def topk_clean(log_probs: Tensor, mask_id: int, k: int):
+    """Select exactly K clean-token slots, excluding MASK even in -inf ties."""
+    k = min(k, log_probs.shape[-1] - 1)
+    extra_values, extra_ids = torch.topk(log_probs, k + 1, dim=-1)
+    order = torch.arange(k + 1, device=log_probs.device)
+    mask_position = torch.where(extra_ids.eq(mask_id), order, k + 1).amin(-1, keepdim=True)
+    keep = torch.arange(k, device=log_probs.device).expand(*log_probs.shape[:-1], k)
+    keep = keep + keep.ge(mask_position).long()
+    return extra_values.gather(-1, keep), extra_ids.gather(-1, keep)
+
 
 def build_candidates(log_probs: Tensor, masked_input: Tensor, mask_id: int, k: int,
-                     gold: Optional[Tensor] = None) -> CandidateBatch:
+                     gold: Optional[Tensor] = None, *, vocab_cap: Optional[int] = None) -> CandidateBatch:
     """Build candidates without changing held-out support to include gold.
 
     Input probabilities are normalized after excluding the mask token. Tail
     mass is computed with logsumexp of excluded tokens (not 1-sum(topK)), so
     small tails remain numerically stable. k may be zero or >= vocabulary.
+    Top-K and tail reductions run only on masked rows; visible rows are
+    filled directly with their deterministic state. The returned normalized
+    backbone probabilities retain their existing meaning at every position.
+    A positive vocab_cap C first restricts masked rows to the top C clean
+    tokens and renormalizes. Up to K are explicit; the remaining allowed
+    tokens form the residual. When C <= K, the residual has -inf mass.
+    None preserves full support. Gold outside the cap has zero probability.
     """
     if log_probs.ndim != 3 or masked_input.shape != log_probs.shape[:2]:
         raise ValueError("log_probs [B,L,V] and masked_input [B,L] are required")
     if k < 0 or not 0 <= mask_id < log_probs.shape[-1]:
         raise ValueError("k must be nonnegative and mask_id inside the vocabulary")
+    if vocab_cap is not None and (type(vocab_cap) is not int or vocab_cap < 1):
+        raise ValueError("vocab_cap must be None or a positive integer")
     vocab = log_probs.shape[-1]
-    k = min(k, vocab - 1)
+    k = min(k, vocab - 1, vocab_cap if vocab_cap is not None else vocab - 1)
     dtype = torch.float64 if log_probs.dtype == torch.float64 else torch.float32
     lp = log_probs.to(dtype).clone()
     lp[..., mask_id] = -torch.inf
@@ -128,28 +229,42 @@ def build_candidates(log_probs: Tensor, masked_input: Tensor, mask_id: int, k: i
     # Observed MDLM rows may be point masses. A visible mask-token point mass
     # is invalid; well-formed visible rows and all masked rows normalize here.
     lp = lp - norm
-    # Ask for one extra item and remove MASK explicitly. Merely assigning it
-    # -inf is insufficient when other real tokens also have zero probability:
-    # topk can break -inf ties by returning MASK instead of a real token.
-    extra_values, extra_ids = torch.topk(lp, k + 1, dim=-1)
-    order = torch.arange(k + 1, device=lp.device)
-    mask_position = torch.where(extra_ids.eq(mask_id), order, k + 1).amin(-1, keepdim=True)
-    keep = torch.arange(k, device=lp.device).expand(*lp.shape[:2], k)
-    keep = keep + keep.ge(mask_position).long()
-    top_values = extra_values.gather(-1, keep)
-    top_ids = extra_ids.gather(-1, keep)
-    tail = lp.clone()
-    tail.scatter_(-1, top_ids, -torch.inf)
-    tail_mass = _logsumexp(tail, -1)
-    ids = torch.cat((top_ids, torch.full_like(masked_input.unsqueeze(-1), -1)), -1)
-    unary = torch.cat((top_values, tail_mass.unsqueeze(-1)), -1)
     masked = masked_input.eq(mask_id)
-    visible_ids = torch.full_like(ids, -1)
-    visible_ids[..., 0] = masked_input
-    visible_unary = torch.full_like(unary, -torch.inf)
-    visible_unary[..., 0] = 0.
-    ids = torch.where(masked.unsqueeze(-1), ids, visible_ids)
-    unary = torch.where(masked.unsqueeze(-1), unary, visible_unary)
+    active_rows = masked.reshape(-1).nonzero(as_tuple=False).squeeze(-1)
+    ids = masked_input.new_full((*masked_input.shape, k + 1), -1)
+    ids[..., 0] = masked_input
+    unary = lp.new_full(ids.shape, -torch.inf)
+    unary[..., 0] = 0.
+    if active_rows.numel():
+        flat_lp = lp.reshape(-1, vocab)
+        # Avoid copying the whole vocabulary tensor at the fully masked step.
+        active_lp = (flat_lp if active_rows.numel() == masked.numel()
+                     else flat_lp.index_select(0, active_rows))
+        # Ask for one extra item and remove MASK explicitly. Merely assigning
+        # it -inf is insufficient when topk breaks ties among impossible tokens.
+        with torch.profiler.record_function('crf.topk'):
+            if vocab_cap is None:
+                top_values, top_ids = topk_clean(active_lp, mask_id, k)
+            else:
+                cap_values, cap_ids = topk_clean(active_lp, mask_id, vocab_cap)
+                cap_values = cap_values - _logsumexp(cap_values, -1).unsqueeze(-1)
+                # Take explicit states from this same ranked support, so ties
+                # cannot select different tokens at the cap boundary.
+                top_values, top_ids = cap_values[:, :k], cap_ids[:, :k]
+                active_lp = torch.full_like(active_lp, -torch.inf).scatter(-1, cap_ids, cap_values)
+                lp = flat_lp.index_copy(0, active_rows, active_lp).reshape_as(lp)
+        with torch.profiler.record_function('crf.tail_mass'):
+            tail = active_lp.clone()
+            tail.scatter_(-1, top_ids, -torch.inf)
+            tail_mass = _logsumexp(tail, -1)
+        active_ids = torch.cat((top_ids, top_ids.new_full((active_rows.numel(), 1), -1)), -1)
+        active_unary = torch.cat((top_values, tail_mass.unsqueeze(-1)), -1)
+        ids.view(-1, k + 1).index_copy_(0, active_rows, active_ids)
+        unary.view(-1, k + 1).index_copy_(0, active_rows, active_unary)
+    elif lp.requires_grad:
+        # Preserve a zero gradient to the backbone for an entirely clamped
+        # chain. An empty sum avoids multiplying any -inf values by zero.
+        unary = unary + lp[..., :0].sum()
     gold_states = gold_tail = None
     if gold is not None:
         if gold.shape != masked_input.shape:
@@ -162,12 +277,85 @@ def build_candidates(log_probs: Tensor, masked_input: Tensor, mask_id: int, k: i
         explicit = matches.any(-1)
         gold_states = torch.where(explicit, matches.long().argmax(-1), torch.full_like(gold, k))
         gold_lp = lp.gather(-1, gold.unsqueeze(-1)).squeeze(-1)
+        tail_mass = unary[..., -1]
         # Avoid undefined -inf - -inf on unused states of point-mass rows.
         is_tail = masked & ~explicit & torch.isfinite(tail_mass)
         numerator = torch.where(is_tail, gold_lp, torch.zeros_like(gold_lp))
         denominator = torch.where(is_tail, tail_mass, torch.zeros_like(tail_mass))
         gold_tail = numerator - denominator
     return CandidateBatch(ids, unary, masked, gold_states, gold_tail, lp)
+
+
+@torch.no_grad()
+def build_sampling_candidates(log_probs: Tensor, masked_input: Tensor, mask_id: int,
+                              k: int, *, vocab_cap: Optional[int] = None,
+                              temperature: float = 1.) -> SamplingCandidateBatch:
+    """Build generation support using only masked rows and compact capped tails.
+
+    The candidate-chain law matches build_candidates: clean top-K plus exact
+    residual mass. No full normalized vocabulary field or gold mapping is
+    constructed. The full differentiable builder remains the training oracle.
+    Reduction order and compact capped RNG can change seeded token draws.
+    """
+    if log_probs.ndim != 3 or masked_input.shape != log_probs.shape[:2]:
+        raise ValueError("log_probs [B,L,V] and masked_input [B,L] are required")
+    if k < 0 or not 0 <= mask_id < log_probs.shape[-1]:
+        raise ValueError("k must be nonnegative and mask_id inside the vocabulary")
+    if vocab_cap is not None and (type(vocab_cap) is not int or vocab_cap < 1):
+        raise ValueError("vocab_cap must be None or a positive integer")
+    if temperature <= 0:
+        raise ValueError("temperature must be positive")
+    vocab = log_probs.shape[-1]
+    k = min(k, vocab - 1, vocab_cap if vocab_cap is not None else vocab - 1)
+    dtype = torch.float64 if log_probs.dtype == torch.float64 else torch.float32
+    masked = masked_input.eq(mask_id)
+    rows = masked.reshape(-1).nonzero(as_tuple=False).squeeze(-1)
+    ids = masked_input.new_full((*masked_input.shape, k + 1), -1)
+    ids[..., 0] = masked_input
+    unary = torch.full(ids.shape, -torch.inf, device=log_probs.device, dtype=dtype)
+    unary[..., 0] = 0.
+    packet = SamplingCandidateBatch(ids, unary, masked,
+        log_probs if vocab_cap is None else None, mask_id, temperature)
+    if not rows.numel():
+        return packet
+
+    flat = log_probs.reshape(-1, vocab)
+    # The uncapped path needs writable scratch for MASK/top-K exclusion.
+    # The capped path at temperature 1 can read a fully masked input directly.
+    all_masked = rows.numel() == masked.numel()
+    active = (flat if all_masked else flat.index_select(0, rows)).to(dtype)
+    if all_masked and (vocab_cap is None or temperature != 1.):
+        active = active.clone()
+    if temperature != 1.:
+        active.div_(temperature)
+
+    if vocab_cap is None:
+        active[..., mask_id] = -torch.inf
+        with torch.profiler.record_function('crf.clean_normalization'):
+            normalizer = torch.logsumexp(active, -1)
+        with torch.profiler.record_function('crf.topk'):
+            values, top_ids = topk_clean(active, mask_id, k)
+            values = values - normalizer[:, None]
+        with torch.profiler.record_function('crf.tail_mass'):
+            active.scatter_(-1, top_ids, -torch.inf)
+            tail_mass = torch.logsumexp(active, -1) - normalizer
+    else:
+        with torch.profiler.record_function('crf.topk'):
+            cap_values, cap_ids = topk_clean(active, mask_id, vocab_cap)
+            cap_values = cap_values - torch.logsumexp(cap_values, -1, keepdim=True)
+            values, top_ids = cap_values[:, :k], cap_ids[:, :k]
+        with torch.profiler.record_function('crf.tail_mass'):
+            tail_mass = torch.logsumexp(cap_values[:, k:], -1)
+        packet.row_index = masked_input.new_full(masked_input.shape, -1)
+        packet.row_index.view(-1).index_copy_(0, rows, torch.arange(
+            rows.numel(), device=rows.device, dtype=rows.dtype))
+        packet.cap_ids, packet.cap_log_probs = cap_ids, cap_values
+
+    active_ids = torch.cat((top_ids, top_ids.new_full((rows.numel(), 1), -1)), -1)
+    active_unary = torch.cat((values, tail_mass[:, None]), -1)
+    ids.view(-1, k + 1).index_copy_(0, rows, active_ids)
+    unary.view(-1, k + 1).index_copy_(0, rows, active_unary)
+    return packet
 
 
 def gold_log_prob(candidates: CandidateBatch, edge: Tensor, unary_delta: Optional[Tensor] = None) -> Tensor:
@@ -179,16 +367,25 @@ def gold_log_prob(candidates: CandidateBatch, edge: Tensor, unary_delta: Optiona
 
 
 @torch.no_grad()
-def sample_candidate_tokens(candidates: CandidateBatch, states: Tensor,
-                            generator: Optional[torch.Generator] = None) -> Tensor:
-    """Expand sampled residual states using the backbone conditional tail law."""
+def sample_candidate_tokens(candidates: Union[CandidateBatch, SamplingCandidateBatch], states: Tensor,
+                            generator: Optional[torch.Generator] = None, *,
+                            resolve_mask: Optional[Tensor] = None) -> Tensor:
+    """Expand residual states, optionally only where token IDs will be used.
+
+    Unresolved residuals remain -1 when resolve_mask is supplied; callers must
+    discard those positions before committing tokens. The full candidate-state
+    draw is unchanged. Skipping unused tail draws changes RNG consumption.
+    """
+    if resolve_mask is not None:
+        if (resolve_mask.shape != states.shape or resolve_mask.dtype != torch.bool
+                or resolve_mask.device != states.device):
+            raise ValueError("resolve_mask must be boolean with states' shape and device")
     tokens = candidates.candidate_ids.gather(-1, states.unsqueeze(-1)).squeeze(-1)
     residual = tokens.lt(0)
+    if resolve_mask is not None:
+        residual = residual & resolve_mask
     if residual.any():
-        tail_lp = candidates.normalized_log_probs[residual].clone()
-        explicit = candidates.candidate_ids[residual]
-        # All residual-selected rows are masked, so the first S-1 slots are
-        # explicit candidates (possibly zero slots when K=0).
-        tail_lp.scatter_(-1, explicit[:, :-1], -torch.inf)
-        tokens[residual] = torch.multinomial(tail_lp.double().softmax(-1), 1, generator=generator).squeeze(-1)
+        tail_lp, tail_ids = candidates.residual_distribution(residual)
+        selected = torch.multinomial(_sampling_probs(tail_lp), 1, generator=generator)
+        tokens[residual] = (selected if tail_ids is None else tail_ids.gather(-1, selected)).squeeze(-1)
     return tokens

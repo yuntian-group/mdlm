@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 import sys
+import time
 from pathlib import Path
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 import torch
@@ -13,6 +14,7 @@ from chain_crf.backbone import FrozenMDLM,SyntheticBackbone,file_sha256
 from chain_crf.counts import CountBigramHead
 from chain_crf.data import atomic_json,load_token_data,canonical_hash
 from chain_crf.generation import generate,denoising,token_statistics,clean_token_ids
+from chain_crf.profiling import summarize_trace,format_stage_report
 from scripts.train_chain_crf import make_head
 
 
@@ -183,6 +185,18 @@ def score_gpt2(records,device,model_name='gpt2-large',
             'samples':individual}
 
 
+def parse_vocab_cap(value):
+    if value.lower() == 'none':
+        return None
+    try:
+        cap = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError('vocabulary cap must be none or a positive integer') from None
+    if cap < 1:
+        raise argparse.ArgumentTypeError('vocabulary cap must be none or a positive integer')
+    return cap
+
+
 def main(argv=None):
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--output',type=Path,required=True)
@@ -194,15 +208,29 @@ def main(argv=None):
     p.add_argument('--count-mode',choices=['pmi','conditional'],default='pmi')
     p.add_argument('--strength',type=float,default=.1)
     p.add_argument('--sampling',choices=['joint','marginal'],default='joint')
-    p.add_argument('--inference',choices=['dense','segments'],default='dense')
+    p.add_argument('--inference',choices=['dense','segments','fused-pairs'],default='dense')
+    p.add_argument('--segment-batch-size', type=int, default=None,
+                   help='Maximum segments packed together (positive integer; default: all)')
     p.add_argument('--length',type=int,default=256,
                    help='Generated suffix length; continuation-file mode instead uses each reference suffix length')
     p.add_argument('--steps',type=int,default=16)
+    p.add_argument('--sampler',choices=['fixed','ddpm_cache'],default='fixed',
+                   help='fixed: existing fixed-count reveals; ddpm_cache: native clean/MASK reveals and backbone caching')
+    p.add_argument('--noise-removal',action=argparse.BooleanOptionalAction,default=None,
+                   help='Final greedy cleanup; defaults on for ddpm_cache, off for fixed. Without it, output must still contain no MASK tokens.')
+    p.add_argument('--sampling-eps',type=float,default=1e-5,
+                   help='Final DDPM time (default: 1e-5); ignored by the fixed schedule')
+    p.add_argument('--stage-timing',action='store_true',default=None,
+                   help='Add synchronized stage timing to DDPM (adds overhead). Fixed sampling already measures stages.')
     p.add_argument('--samples',type=int,default=256)
     p.add_argument('--sample-offset',type=int,default=0,
                    help='First draw ID; use disjoint IDs for screening and final evaluation')
     p.add_argument('--batch-size',type=int,default=1)
     p.add_argument('--k',type=int,default=64)
+    p.add_argument('--vocab-cap',type=parse_vocab_cap,default=None,metavar='none|C',
+                   help='Generation support: none (default) keeps the full vocabulary; a positive integer '
+                        'restricts all modes, including backbone, to the top C clean tokens per position. '
+                        'Independent of --k; CRF residuals cover allowed tokens beyond --k.')
     p.add_argument('--temperature',type=float,default=1.)
     p.add_argument('--device',default='cuda')
     p.add_argument('--prefix',default='')
@@ -220,7 +248,28 @@ def main(argv=None):
     p.add_argument('--resume',action='store_true')
     p.add_argument('--synthetic',action='store_true')
     p.add_argument('--warmup',type=int,default=1)
+    p.add_argument('--profile',action='store_true',
+                   help='Profile the first generated batch after warmup; save profile.json, profile.txt and profile-stages.json. Adds timing overhead.')
     args=p.parse_args(argv)
+    if args.segment_batch_size is not None and (args.segment_batch_size < 1 or args.inference not in ('segments', 'fused-pairs')):
+        p.error('--segment-batch-size must be positive and requires --inference segments or fused-pairs')
+    if args.inference == 'fused-pairs':
+        if args.mode not in ('count', 'global', 'contextual') or args.dev_data or args.denoise_only:
+            p.error('--inference fused-pairs supports generation with count/global/contextual heads only')
+    args.noise_removal = args.sampler == 'ddpm_cache' if args.noise_removal is None else args.noise_removal
+    args.stage_timing = args.sampler == 'fixed' if args.stage_timing is None else args.stage_timing
+    if args.sampler == 'ddpm_cache' and args.temperature != 1.:
+        raise ValueError('Native-style ddpm_cache requires --temperature 1')
+    if args.sampler == 'fixed' and args.noise_removal:
+        raise ValueError('--noise-removal requires --sampler ddpm_cache')
+    if not 0 < args.sampling_eps < 1:
+        raise ValueError('--sampling-eps must be in (0,1)')
+    if args.sampler == 'ddpm_cache' and args.denoise_only:
+        raise ValueError('--sampler ddpm_cache requires generation, not --denoise-only')
+    if args.profile and (args.score_only or args.denoise_only):
+        raise ValueError('--profile requires generation, not --score-only or --denoise-only')
+    if args.vocab_cap is not None and (args.dev_data or args.denoise_only):
+        raise ValueError('--vocab-cap is generation-only; omit --dev-data/--denoise-only for capped runs')
     if args.samples<1 or args.batch_size<1 or args.dev_examples<1:
         raise ValueError('Sample, batch and development counts must be positive')
     if args.sample_offset<0:
@@ -246,6 +295,8 @@ def main(argv=None):
     model=SyntheticBackbone(device=args.device) if args.synthetic else FrozenMDLM(
         args.backbone_checkpoint,device=args.device,cache_dir=args.cache_dir)
     head,head_info=load_head(args,model)
+    post_load_start=time.perf_counter()
+    post_load_elapsed=None
     if args.prefix and model.tokenizer is None:
         raise ValueError('Synthetic fixture does not tokenize text')
     prefix=model.tokenizer.encode(args.prefix,add_special_tokens=False) if args.prefix else []
@@ -260,10 +311,13 @@ def main(argv=None):
                    if k not in ('resume','score_gpt2','warmup')}
     source_root=Path(__file__).resolve().parents[1]
     source_files=['scripts/evaluate_chain_crf.py','scripts/train_chain_crf.py',
-                  'chain_crf/generation.py','chain_crf/core.py','chain_crf/heads.py',
-                  'chain_crf/counts.py','chain_crf/backbone.py','chain_crf/data.py','models/dit.py']
-    if args.inference == 'segments':
+                  'chain_crf/generation.py','chain_crf/core.py', 'chain_crf/cuda_forward.py','chain_crf/heads.py',
+                  'chain_crf/counts.py','chain_crf/backbone.py','chain_crf/data.py','models/dit.py',
+                  'chain_crf/profiling.py','chain_crf/cuda_sampling.py']
+    if args.inference in ('segments', 'fused-pairs'):
         source_files.append('chain_crf/segments.py')
+    if args.inference == 'fused-pairs':
+        source_files.append('chain_crf/fused_pairs.py')
     manifest={'config':configuration,'backbone':model.provenance,'head':head_info,
               'dev_data_sha256':file_sha256(args.dev_data) if args.dev_data else None,
               'source_sha256':{name:file_sha256(source_root/name) for name in source_files}}
@@ -292,7 +346,10 @@ def main(argv=None):
             raise ValueError('--denoise-only needs --dev-data')
         return
     kwargs=dict(length=args.length,steps=args.steps,k=args.k,sampling=args.sampling,
-                temperature=args.temperature,device=args.device,prefix=prefix,inference=args.inference)
+                temperature=args.temperature,device=args.device,prefix=prefix,inference=args.inference,
+                vocab_cap=args.vocab_cap,sampler=args.sampler,noise_removal=args.noise_removal,
+                sampling_eps=args.sampling_eps,stage_timing=args.stage_timing,
+                segment_batch_size=args.segment_batch_size)
     batches=(continuation_batch_plan(continuations,args.batch_size) if continuations is not None
              else [(offset,min(args.batch_size,args.samples-offset))
                    for offset in range(0,args.samples,args.batch_size)])
@@ -303,9 +360,13 @@ def main(argv=None):
             batch_kwargs={key:value for key,value in kwargs.items() if key not in ('prefix','length')}
             batch_kwargs.update(prefixes=[row['prefix_input_ids'] for row in continuations[offset:offset+size]],
                                 length=len(continuations[offset]['reference_continuation_ids']))
-        return generate(model,head,args.mode,batch_size=size,sample_offset=draw_offset,**batch_kwargs)
+        tokens,timing=generate(model,head,args.mode,batch_size=size,sample_offset=draw_offset,**batch_kwargs)
+        if tokens.eq(model.mask_id).any():
+            raise ValueError('Generation left MASK tokens; enable --noise-removal before saving/scoring samples')
+        return tokens,timing
 
     records=[json.loads(line) for line in records_path.read_text().splitlines() if line.strip()] if records_path.exists() else []
+    initial_record_count=len(records)
     if [r['sample_id'] for r in records]!=list(range(len(records))):
         raise ValueError('Incomplete or duplicated sample IDs')
     if [r['draw_id'] for r in records]!=list(range(args.sample_offset,args.sample_offset+len(records))):
@@ -315,18 +376,62 @@ def main(argv=None):
     if continuations is not None:
         validate_continuation_resume(records,continuations,batches,continuation_sha256,
                                      vocab_size=model.vocab_size,mask_id=model.mask_id)
+    # Drain loading/setup work before excluding warmup and its pending GPU work.
+    if torch.device(args.device).type == 'cuda':
+        torch.cuda.synchronize(torch.device(args.device))
+    warmup_start=time.perf_counter()
     for warmup_index in range(args.warmup):
         # Same shape/path, discarded; draw IDs lie outside the target range.
         warmup_offset=args.sample_offset+args.samples+warmup_index*args.batch_size
         warmup_size=batches[0][1] if continuations is not None else args.batch_size
         draw_batch(0,warmup_size,warmup_offset)
+    if torch.device(args.device).type == 'cuda':
+        torch.cuda.synchronize(torch.device(args.device))
+    warmup_elapsed=time.perf_counter()-warmup_start
     # Token RNG is seeded once per original batch. If interruption left only
     # some rows on disk, replay that entire batch at its original draw offset;
     # starting a new batch at len(records) would change the remaining draws.
+    profile_pending=args.profile
     for offset,size in batches:
         if offset+size<=len(records):
             continue
-        tokens,timing=draw_batch(offset,size,args.sample_offset+offset)
+        if profile_pending:
+            activities=[torch.profiler.ProfilerActivity.CPU]
+            if torch.device(args.device).type=='cuda':
+                activities.append(torch.profiler.ProfilerActivity.CUDA)
+            # Warmup/model loading are outside this scope. Keep traces bounded
+            # to one batch; use --steps 1 --samples 1 for an initial profile.
+            with torch.profiler.profile(activities=activities,record_shapes=True,
+                                        profile_memory=True) as profiler:
+                tokens,timing=draw_batch(offset,size,args.sample_offset+offset)
+            profiler.export_chrome_trace(str(args.output/'profile.json'))
+            averages=profiler.key_averages()
+            # CUDA range annotations duplicate CPU regions and include idle
+            # gaps. Keep raw kernels for PyTorch's device-time table totals.
+            averages[:]=[event for event in averages if event.device_type.name=='CPU'
+                         or not event.key.startswith(('mdlm.','crf.','generation.'))]
+            # Driver-launched kernels (e.g. Triton) are not reliably attached
+            # to the native CPU event tree. Use raw launch correlations for
+            # every stage, including parents, so no work is lost/double-added.
+            with (args.output/'profile.json').open() as trace_file:
+                summary=summarize_trace(json.load(trace_file))
+            stages=summary['stages']
+            atomic_json({'batch_offset':offset,'draw_offset':args.sample_offset+offset,
+                         'device':args.device,**summary},
+                        args.output/'profile-stages.json')
+            report=format_stage_report(summary)
+            report+='\n\nNative operator tables use PyTorch attribution, which may misassign custom kernels. Use the corrected stage table above for stage totals.\n'
+            report+='\n\nTop operators by self CPU time\n'+averages.table(sort_by='self_cpu_time_total',row_limit=30)
+            if torch.device(args.device).type=='cuda':
+                report+='\n\nTop operators by self device time\n'+averages.table(sort_by='self_device_time_total',row_limit=30)
+            (args.output/'profile.txt').write_text(report+'\n')
+            print(json.dumps({'profile':str(args.output/'profile.txt'),'stages':stages,
+                              'timing_note':'Profiled batch includes profiler overhead'}),flush=True)
+            timing['profiled']=True
+            profile_pending=False
+        else:
+            tokens,timing=draw_batch(offset,size,args.sample_offset+offset)
+            timing['profiled']=False
         batch=[]
         for index,row in enumerate(tokens.cpu().tolist()):
             local_id=offset+index
@@ -339,7 +444,7 @@ def main(argv=None):
                 record.update(continuation_identity(source,continuation_sha256))
             # Per-sample normalized times permit summation without double counting.
             for key in ('elapsed_seconds','backbone_seconds','sampling_seconds'):
-                record[key]=timing[key]/size
+                record[key]=timing[key]/size if timing[key] is not None else None
             batch.append(record)
         overlap=min(len(records)-offset,len(batch))
         for previous,replayed in zip(records[offset:offset+overlap],batch[:overlap]):
@@ -353,17 +458,40 @@ def main(argv=None):
             for row in pending:
                 f.write(json.dumps(row,allow_nan=False)+'\n')
             f.flush()
+        if offset+size == args.samples:
+            post_load_elapsed=time.perf_counter()-post_load_start-warmup_elapsed
         records.extend(pending)
         print(json.dumps({'completed':len(records),'target':args.samples,'batch':timing,
                           'replayed_existing_rows':overlap}),flush=True)
     elapsed=sum(r['elapsed_seconds'] for r in records)
     result={'samples':len(records),'elapsed_seconds':elapsed,'seconds_per_sample':elapsed/len(records),
-            'backbone_seconds':sum(r['backbone_seconds'] for r in records),
-            'sampling_seconds':sum(r['sampling_seconds'] for r in records),
+            'vocab_cap':args.vocab_cap,'k':args.k,
+            'sampler':args.sampler,'noise_removal':args.noise_removal,
+            'sampling_eps':args.sampling_eps if args.sampler=='ddpm_cache' else None,
+            'timing_mode':records[0]['timing_mode'],
+            'noise_removal_method':records[0]['noise_removal_method'],
+            'reveal_sampler':records[0]['reveal_sampler'],
+            'contains_profiled_batches':any(r.get('profiled',False) for r in records),
+            'backbone_seconds':(sum(r['backbone_seconds'] for r in records)
+                                if all(r.get('backbone_seconds') is not None for r in records) else None),
+            'sampling_seconds':(sum(r['sampling_seconds'] for r in records)
+                                if all(r.get('sampling_seconds') is not None for r in records) else None),
             'backbone_calls_per_sample':sum(r['backbone_calls'] for r in records)/len(records),
             'generated_tokens_per_second':sum(len(r['token_ids'])-r['prefix_length'] for r in records)/elapsed,
             **token_statistics([r['token_ids'][r['prefix_length']:] for r in records])}
-    atomic_json(result,args.output/'metrics.json')
+    # A resumed partial run cannot reconstruct time spent before interruption.
+    post_load_fields={
+        'post_load_elapsed_seconds':post_load_elapsed if initial_record_count == 0 else None,
+        'post_load_seconds_per_sample':post_load_elapsed/len(records) if initial_record_count == 0 else None,
+        'post_load_timing_complete':initial_record_count == 0,
+        'post_load_timing_scope':'after model loading through closing samples.jsonl; includes setup, synchronization, generation, decoding and sample I/O; excludes model loading, warmup, scoring and final summaries'}
+    metrics_path=args.output/'metrics.json'
+    if initial_record_count == len(records) and metrics_path.exists():
+        previous=json.loads(metrics_path.read_text())
+        if previous.get('post_load_timing_complete'):
+            post_load_fields={key:previous[key] for key in post_load_fields}
+    result.update(post_load_fields)
+    atomic_json(result,metrics_path)
     print(json.dumps(result,indent=2),flush=True)
     if args.score_gpt2:
         del head,model

@@ -168,12 +168,88 @@ that can use the time spent on pair scoring and DP. Prefix continuation is
 available through `--prefix`. Use a separate output directory per configuration;
 `--resume` verifies its complete manifest.
 
+Vocabulary truncation and explicit CRF states are separate generation options:
+
+| Options | Allowed tokens per masked position | Explicit CRF states and residual |
+|---|---|---|
+| `--vocab-cap none --k 64` (default) | All clean tokens | Top 64 plus the rest of the vocabulary |
+| `--vocab-cap 500 --k 64` | Top 500 by backbone unary probability | Top 64 plus a residual over the other 436 |
+| `--vocab-cap 500 --k 500` | Top 500 | 500 explicit tokens; no residual probability |
+| `--vocab-cap 1000 --k 64` | Top 1,000 | Top 64 plus a residual over the other 936 |
+| `--vocab-cap 2000 --k 64` | Top 2,000 | Top 64 plus a residual over the other 1,936 |
+
+The cap is recomputed at each generation step and masked position, before head
+potentials, excluding MASK and renormalizing the allowed unary probabilities.
+It applies to `backbone`, `count` (bigram), `global`, `contextual`, and
+`independent`. The baseline ignores `--k`, but obeys `--vocab-cap`.
+Observed/prefix tokens stay fixed even when outside the current top-C set.
+Residual expansion samples only allowed non-explicit tokens. Its pair potentials
+remain neutral: full token support is not a full-vocabulary pairwise model.
+Using a cap larger than `--k` therefore differs from a dense CRF with C explicit
+states; to make every allowed token explicit, set `--k` equal to the cap.
+
+Caps must be positive integers or `none`. Caps above the clean vocabulary size
+allow all clean tokens; K is clipped to the allowed size. The residual tensor
+slot remains for compatibility, with zero probability when no tokens remain.
+`mean_retained_mass` for structured draws measures explicit-state unary mass
+within the allowed, renormalized vocabulary, not mass retained before truncation.
+The numeric cap (JSON null for none) is recorded in manifests, sample records,
+and metrics; changing it requires a new output directory. This option is for
+generation only; capped runs reject `--dev-data`/`--denoise-only` to avoid mixing
+them with uncapped denoising diagnostics. Training, reveal scheduling, GPT-2
+scoring and the separate sparse-count evaluator are unchanged by this option.
+
+`quick_ppl_check_capped_vocab.sh` also runs a `native_mdlm` row through the original
+`main.py mode=sample_eval` -> `restore_model_and_sample` -> `Diffusion._sample`
+path. `VOCAB_CAP=none` or a positive integer controls the cap for all five rows;
+the default is 500. `vanilla` in this table remains the custom-evaluator baseline.
+The cap helper lives in `diffusion.py`; `main.py` saves native token IDs and
+generation durations for the table. There is no separate native sampler module.
+Native generation uses the existing `mdlm` conda environment (override with
+`NATIVE_ENV`) and original-reproduction HF cache in a subshell. All five rows use
+the existing raw-ID GPT-2-large scorer; `evaluate_chain_crf.py --score-only` never
+generates the native samples. The upstream retokenized PPL path is bypassed only
+when the new `eval.sample_output_dir` export option is enabled.
+
+Native `sampling.vocab_cap=null` leaves its probability calculation unchanged.
+A positive cap restricts/renormalizes clean unaries in FP32 before DDPM adds MASK
+transition mass, preserving its reveal probabilities and original categorical sampler.
+It supports non-CRF SUBS DDPM-cache sampling only. `sampling.warmup_batches` draws
+are discarded and their RNG changes restored before production sampling.
+The script retains native final noise removal, which can add a backbone call
+beyond the requested diffusion steps. Actual forward calls and timing scope are
+recorded; native timing covers the loop and final noise removal, excluding model
+loading, initial buffers, EMA copying, warmup, decoding, I/O, and scoring. Custom
+timing additionally includes its existing per-step synchronizations/diagnostics.
+All five rows exclude loading, warmup, decoding, output I/O, and PPL scoring from
+seconds/sample. The shared script settings use one discarded warmup batch and
+60 measured samples per method. The Bash elapsed totals include the whole commands
+and are separate from the generation-only seconds/sample table.
+This adds an original-sampler reference, not a controlled comparison of identical
+reveal schedules, RNG streams, precision, or final denoising. Without the opt-in
+export/cap settings, the original `main.py` evaluation behavior remains unchanged.
+
 `--inference segments` eliminates clamped positions and samples independent
 contiguous masked runs, absorbing observed boundary factors into their endpoint
 unaries. It preserves the dense model's distribution, not its seed-by-seed
 samples. Dense inference remains the default. Padded run batching can use more
 memory for mixtures of long and short runs; benchmark the intended batch and
 mask pattern rather than assuming it is always faster.
+
+Use `--inference segments --segment-batch-size 32` to pack and infer at most
+32 masked runs at a time, independently of `--batch-size` (generated sequences).
+Chunks preserve run order and pad only to their own longest run; each chunk's
+packed tensors are released before the next chunk is built in no-grad inference.
+The flag is supported by the evaluation CLIs and recorded in their manifests. Omit it for the existing all-runs batching. It applies to generation,
+not the dense held-out `--denoise-only` diagnostic or the separate sparse-count
+`--backend segments` API.
+
+Start with 32 when memory is tight or K is large; try 64 for more parallelism,
+or 16 for a smaller working set. These are starting points, not measured GPU
+optima. The cap bounds run count, not bytes: original dense edges remain live,
+long runs remain intact, and edge storage scales as `(K+1)^2`. Changing the cap
+preserves the model law but can change seeded samples; keep it fixed for replay.
+Gradient-enabled calls may retain tensors from multiple chunks for backward.
 
 Use `--sample-offset 10000` for a final draw set disjoint from an earlier screen
 at offset zero. Outputs distinguish the local `sample_id` from its RNG/reveal
@@ -430,3 +506,36 @@ and a decode/retokenize scorer measure different token sequences.
 
 The implementation contains no claimed benchmark improvements or fabricated
 results. Use separately recorded runs for any performance claims.
+
+## Experimental on-demand pair scoring on CUDA
+
+Generation supports `--inference fused-pairs --segment-batch-size 32` for
+`count`, `global`, and `contextual` heads. This optional backend computes pair
+scores inside Triton message and backward-sampling kernels instead of allocating
+an original or packed `[batch, length-1, K+1, K+1]` edge table. It retains the
+same signed log potentials, candidate/tail support, observed boundaries, reveal
+schedule and final token-marginal cleanup. It also supports marginal sampling.
+The existing `dense` and `segments` backends and their defaults are unchanged.
+
+The backend requires NVIDIA CUDA, Triton, FP32 unaries, at most 1024 states
+(including the residual), and learned rank at most 32. It is generation-only;
+training and held-out denoising losses continue to use the established backend.
+Unsupported configurations raise explicitly. Reduction order can change seeded
+draws; distributional equivalence is subject to FP32 rounding. Categorical
+perturbations are generated in FP64 with the caller's PyTorch generator.
+
+Count heads cache one shared table of observed-pair log scores. The cache is
+invalidated when count buffers or scoring settings change. Learned heads keep
+candidate embeddings and context gates, with no probability-space low-rank
+approximation. The forward recurrence still does quadratic pairwise work and
+advances sequentially through each masked run. Lower memory use therefore does
+not by itself guarantee a speedup, especially at small K. Exclude first-use
+Triton compilation and count-table setup when measuring steady-state speed, and
+report those setup costs separately when relevant.
+
+`tests/test_chain_fused_pairs.py` compares forward messages, marginals and
+fixed-noise joint draws with the dense reference, checks a tiny enumerated joint
+law, and exercises clamps, residuals, count-cache invalidation and generation.
+`scripts/benchmark_fused_pairs.py` runs prewarmed, alternating A/B generation
+measurements using the existing WatGPU checkpoints. It records memory, runtime,
+source hashes, same-backend replay, and real-backbone marginal comparisons.
