@@ -12,6 +12,9 @@ The [finite-step generation API](GENERATION.md) connects the frozen backbone
 to baseline, joint-chain, and own-marginal proposals. It returns raw accepted
 and rejected attempts in the evaluator's format; checkpoint imports and a
 durable command-line runner are separate from this API.
+The [local-assets generation command](CLI.md) supplies strict count/head
+imports and executable baseline/count/global/contextual wiring. It saves a
+finite run, but does not provide durable resume or claim CUDA reproduction.
 
 For a fixed partially masked input `c`, the score is
 
