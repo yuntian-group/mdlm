@@ -8,6 +8,10 @@ log probabilities and masked-input features used by the experiment pipeline.
 The [saved-generation evaluator](EVALUATION.md) reports external-model PPL,
 rejection-aware generation time, and raw-token diagnostics without regenerating
 or filtering the saved outputs.
+The [finite-step generation API](GENERATION.md) connects the frozen backbone
+to baseline, joint-chain, and own-marginal proposals. It returns raw accepted
+and rejected attempts in the evaluator's format; checkpoint imports and a
+durable command-line runner are separate from this API.
 
 For a fixed partially masked input `c`, the score is
 
