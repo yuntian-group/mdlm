@@ -78,6 +78,26 @@ between two selected sites.
   then makes independent FP32 multinomial draws only at selected positions.
   Support, unary scores, coefficients, hidden inputs and context are unchanged.
 
+The optional `independent_control=IndependentControl(...)` argument to
+`ChainDecoder` supplies a different control: independent categorical draws
+after frequency correction and/or post-support temperature, with no pair
+model. Import it from `additive_chain.sampling_controls`. Supply
+`frequency_strength=alpha` and an FP64 `log_marginal` from
+`count_controls.smoothed_unigram_log_probs(right_counts, smoothing=...)`,
+or `temperature=tau`. Put the marginal on the decoder device before constructing
+the control; it is validated and copied once outside the timed loop.
+The saved control identity includes the copied vector's SHA256, dtype and
+shape, so programmatic inputs remain distinguishable even without a count file.
+
+Candidate extraction receives the original diffusion scores. The independent
+control then applies `softmax((u + alpha*1[i>0]*log J_R)/tau)` on those candidates,
+preserving all padding and using the original absolute sequence positions for
+the incoming-edge mask. Zero frequency and unit temperature delegate to the
+unchanged FP64 baseline categorical path. Both individual controls and their
+explicit composition have unit tests; the combined law has not been measured
+in the reported experiments. Nonzero pair strengths and an active independent
+control are rejected explicitly. See [CLI.md](CLI.md) for commands.
+
 `prune_irrelevant=True` uses visible separators to omit masked spans containing
 no selected site. It changes only inference preparation: the model still sees
 the original masked window, and the final update preserves all unselected

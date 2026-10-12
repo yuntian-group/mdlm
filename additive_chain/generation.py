@@ -96,7 +96,7 @@ class ChainDecoder:
                  contextual_strength=0., sampling="joint", backend="fused",
                  top_k=500, nucleus_p=.9, fast_candidates=False,
                  prune_irrelevant=True, segment_batch_size=32,
-                 strict_unary_validation=False):
+                 strict_unary_validation=False, independent_control=None):
         _require(type(mask_id) is int and mask_id > 0, "Mask must be the last vocabulary ID")
         _require(sampling in ("joint", "own-marginal"), "Unknown sampling selector")
         _require(backend in ("fused", "static"), "Choose fused or explicit static backend")
@@ -121,6 +121,14 @@ class ChainDecoder:
         self.segment_batch_size = segment_batch_size
         self.strict_unary_validation = strict_unary_validation
         self.active = bool(self.count_strength or self.global_strength or self.contextual_strength)
+        if independent_control is not None:
+            from .sampling_controls import IndependentControl
+            _require(isinstance(independent_control, IndependentControl),
+                     "Expected an IndependentControl or None")
+            independent_control.validate_for(vocab_size=mask_id + 1, device=self.device)
+            _require(not (self.active and independent_control.active),
+                     "Independent controls require zero pair strengths; they do not modify a chain")
+        self.independent_control = independent_control
         for coefficient, head in ((self.global_strength, global_head),
                                   (self.contextual_strength, contextual_head)):
             if coefficient:
@@ -214,7 +222,9 @@ class ChainDecoder:
         if not self.active:
             # Match the baseline's selected-row-only FP64 categorical draws.
             c = self._candidates(log_probs[selected][None], tokens[selected][None])
-            slots = torch.multinomial(c.log_unary[0].exp(), 1, generator=generator)
+            probability = c.log_unary[0].exp() if self.independent_control is None \
+                or not self.independent_control.active else self.independent_control.probabilities(c, selected)
+            slots = torch.multinomial(probability, 1, generator=generator)
             result = tokens.clone()
             result[selected] = c.candidate_ids[0].gather(-1, slots).squeeze(-1)
         else:
@@ -376,5 +386,7 @@ def generate_saved(forward, decoder, tokenizer, *, samples, stream_namespace,
             "top_p": decoder.nucleus_p, "prune_irrelevant": decoder.prune_irrelevant,
             "fast_candidates": decoder.fast_candidates, "segment_batch_size": decoder.segment_batch_size,
             "strict_unary_validation": decoder.strict_unary_validation,
+            "independent_control": None if decoder.independent_control is None
+                else decoder.independent_control.identity(),
             "device": str(decoder.device), "torch_version": str(torch.__version__),
             "max_consecutive_rejections": None if population == "raw" else 10}}

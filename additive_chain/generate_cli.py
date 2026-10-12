@@ -13,6 +13,8 @@ import torch
 from . import assets
 from .backbone import load_bd3lm, file_sha256
 from .generation import ChainDecoder, generate_saved
+from .count_controls import smoothed_unigram_log_probs
+from .sampling_controls import IndependentControl
 
 
 def parser():
@@ -34,6 +36,10 @@ def parser():
     p.add_argument('--count-strength', type=float, default=0.)
     p.add_argument('--count-mode', choices=('conditional', 'pmi'), default='conditional')
     p.add_argument('--smoothing', type=float, default=.1)
+    p.add_argument('--frequency-strength', type=float, default=0.,
+                   help='Independent destination-marginal correction after original support selection')
+    p.add_argument('--temperature', type=float, default=1.,
+                   help='Independent temperature after original support selection (not before top-p)')
     for name in ('global', 'contextual'):
         p.add_argument('--' + name + '-head', type=Path)
         p.add_argument('--' + name + '-sha256')
@@ -67,6 +73,13 @@ def validate_options(a):
         assets.require(not strength or path is not None, 'Positive ' + name + ' strength requires an asset')
     assets.require(not a.contextual_strength or a.global_head is not None,
         'Contextual inference needs the exact inherited global asset, even if its coefficient is zero')
+    assets.number(a.frequency_strength, 'frequency strength')
+    assets.number(a.temperature, 'temperature', positive=True)
+    assets.require(not a.frequency_strength or a.count_file is not None,
+                   'Positive frequency strength requires count-file and SHA256')
+    independent_active = bool(a.frequency_strength or a.temperature != 1.)
+    assets.require(not independent_active or not any((a.count_strength, a.global_strength, a.contextual_strength)),
+                   'Independent controls require zero pair strengths; do not combine them with a chain')
     for key in ('table_gib', 'scratch_mib', 'reserve_gib'):
         assets.number(getattr(a, key), key, positive=key != 'reserve_gib')
     a.output = a.output.resolve()
@@ -102,6 +115,12 @@ def run(a):
         count_strength=a.count_strength, global_strength=a.global_strength,
         contextual_strength=a.contextual_strength, count_mode=a.count_mode, smoothing=a.smoothing,
         cap=a.top_k, top_p=a.top_p, steps=a.steps, allow_recalibration=a.allow_recalibration)
+    control = None
+    if a.frequency_strength or a.temperature != 1.:
+        log_marginal = None if not a.frequency_strength else smoothed_unigram_log_probs(
+            count.statistics['right_counts'].to(a.device), smoothing=a.smoothing)
+        control = IndependentControl(frequency_strength=a.frequency_strength,
+            log_marginal=log_marginal, temperature=a.temperature)
     if a.contextual_strength:
         local = heads['contextual'].head
         embedding = frozen.model.backbone.backbone.vocab_embed.embedding.detach()
@@ -117,7 +136,7 @@ def run(a):
         contextual_strength=a.contextual_strength, sampling=a.sampling, backend=a.backend,
         top_k=a.top_k, nucleus_p=a.top_p, fast_candidates=a.fast_candidates,
         prune_irrelevant=not a.no_prune_irrelevant, segment_batch_size=a.segment_batch_size,
-        strict_unary_validation=a.strict_unary_validation)
+        strict_unary_validation=a.strict_unary_validation, independent_control=control)
     try:
         budget = {} if a.backend == 'fused' else dict(
             max_table_bytes=int(a.table_gib * 1024**3),

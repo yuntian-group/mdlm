@@ -229,7 +229,10 @@ def test_documented_toy_step_runs_without_assets_or_private_imports():
     import re
     from pathlib import Path
     text = (Path(__file__).resolve().parents[1] / 'additive_chain/ADAPTATION.md').read_text()
-    code, = re.findall(r'```python\n(.*?)```', text, re.DOTALL)
+    # Other sections contain API fragments that take caller-supplied inputs.
+    # This test executes the explicitly self-contained runnable toy section.
+    toy = text.split('## Runnable toy example\n', 1)[1].split('\n## ', 1)[0]
+    code, = re.findall(r'```python\n(.*?)```', toy, re.DOTALL)
     namespace = {}
     exec(compile(code, 'ADAPTATION.md', 'exec'), namespace)
     assert namespace['result'].loss is not None

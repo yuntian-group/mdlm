@@ -30,6 +30,40 @@ For multiple rows the numerator is summed and divided by the total number of
 selected tokens, not averaged by row. This is a **candidate-set training/dev
 surrogate, not held-out data perplexity**. Generation never adds gold tokens.
 
+## Optional unchanged-support objective
+
+`supported_training.prepare_supported_targets` and `supported_block_loss`
+provide an alternative, explicit partial-target objective. They do **not**
+change `adaptation_step` or `train_cli`; the default remains the gold-augmented
+objective above. On the original candidate sets `C`, let
+`I = {i in R: gold_i is already in C_i}`. The alternative loss is
+`-log q_C(gold_I) / |R|`: keep the original requested-target denominator, clamp
+only `I`, and marginalize every other masked position, including missing
+targets in `R`. No gold candidate is inserted, removed, or reordered. The
+returned `per_supported_target_nll` uses `|I|` instead for diagnostics, not as
+an implicit replacement training weight.
+
+Callers build pair scores on `targets.support` and own the optimizer:
+
+```python
+from additive_chain.supported_training import prepare_supported_targets, supported_block_loss
+
+targets = prepare_supported_targets(candidates, gold_tokens=clean,
+    reveal_mask=reveal, visible_mask=visible)
+value = supported_block_loss(targets, pair_scores)
+optimizer.zero_grad(set_to_none=True)
+if value['should_update']:
+    value['per_original_selected_token_nll'].backward()
+    optimizer.step()
+```
+
+When `I` is empty, **skip `optimizer.step()` entirely**. A zero-valued loss does
+not prevent Adam momentum or weight decay from changing parameters. In a batch
+with some supported targets, the denominator still includes all requested
+targets, and one update uses the pooled objective. This API neither supplies
+supervision for unavailable targets nor estimates full-data PPL. Its existence
+and correctness tests do not establish improved generation quality or speed.
+
 ## Count and learned scores
 
 Construct `SparseCountPotential.from_counts(..., strength=count_strength)` once

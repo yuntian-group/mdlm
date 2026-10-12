@@ -61,6 +61,42 @@ Count strength is applied once: the stored count file's `strength` is never
 multiplied into the CLI strength. The stored settings and requested settings
 are both recorded.
 
+### Independent frequency and temperature controls
+
+Use the baseline command with `--population raw` for a fixed-size comparison.
+These options leave the original top-p/cap support unchanged:
+
+```bash
+# Frequency only: no count-pair inference, despite reading the count asset.
+--count-file /path/to/counts.pt --count-sha256 YOUR_COUNTS_SHA256 \
+--frequency-strength .1 --smoothing .1 --count-strength 0
+
+# Temperature only: no count asset required.
+--temperature .95
+```
+
+The frequency term is `alpha * log J_R(v)` at original positions `i>0`,
+where `J_R` is the actual destination marginal of the smoothed count joint in
+`count_controls.py`. It is not merely the add-one backoff distribution and
+does not exempt the first *selected* position. Temperature divides the retained
+unaries only **after** the original nucleus and cap have been selected; it is
+not a temperature applied before top-p. Neither control loads a learned head,
+builds a pair table, or runs dynamic programming.
+
+If both options are requested, their explicit composition is
+`q_i(v) proportional to exp((u_i(v) + alpha*1[i>0]*log J_R(v))/temperature)`.
+The reported experiments used frequency or temperature separately; the combined
+law is supported by the API but has not been measured in those experiments.
+Active independent controls cannot be combined with nonzero count/global/
+contextual pair strengths; such a request fails rather than dropping an input.
+Identity settings `--frequency-strength 0 --temperature 1` follow the exact
+baseline sampling path. Control settings and order are saved with the output.
+
+These commands demonstrate the interface, not a new validation selection or
+an assertion that the public port reproduces historical GPU timings. Compare
+the complete saved raw population, including failed entropy checks, and verify
+trajectory/runtime parity on the intended checkpoint and GPU before claiming it.
+
 Use `--sampling own-marginal` to draw selected positions independently from
 the **same chain's** singleton marginals. It does not remove pair scores or
 retune the model. `--backend static` explicitly requests a fixed count/global

@@ -55,6 +55,9 @@ def test_composed_cli_real_baseline_core_serialization_and_no_overwrite(tmp_path
     ('--count-file', 'counts.pt'), ('--global-sha256', 'a' * 64),
     ('--steps', '0'), ('--top-p', 'nan'), ('--count-strength', 'nan'),
     ('--top-k', '0'), ('--stream-namespace', ' '), ('--device', 'mps'),
+    ('--frequency-strength', '.1'), ('--frequency-strength', '-1'),
+    ('--temperature', '0'), ('--temperature', 'nan'),
+    ('--temperature', '.9', '--count-strength', '.1', '--count-file', 'counts.pt', '--count-sha256', 'a'*64),
 ])
 def test_invalid_requests_fail_before_backbone(tmp_path, monkeypatch, extra):
     monkeypatch.setattr(cli, 'load_bd3lm', lambda *a, **k: (_ for _ in ()).throw(AssertionError('must not load')))
@@ -131,3 +134,32 @@ def test_invalid_programmatic_population_rejected_before_loading(tmp_path, monke
     a = arguments(tmp_path)
     a.population = 'unknown'
     with pytest.raises(ValueError, match='population'): cli.run(a)
+
+
+@pytest.mark.parametrize('alpha,tau', [(0., .95), (.1, 1.), (.1, .95)])
+def test_independent_control_cli_uses_endpoint_marginal_and_no_pair_setup(tmp_path, monkeypatch, alpha, tau):
+    from additive_chain.count_controls import smoothed_unigram_log_probs
+    frozen = fake_backbone()
+    monkeypatch.setattr(cli, 'load_bd3lm', lambda *a, **k: frozen)
+    counts = torch.arange(66, dtype=torch.float64)
+    count = NS(statistics={'right_counts': counts}, identity={'count_fixture': True})
+    monkeypatch.setattr(cli.assets, 'load_count_asset', lambda *a, **k: count)
+    extra = ['--population', 'raw', '--no-warmup', '--temperature', str(tau), '--frequency-strength', str(alpha)]
+    if alpha:
+        extra += ['--count-file', 'counts.pt', '--count-sha256', 'a'*64]
+    seen = {}
+    original = cli.ChainDecoder
+    def decoder(**kwargs):
+        seen.update(kwargs)
+        return original(**kwargs)
+    monkeypatch.setattr(cli, 'ChainDecoder', decoder)
+    value = cli.run(arguments(tmp_path, *extra))
+    control = seen['independent_control']
+    assert control.frequency_strength == alpha and control.temperature == tau
+    assert not seen['count_strength'] and not seen['global_strength'] and not seen['contextual_strength']
+    if alpha:
+        torch.testing.assert_close(control._log_marginal, smoothed_unigram_log_probs(counts), rtol=0, atol=0)
+    assert len(value['attempts']) == 2 and value['setup']['static_table_prepared'] is False
+    protocol = value['generation_protocol']['independent_control']
+    assert protocol['frequency_strength'] == alpha and protocol['temperature'] == tau
+    assert protocol['pair_inference'] is False and protocol['combined_control_measured'] is False
