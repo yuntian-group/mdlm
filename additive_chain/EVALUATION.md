@@ -32,14 +32,17 @@ per-sample records and FP64 pooled summation.
 The output reports both:
 
 - `pooled_token_ppl = exp(sum(token NLL) / sum(scored target counts))`.
-  FP32 token losses are summed in FP64, then pooled across accepted samples.
+  FP32 token losses are summed in FP64, then pooled across the declared sample
+  population (accepted by default; every raw attempt in raw mode).
 - `legacy_mean_sequence_ppl`: arithmetic mean of per-sequence perplexities.
   Each sequence PPL uses the upstream FP32 reduction/exponentiation. This is
   generally different from pooled PPL, even at the same generated length,
   because retokenization and EOS masking can change the scored target counts.
 
-All-EOS samples have no scored targets and cause an explicit error rather than
-a misleading PPL. The API accepts an already loaded evaluator; the CLI uses
+All-EOS samples have no scored targets. The default accepted-population path
+raises an explicit error; raw-population evaluation records their undefined
+scores without replacing or omitting those attempts (see below).
+The API accepts an already loaded evaluator; the CLI uses
 FP32 weights and logits. Changing precision, evaluator/tokenizer revision,
 decoding, EOS handling, context, or sample population changes the evaluation.
 CPU metric tests alone do not establish real-checkpoint numerical equivalence
@@ -78,6 +81,32 @@ inferring a length. Optional `text` is checked against retained-special-token
 decoding. An incomplete accepted population is reported as `partial`, not as a
 finished evaluation. Zero accepted samples yield no quality score.
 
+### Fixed raw populations
+
+For a fixed-size, unfiltered comparison, generate with `population="raw"` or
+the generation CLI's `--population raw`. Its schema is
+`additive_chain_saved_raw_generations_v1`; `samples_requested` means raw
+attempts, not accepted outputs. The scorer then evaluates **every** attempt,
+including those whose saved `accepted` flag is false. The flag remains a
+diagnostic: scoring does not repeat generation or fill rejected slots. A null
+`text` for a rejected attempt is reconstructed from its saved IDs, retaining EOS.
+
+The result uses `additive_chain_raw_generation_metrics_v1`. `quality` describes
+all raw attempts, and `quality_subsets.accepted` / `.rejected` describe the two
+subsets of that same population. All three report `samples`, `defined` and
+`undefined`. A sequence with no non-EOS next-token targets keeps its attempt
+ID, status `undefined`, zero scored targets and null sequence PPL. If any member
+is undefined, that population's PPL fields are null; any calculable score is
+explicitly labeled `defined_subset`, never silently called the full score.
+An empty subset also has null PPL. `quality_population="complete"` means all
+requested attempts are present, not that every score is defined.
+
+Raw populations cannot exceed their declared size. A shorter saved prefix is
+reported as partial. Do not change an accepted-run schema to raw while leaving
+its requested accepted count unchanged: explicitly choose the raw prefix and
+declare its size when converting historical results. Acceptance, source IDs
+and elapsed work must remain traceable.
+
 ## Timing and diagnostics
 
 `generation_seconds` must measure the complete attempt, synchronized before
@@ -107,7 +136,7 @@ Diagnostics use raw generator token IDs, before decoding or scoring:
   tokens), counting overlapping 4grams;
 - EOS count and per-attempt last-256-token empirical entropy.
 
-Accepted-sample means and rejected/attempted counts are separate. The original
+Raw, accepted and rejected diagnostic means are separate. The original
 fixed-length sampler rejected a last-256 entropy below four nats; evaluation
 reports the FP32 statistic but **does not reapply the filter**. Predictive model
 entropy is a different quantity. These diagnostics help detect repetition;
@@ -151,3 +180,6 @@ These tests run on CPU with a deterministic mock evaluator and tokenizer.
 They compare the original sliding-window arithmetic, EOS/context and padding
 behavior, aggregation, rejection-aware timing, and CLI load flags. They do not
 download checkpoints, run real GPT-2 Large, or claim GPU scoring results.
+Raw-mode tests also check fixed population sizes, scoring of rejected attempts,
+explicit undefined rows, accepted/rejected subsets and unchanged arithmetic
+for samples with defined scores.

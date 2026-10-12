@@ -148,11 +148,21 @@ a time, and do not treat closing/rebuilding it as free inference work.
 ## Rejections, timing, and output
 
 Each complete attempt computes the native FP32 empirical entropy of its last
-256 token IDs on the generation device. Entropy below four nats rejects that
-attempt. Ten consecutive rejections for one accepted-sample slot stop the run
+256 token IDs on the generation device. Entropy below four nats marks that
+attempt as rejected. By default (`population="accepted"`), ten consecutive
+rejections for one accepted-sample slot stop the run
 with `status="retry_limit"`; successful acceptance resets that counter. There
 is no forced cleanup, acceptance override, or retry-counter reset to hide a
 failure. Every rejected token sequence remains in the output.
+
+With `population="raw"`, `samples` instead fixes the total number of raw
+attempts. Every attempt remains, no rejected slot is replaced, and there is no
+consecutive-rejection limit. The same sampler, acceptance diagnostic, attempt
+IDs and explicit random streams are used. Only the stopping rule changes.
+The output schema becomes `additive_chain_saved_raw_generations_v1`; its
+evaluator scores every raw attempt and reports accepted/rejected subsets,
+including explicit undefined scores for sequences without non-EOS targets.
+This prevents an acceptance rule from hiding failures in the quality result.
 
 Accepted text uses `skip_special_tokens=False`. As in the experiment sampler,
 rejected attempts retain raw IDs but are not decoded inside the timed attempt.
@@ -179,10 +189,10 @@ does not estimate unrecorded work after an interrupted process. Compare methods
 within one declared implementation/runtime, and measure this entrypoint anew;
 do not splice its durations into previously reported experiment timings.
 
-This is a minimal **Python API**, not a complete command-line reproduction
-pipeline. Checkpoint/count-file import schemas, on-disk durable attempt commits,
-resume after interruption, selection/provenance receipts, and a generation CLI
-are not included. Callers must load the existing local assets, verify their
+This is a minimal **Python API**. The separate [CLI](CLI.md) supplies authenticated
+asset loading and output serialization. Neither entrypoint includes on-disk
+durable attempt commits, resume after interruption, or automatic experimental
+selection. Direct API callers load existing local assets, verify their
 identities, and save output themselves. Exceptions propagate; the API does not
 fabricate a finished record after an interrupted attempt. No downloads or
 checkpoint writes occur in this module.

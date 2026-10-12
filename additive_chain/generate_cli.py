@@ -22,6 +22,8 @@ def parser():
     p.add_argument('--tokenizer', required=True, type=Path)
     p.add_argument('--output', required=True, type=Path)
     p.add_argument('--samples', required=True, type=int)
+    p.add_argument('--population', choices=('accepted', 'raw'), default='accepted',
+                   help='Stop at this many accepted outputs, or exactly this many raw attempts')
     p.add_argument('--stream-namespace', required=True)
     p.add_argument('--steps', type=int, default=32)
     p.add_argument('--top-k', type=int, default=500)
@@ -51,6 +53,7 @@ def parser():
 
 
 def validate_options(a):
+    assets.require(a.population in ('accepted', 'raw'), 'Unknown generation population')
     assets.require(a.samples > 0 and a.steps > 0 and 1 <= a.top_k <= 2048
         and 0 < a.top_p <= 1 and 0 < a.smoothing <= 1 and a.segment_batch_size > 0,
         'Invalid samples, schedule, support or smoothing')
@@ -122,7 +125,8 @@ def run(a):
         setup = decoder.prepare(**budget)
         result = generate_saved(frozen.forward, decoder, frozen.model.tokenizer,
             samples=a.samples, steps=a.steps, length=1024,
-            stream_namespace=a.stream_namespace, warmup=not a.no_warmup)
+            stream_namespace=a.stream_namespace, warmup=not a.no_warmup,
+            population=a.population)
     finally:
         decoder.close()
     assets.require(source_identity() == sources, 'Scientific source changed during execution')

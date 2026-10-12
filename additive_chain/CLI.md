@@ -26,6 +26,13 @@ python -m additive_chain.generate_cli \
   --stream-namespace my-development-stream --fast-candidates
 ```
 
+The default `--population accepted` requests 64 accepted outputs, retaining
+their rejected attempts too. Add `--population raw` to request exactly 64 raw
+outputs instead: no rejection replacement and no ten-rejection stopping limit.
+This does not change individual trajectories or their acceptance flags. The
+saved schema tells the evaluator to score all raw attempts, with separate
+accepted/rejected diagnostics and explicit undefined scores when necessary.
+
 Add these arguments for a count chain, using the actual SHA256 of your file:
 
 ```bash
@@ -155,8 +162,10 @@ Model loading, asset validation, count/head construction and fixed-table setup
 are outside attempt timing. Warmup is enabled by default and reported
 separately; `--no-warmup` disables it explicitly. Every rejected attempt's
 generation time remains in the output. An output file must not already exist.
-Ten consecutive rejections save `status="retry_limit"` and produce exit code2;
-successful completion returns0. No failed configuration is relabeled complete.
+In accepted mode, ten consecutive rejections save `status="retry_limit"` and
+produce exit code2. In raw mode, completion means the requested number of raw
+attempts has been saved, regardless of acceptance. Successful completion
+returns0. No interrupted configuration is relabeled complete.
 
 This first command has no durable per-attempt ledger or resume mechanism.
 An exception or killed process before serialization does **not** save its

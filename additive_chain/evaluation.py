@@ -97,7 +97,7 @@ def scoring_windows(length, context_size=1024, stride=512):
 
 @torch.no_grad()
 def score_token_batch(model, input_ids, attention_mask, *, eos_token_id,
-                      context_size=1024, stride=512):
+                      context_size=1024, stride=512, undefined="error"):
     """Score right-padded retokenized samples, one sequence per model call.
 
     Matches the GPT-2 branch of the pinned upstream scorer: FP32 logits/CE,
@@ -105,8 +105,11 @@ def score_token_batch(model, input_ids, attention_mask, *, eos_token_id,
     Padding must use EOS IDs, as in the original scorer. All samples share the
     tokenizer's padded length. ``model`` must already be in eval mode/device.
     """
+    _require(undefined in ("error", "record"), "Unknown undefined-score policy")
+    _require(type(context_size) is int and type(stride) is int
+             and 1 <= stride < context_size, "Require 1 <= stride < context_size")
     _require(input_ids.ndim == 2 and input_ids.shape == attention_mask.shape
-             and input_ids.shape[0] > 0 and input_ids.shape[1] >= 2,
+             and input_ids.shape[0] > 0 and input_ids.shape[1] >= (1 if undefined == "record" else 2),
              "Expected nonempty [samples, length] IDs and matching attention mask")
     _require(input_ids.dtype == torch.long and not model.training,
              "Integer IDs and an eval-mode model are required")
@@ -120,6 +123,13 @@ def score_token_batch(model, input_ids, attention_mask, *, eos_token_id,
     for index in range(input_ids.shape[0]):
         ids = input_ids[index:index + 1]
         mask = attention_mask[index:index + 1]
+        if not bool(ids[:, 1:].ne(eos_token_id).any()):
+            _require(undefined == "record", "Sample has no non-EOS next-token targets")
+            rows.append({"sample_id": index, "status": "undefined",
+                "reason": "no_non_EOS_targets", "scored_tokens": 0,
+                "total_nll_float64_sum": 0., "legacy_sequence_ppl": None,
+                "scored_target_mask": [False] * ids.shape[1]})
+            continue
         nll = torch.zeros_like(ids, dtype=torch.float32)
         valid = torch.zeros_like(ids, dtype=torch.bool)
         for start, end, first in scoring_windows(ids.shape[1], context_size, stride):
@@ -148,6 +158,8 @@ def score_token_batch(model, input_ids, attention_mask, *, eos_token_id,
             "legacy_sequence_ppl": legacy_ppl,
             "scored_target_mask": valid[0].cpu().tolist(),
         })
+        if undefined == "record":
+            rows[-1]["status"] = "defined"
     return rows
 
 
@@ -168,8 +180,32 @@ def aggregate_scores(rows):
                 row["legacy_sequence_ppl"] for row in rows)}
 
 
+def aggregate_population_scores(rows):
+    """Keep undefined members visible; never relabel their omission as a full score."""
+    defined, undefined = [], []
+    for row in rows:
+        if row.get("status") == "undefined":
+            _require(row.get("reason") == "no_non_EOS_targets"
+                and type(row["scored_tokens"]) is int and row["scored_tokens"] == 0
+                and _nonnegative(row["total_nll_float64_sum"], "undefined NLL") == 0
+                and row["legacy_sequence_ppl"] is None, "Invalid undefined score record")
+            undefined.append(row)
+        else:
+            _require(row.get("status") == "defined", "Explicit score status required")
+            defined.append(row)
+    subset = aggregate_scores(defined) if defined else None
+    return {"samples": len(rows), "defined": len(defined), "undefined": len(undefined),
+        "total_nll_float64_sum": 0. if subset is None else subset["total_nll_float64_sum"],
+        "scored_tokens": 0 if subset is None else subset["scored_tokens"],
+        "pooled_token_ppl": subset["pooled_token_ppl"] if subset is not None and not undefined else None,
+        "legacy_mean_sequence_ppl": subset["legacy_mean_sequence_ppl"]
+            if subset is not None and not undefined else None,
+        "defined_subset": subset}
+
+
 def summarize_attempts(attempts, *, eos_token_id, samples_requested,
-                       timing_complete, setup_seconds=None, warmup_seconds=None):
+                       timing_complete, setup_seconds=None, warmup_seconds=None,
+                       population="accepted"):
     """Summarize saved single-sequence attempts; never drop rejected work.
 
     ``generation_seconds`` includes complete generation, preparation, inference,
@@ -180,6 +216,7 @@ def summarize_attempts(attempts, *, eos_token_id, samples_requested,
     _require(type(samples_requested) is int and samples_requested > 0,
              "samples_requested must be positive")
     _require(type(timing_complete) is bool, "timing_complete must be explicit")
+    _require(population in ("accepted", "raw"), "Unknown generation population")
     _require([r.get("attempt_id") for r in attempts] == list(range(len(attempts))),
              "Preserve contiguous raw attempt IDs, including rejections")
     accepted, durations, diagnostic_rows = [], [], []
@@ -198,6 +235,8 @@ def summarize_attempts(attempts, *, eos_token_id, samples_requested,
         else:
             _require(type(new) is int and 0 <= new <= len(values), "Invalid new_tokens")
     _require(len(accepted) <= samples_requested, "More accepted samples than declared")
+    _require(population != "raw" or len(attempts) <= samples_requested,
+             "Raw population exceeds its declared fixed size")
     measured = timing_complete and bool(attempts) and all(d is not None for d in durations)
     seconds = math.fsum(d for d in durations if d is not None)
     if measured:
@@ -205,13 +244,15 @@ def summarize_attempts(attempts, *, eos_token_id, samples_requested,
     setup = None if setup_seconds is None else _nonnegative(setup_seconds, "setup_seconds")
     warmup = None if warmup_seconds is None else _nonnegative(warmup_seconds, "warmup_seconds")
     count = len(accepted)
-    means = {key: statistics.fmean(diagnostic_rows[i][key] for i in accepted)
-             if count else None for key in (
+    def means(indices):
+        return {key: statistics.fmean(diagnostic_rows[i][key] for i in indices)
+             if indices else None for key in (
                  "token_entropy_nats", "unique_token_fraction", "repeated_4gram_fraction",
                  "eos_tokens_including_initial_context")}
     return {"attempts": len(attempts), "accepted": count,
             "rejected": len(attempts) - count, "samples_requested": samples_requested,
-            "population_complete": count == samples_requested,
+            "population": population,
+            "population_complete": (len(attempts) if population == "raw" else count) == samples_requested,
             "rejection_rate": (len(attempts) - count) / len(attempts) if attempts else None,
             "timing_complete": measured, "generation_seconds_recorded": seconds,
             "seconds_per_accepted_sequence": seconds / count if measured and count else None,
@@ -223,7 +264,9 @@ def summarize_attempts(attempts, *, eos_token_id, samples_requested,
             "setup_seconds": setup, "warmup_seconds": warmup,
             "setup_warmup_amortized_seconds_per_accepted_sequence": (seconds + setup + warmup) / count
                 if measured and count and setup is not None and warmup is not None else None,
-            "accepted_diagnostics_mean": means,
+            "accepted_diagnostics_mean": means(accepted),
+            "raw_diagnostics_mean": means(list(range(len(attempts)))),
+            "rejected_diagnostics_mean": means([i for i, r in enumerate(attempts) if not r["accepted"]]),
             "last256_entropy_nats_all_attempts": [last256_entropy(r["token_ids"]) for r in attempts]}
 
 
@@ -231,20 +274,27 @@ def evaluate_saved(data, generator_tokenizer, scorer_tokenizer, scorer, *, devic
                    max_length=1024):
     """Evaluate a portable saved-attempt dictionary with caller-loaded models.
 
-    Decode generator IDs with special tokens retained, then retokenize accepted
-    strings for the external scorer. No new samples or rejection decisions.
+    Decode generator IDs with special tokens retained, then retokenize the
+    declared population. Raw-schema inputs score all saved attempts, including
+    rejections, and retain undefined rows. No new samples or rejection decisions.
     """
-    _require(data.get("schema") == "additive_chain_saved_generations_v1", "Unknown saved-sample schema")
+    schemas = {"additive_chain_saved_generations_v1": "accepted",
+               "additive_chain_saved_raw_generations_v1": "raw"}
+    _require(data.get("schema") in schemas, "Unknown saved-sample schema")
+    population = schemas[data["schema"]]
+    _require(data.get("population", population) == population,
+             "Saved schema and population disagree")
     _require(data["eos_token_id"] == generator_tokenizer.eos_token_id,
              "Saved token IDs and generator tokenizer EOS differ")
     _require(type(max_length) is int and max_length >= 2, "Invalid scoring maximum length")
     summary = summarize_attempts(data["attempts"], eos_token_id=data["eos_token_id"],
         samples_requested=data["samples_requested"], timing_complete=data["generation_timing_complete"],
-        setup_seconds=data.get("setup_seconds"), warmup_seconds=data.get("warmup_seconds"))
-    accepted = [r for r in data["attempts"] if r["accepted"]]
-    texts = [decode_retaining_eos(generator_tokenizer, r["token_ids"]) for r in accepted]
-    for row, text in zip(accepted, texts):
-        _require("text" not in row or row["text"] == text,
+        setup_seconds=data.get("setup_seconds"), warmup_seconds=data.get("warmup_seconds"),
+        population=population)
+    chosen = [r for r in data["attempts"] if population == "raw" or r["accepted"]]
+    texts = [decode_retaining_eos(generator_tokenizer, r["token_ids"]) for r in chosen]
+    for row, text in zip(chosen, texts):
+        _require("text" not in row or row["text"] == text or (not row["accepted"] and row["text"] is None),
                  "Saved text differs from retained-special-token decoding")
     rows = []
     if texts:
@@ -256,11 +306,17 @@ def evaluate_saved(data, generator_tokenizer, scorer_tokenizer, scorer, *, devic
         batch = scorer_tokenizer(texts, return_tensors="pt", return_token_type_ids=False,
             return_attention_mask=True, truncation=True, padding=True, max_length=max_length)
         rows = score_token_batch(scorer, batch["input_ids"].to(device),
-            batch["attention_mask"].to(device), eos_token_id=scorer_tokenizer.eos_token_id)
-        for row, attempt, text in zip(rows, accepted, texts):
-            row.update(attempt_id=attempt["attempt_id"], text_sha256=hashlib.sha256(text.encode()).hexdigest())
-    return {"schema": "additive_chain_generation_metrics_v1", "generation": summary,
-            "quality": aggregate_scores(rows) if rows else None,
+            batch["attention_mask"].to(device), eos_token_id=scorer_tokenizer.eos_token_id,
+            undefined="record" if population == "raw" else "error")
+        for row, attempt, text in zip(rows, chosen, texts):
+            row.update(attempt_id=attempt["attempt_id"], accepted=attempt["accepted"],
+                       text_sha256=hashlib.sha256(text.encode()).hexdigest())
+    quality = aggregate_population_scores(rows) if population == "raw" else aggregate_scores(rows) if rows else None
+    return {"schema": "additive_chain_raw_generation_metrics_v1" if population == "raw"
+                else "additive_chain_generation_metrics_v1", "generation": summary,
+            "quality": quality, "population": population,
+            "quality_subsets": {key: aggregate_population_scores([r for r in rows if r["accepted"] == flag])
+                for key, flag in (("accepted", True), ("rejected", False))} if population == "raw" else None,
             "quality_population": "complete" if summary["population_complete"] else "partial",
             "score_rows": rows,
             "scoring_protocol": {"retokenize": True, "decode_skip_special_tokens": False,

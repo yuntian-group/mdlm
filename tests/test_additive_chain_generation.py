@@ -349,3 +349,45 @@ def test_rejection_counter_resets_after_acceptance(monkeypatch):
     monkeypatch.setattr(gen, "generate_attempt", attempt)
     result = gen.generate_saved(None, decoder, Tokenizer(), samples=2, stream_namespace="test")
     assert result["status"] == "complete" and len(result["attempts"]) == 20
+
+
+def test_fixed_raw_population_never_replaces_or_stops_after_ten_rejections(monkeypatch):
+    decoder = gen.ChainDecoder(mask_id=4)
+    decoder.prepare()
+    seen = []
+    def attempt(*args, attempt_id, **kwargs):
+        seen.append((attempt_id, kwargs))
+        return {"attempt_id": attempt_id, "accepted": False, "generation_seconds": .5}
+    monkeypatch.setattr(gen, "generate_attempt", attempt)
+    result = gen.generate_saved(None, decoder, Tokenizer(), samples=64,
+        stream_namespace="raw-test", warmup=True, population="raw")
+    assert result["schema"] == "additive_chain_saved_raw_generations_v1"
+    assert result["population"] == "raw" and result["status"] == "complete"
+    assert result["samples_requested"] == result["raw_samples_requested"] == 64
+    assert result["accepted_samples_requested"] is None
+    assert result["generation_protocol"]["max_consecutive_rejections"] is None
+    assert [r["attempt_id"] for r in result["attempts"]] == list(range(64))
+    assert len(seen) == 65 and seen[0][0] == 1_000_000_000
+    assert all(kw["stream_namespace"] == "raw-test" for _, kw in seen)
+
+
+def test_raw_stopping_rule_preserves_attempt_tokens_streams_and_flags():
+    decoder = gen.ChainDecoder(mask_id=65, top_k=64)
+    decoder.prepare()
+    arguments = dict(samples=2, stream_namespace="same-stream", steps=4, length=256)
+    accepted = gen.generate_saved(high_entropy_forward, decoder, Tokenizer(), **arguments)
+    raw = gen.generate_saved(high_entropy_forward, decoder, Tokenizer(), population="raw", **arguments)
+    for left, right in zip(accepted["attempts"], raw["attempts"]):
+        for key in ("token_ids", "accepted", "text", "stream_seeds", "window", "attempt_id"):
+            assert left[key] == right[key]
+    assert accepted["accepted_samples_requested"] == 2
+    assert accepted["generation_protocol"]["max_consecutive_rejections"] == 10
+
+
+def test_invalid_population_rejected_before_warmup(monkeypatch):
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Must not generate")
+    monkeypatch.setattr(gen, "generate_attempt", forbidden)
+    with pytest.raises(ValueError, match="population"):
+        gen.generate_saved(None, None, None, samples=2, stream_namespace="test",
+                           warmup=True, population="unspecified")

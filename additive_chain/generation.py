@@ -330,23 +330,27 @@ def generate_attempt(forward, decoder, tokenizer, *, attempt_id, stream_namespac
 
 
 def generate_saved(forward, decoder, tokenizer, *, samples, stream_namespace,
-                   steps=32, length=1024, warmup=False):
+                   steps=32, length=1024, warmup=False, population="accepted"):
     """Finite one-window run returning the portable evaluation JSON structure.
 
-    Stops at the requested accepted count OR ten consecutive rejections for a
-    sample. Warmup uses separate attempt1_000_000_000 and is excluded. Caller
+    Accepted mode stops at the requested accepted count OR ten consecutive
+    rejections. Raw mode stops at exactly ``samples`` attempts, including every
+    rejection, with no replacement or consecutive-rejection limit. This is a
+    stopping rule, not a change to the sampler or the saved acceptance flag.
+    Warmup uses separate attempt1_000_000_000 and is excluded. Caller
     serializes the returned dictionary outside generation timing. This is not
     a durable/resumable job runner; exceptions propagate rather than inventing
     an accepted result or complete timing for interrupted work.
     """
     _require(type(samples) is int and samples > 0, "samples must be positive")
+    _require(population in ("accepted", "raw"), "Unknown generation population")
     warmup_seconds = None
     if warmup:
         warmup_seconds = generate_attempt(forward, decoder, tokenizer,
             attempt_id=1_000_000_000, stream_namespace=stream_namespace,
             steps=steps, length=length)["generation_seconds"]
     rows, accepted, consecutive = [], 0, 0
-    while accepted < samples and consecutive < 10:
+    while (len(rows) < samples if population == "raw" else accepted < samples and consecutive < 10):
         row = generate_attempt(forward, decoder, tokenizer, attempt_id=len(rows),
             stream_namespace=stream_namespace, steps=steps, length=length)
         rows.append(row)
@@ -354,11 +358,16 @@ def generate_saved(forward, decoder, tokenizer, *, samples, stream_namespace,
             accepted, consecutive = accepted + 1, 0
         else:
             consecutive += 1
-    return {"schema": "additive_chain_saved_generations_v1",
+    complete = len(rows) == samples if population == "raw" else accepted == samples
+    return {"schema": "additive_chain_saved_raw_generations_v1" if population == "raw"
+                else "additive_chain_saved_generations_v1",
         "eos_token_id": tokenizer.eos_token_id, "samples_requested": samples,
+        "population": population,
+        "raw_samples_requested": samples if population == "raw" else None,
+        "accepted_samples_requested": samples if population == "accepted" else None,
         "generation_timing_complete": True, "setup_seconds": decoder.setup_seconds,
         "warmup_seconds": warmup_seconds, "attempts": rows,
-        "status": "complete" if accepted == samples else "retry_limit",
+        "status": "complete" if complete else "retry_limit",
         "generation_protocol": {"steps": steps, "length": length, "initial_context_tokens": 1,
             "stream_namespace": stream_namespace, "count_strength": decoder.count_strength,
             "count_mode": decoder.count_mode, "smoothing": decoder.smoothing,
@@ -368,4 +377,4 @@ def generate_saved(forward, decoder, tokenizer, *, samples, stream_namespace,
             "fast_candidates": decoder.fast_candidates, "segment_batch_size": decoder.segment_batch_size,
             "strict_unary_validation": decoder.strict_unary_validation,
             "device": str(decoder.device), "torch_version": str(torch.__version__),
-            "max_consecutive_rejections": 10}}
+            "max_consecutive_rejections": None if population == "raw" else 10}}

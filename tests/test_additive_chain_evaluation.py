@@ -243,3 +243,120 @@ def test_cli_cached_only_cpu_mock_and_no_overwrite(tmp_path, monkeypatch):
     assert calls[-1]["torch_dtype"] == torch.float32
     with pytest.raises(ValueError, match="Output exists"):
         ev.main([str(source), "--output", str(output)])
+
+
+@pytest.mark.parametrize("ids", [[[6]], [[1]], [[6, 6, 6]]])
+def test_record_undefined_without_forward_or_inventing_a_score(ids):
+    model = TinyScorer().eval()
+    tensor = torch.tensor(ids)
+    rows = ev.score_token_batch(model, tensor, torch.ones_like(tensor), eos_token_id=6,
+                                undefined="record")
+    assert model.calls == []
+    assert rows[0] == dict(sample_id=0, status="undefined", reason="no_non_EOS_targets",
+        scored_tokens=0, total_nll_float64_sum=0., legacy_sequence_ppl=None,
+        scored_target_mask=[False] * tensor.shape[1])
+    result = ev.aggregate_population_scores(rows)
+    assert result["samples"] == result["undefined"] == 1
+    assert result["defined_subset"] is None and result["pooled_token_ppl"] is None
+    with pytest.raises(ValueError, match="stride"):
+        ev.score_token_batch(model, tensor, torch.ones_like(tensor), eos_token_id=6,
+                            undefined="record", stride=1024)
+
+
+def test_record_mode_keeps_defined_arithmetic_and_padding_unchanged():
+    ids = torch.tensor([[6, 6, 6, 6], [6, 1, 6, 2]])
+    mask = torch.tensor([[1, 0, 0, 0], [1, 1, 1, 1]])
+    model = TinyScorer().eval()
+    rows = ev.score_token_batch(model, ids, mask, eos_token_id=6, undefined="record")
+    reference = ev.score_token_batch(TinyScorer().eval(), ids[1:], mask[1:], eos_token_id=6)[0]
+    assert len(model.calls) == 1 and rows[0]["status"] == "undefined"
+    assert rows[1]["status"] == "defined"
+    for key in ("scored_tokens", "total_nll_float64_sum", "legacy_sequence_ppl", "scored_target_mask"):
+        assert rows[1][key] == reference[key]
+    result = ev.aggregate_population_scores(rows)
+    assert result["samples"] == 2 and result["defined"] == result["undefined"] == 1
+    assert result["pooled_token_ppl"] is result["legacy_mean_sequence_ppl"] is None
+    assert result["defined_subset"] == ev.aggregate_scores([reference])
+
+
+@pytest.mark.parametrize("field,value", [("reason", "unknown"), ("scored_tokens", False),
+    ("scored_tokens", 1), ("total_nll_float64_sum", float("nan")),
+    ("total_nll_float64_sum", 1.), ("legacy_sequence_ppl", 1.)])
+def test_invalid_undefined_records_rejected(field, value):
+    row = dict(status="undefined", reason="no_non_EOS_targets", scored_tokens=0,
+               total_nll_float64_sum=0., legacy_sequence_ppl=None)
+    row[field] = value
+    with pytest.raises(ValueError): ev.aggregate_population_scores([row])
+
+
+def raw_saved():
+    data = saved()
+    data.update(schema="additive_chain_saved_raw_generations_v1", population="raw", samples_requested=3)
+    data["attempts"][1]["text"] = None  # Generator does not decode rejected attempts.
+    return data
+
+
+def test_raw_saved_scores_every_attempt_and_reports_both_subsets():
+    data = raw_saved()
+    result = ev.evaluate_saved(data, Tokenizer(), Tokenizer(), TinyScorer().eval())
+    assert result["schema"] == "additive_chain_raw_generation_metrics_v1"
+    assert result["quality_population"] == "complete" and result["population"] == "raw"
+    assert result["quality"]["samples"] == result["quality"]["defined"] == 3
+    assert result["quality"]["undefined"] == 0
+    assert [r["attempt_id"] for r in result["score_rows"]] == [0, 1, 2]
+    assert [r["accepted"] for r in result["score_rows"]] == [True, False, True]
+    assert result["quality"]["pooled_token_ppl"] == ev.aggregate_scores(result["score_rows"])["pooled_token_ppl"]
+    assert result["quality_subsets"]["accepted"]["samples"] == 2
+    assert result["quality_subsets"]["rejected"]["samples"] == 1
+    assert result["generation"]["seconds_per_raw_sequence"] == 2.
+    assert result["generation"]["raw_diagnostics_mean"] == result["generation"]["accepted_diagnostics_mean"]
+    data["attempts"][1]["text"] = "bad"
+    with pytest.raises(ValueError, match="retained"):
+        ev.evaluate_saved(data, Tokenizer(), Tokenizer(), TinyScorer().eval())
+
+
+def test_raw_eos_only_preserved_as_undefined_not_replaced_or_silently_omitted():
+    data = raw_saved()
+    data["attempts"][1]["token_ids"] = [6] * 5
+    result = ev.evaluate_saved(data, Tokenizer(), Tokenizer(), TinyScorer().eval())
+    assert result["quality_population"] == "complete"  # All3 requested raw attempts exist.
+    assert result["quality"]["undefined"] == 1 and result["quality"]["defined"] == 2
+    assert result["quality"]["pooled_token_ppl"] is None
+    assert result["quality"]["defined_subset"]["samples"] == 2
+    assert result["quality_subsets"]["accepted"]["pooled_token_ppl"] is not None
+    assert result["quality_subsets"]["rejected"]["undefined"] == 1
+    assert result["score_rows"][1]["attempt_id"] == 1
+    assert result["score_rows"][1]["status"] == "undefined"
+    assert result["generation"]["generation_seconds_recorded"] == 6.
+
+
+def test_raw_partial_empty_excess_population_and_schema_disagreement():
+    data = raw_saved()
+    data["samples_requested"] = 4
+    result = ev.evaluate_saved(data, Tokenizer(), Tokenizer(), TinyScorer().eval())
+    assert result["quality_population"] == "partial" and result["quality"]["samples"] == 3
+    data["samples_requested"] = 2
+    with pytest.raises(ValueError, match="fixed size"):
+        ev.evaluate_saved(data, Tokenizer(), Tokenizer(), TinyScorer().eval())
+    data["samples_requested"] = 3
+    data["population"] = "accepted"
+    with pytest.raises(ValueError, match="disagree"):
+        ev.evaluate_saved(data, Tokenizer(), Tokenizer(), TinyScorer().eval())
+    data["population"] = "raw"
+    data["attempts"] = []
+    result = ev.evaluate_saved(data, Tokenizer(), Tokenizer(), TinyScorer().eval())
+    assert result["quality_population"] == "partial"
+    assert result["quality"]["samples"] == result["quality"]["undefined"] == 0
+    assert result["quality"]["pooled_token_ppl"] is None
+    assert result["generation"]["raw_diagnostics_mean"]["token_entropy_nats"] is None
+
+
+def test_all_raw_rejected_is_a_complete_population_not_no_quality():
+    data = raw_saved()
+    for row in data["attempts"]: row["accepted"] = False
+    result = ev.evaluate_saved(data, Tokenizer(), Tokenizer(), TinyScorer().eval())
+    assert result["quality_population"] == "complete" and result["quality"]["samples"] == 3
+    assert result["quality"]["pooled_token_ppl"] is not None
+    assert result["quality_subsets"]["accepted"]["samples"] == 0
+    assert result["quality_subsets"]["accepted"]["pooled_token_ppl"] is None
+    assert result["generation"]["seconds_per_accepted_sequence"] is None

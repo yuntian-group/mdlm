@@ -102,3 +102,32 @@ def test_retry_limit_saved_but_exit_nonzero(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(cli, 'parser', lambda: NS(parse_args=lambda argv: a))
     assert cli.main([]) == 2
     assert json.loads(capsys.readouterr().out)['raw_attempts'] == 10
+
+
+def test_raw_cli_composes_with_generation_and_evaluation(tmp_path, monkeypatch):
+    from additive_chain.evaluation import summarize_attempts
+    frozen = fake_backbone()
+    # All-EOS outputs fail acceptance; fixed-raw mode still finishes exactly12.
+    def constant(tokens, t):
+        result = torch.full((*tokens.shape, 66), -torch.inf)
+        result[..., 0] = 0
+        return result
+    frozen.forward = constant
+    monkeypatch.setattr(cli, 'load_bd3lm', lambda *a, **k: frozen)
+    a = arguments(tmp_path, '--population', 'raw', '--samples', '12', '--no-warmup')
+    value = cli.run(a)
+    assert value == json.loads(a.output.read_text())
+    assert value['status'] == 'complete' and len(value['attempts']) == 12
+    assert value['population'] == 'raw' and not any(r['accepted'] for r in value['attempts'])
+    summary = summarize_attempts(value['attempts'], eos_token_id=0,
+        samples_requested=12, timing_complete=True, population=value['population'])
+    assert summary['population_complete'] and summary['rejected'] == 12
+    assert summary['seconds_per_raw_sequence'] > 0
+    with pytest.raises(ValueError, match='new file'): cli.run(a)
+
+
+def test_invalid_programmatic_population_rejected_before_loading(tmp_path, monkeypatch):
+    monkeypatch.setattr(cli, 'load_bd3lm', lambda *a, **k: (_ for _ in ()).throw(AssertionError('must not load')))
+    a = arguments(tmp_path)
+    a.population = 'unknown'
+    with pytest.raises(ValueError, match='population'): cli.run(a)
