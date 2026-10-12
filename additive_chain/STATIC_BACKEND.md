@@ -13,6 +13,9 @@ remove the quadratic candidate-pair reductions in forward/backward inference.
 The frozen global term can be cached because it does not depend on the current
 masked input. A contextual term cannot use this backend.
 
+For a fixed count/global table plus a fresh contextual term, see the separate
+opt-in [cached contextual backend](STATIC_CONTEXTUAL_BACKEND.md).
+
 The backend is explicitly opt-in. Existing `additive_chain.cuda` functions and
 package import behavior are unchanged. NVIDIA CUDA and Triton are required for
 sampling. CPU table construction is permitted only for small correctness

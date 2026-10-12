@@ -5,6 +5,7 @@
 
 Changes to the count kernels: kind2 adds both count and learned scores; zero
 learned contributions delegate to the unchanged count recurrence and sampler.
+kind3 reads a cached count/global table and adds fresh contextual dot scores.
 No support pooling or probability-rank approximation. Inference only.
 """
 from dataclasses import dataclass
@@ -91,7 +92,7 @@ if triton is not None:
                    capacity: tl.constexpr):
         # kind2 is COUNT + SIGNED LOG DOT, not an either/or switch.
         score = tl.full((a.shape[0], b.shape[0]), 0., tl.float32)
-        if kind == 0 or kind == 2:
+        if (kind == 0 or kind == 2) or kind == 3:
             r = tl.arange(0, rank_block)
             x = tl.load(left + ((original_row * original_length + edge_pos) * states
                                 + a[:, None]) * rank + r[None, :],
@@ -107,6 +108,13 @@ if triton is not None:
                          b < states, other=-1)
             score += _count_scores(ai[:, None], bi[None, :], keys, values, left_bg, right_bg,
                                    vocab, capacity)
+        if kind == 3:
+            ai = tl.load(ids + (original_row * original_length + edge_pos) * states + a,
+                         a < states, other=-1).to(tl.int64)
+            bi = tl.load(ids + (original_row * original_length + edge_pos + 1) * states + b,
+                         b < states, other=-1).to(tl.int64)
+            valid = (ai[:, None] >= 0) & (ai[:, None] < vocab) & (bi[None, :] >= 0) & (bi[None, :] < vocab)
+            score += tl.load(values + ai[:, None] * vocab + bi[None, :], valid, other=0.)
         return score
 
 
@@ -201,7 +209,7 @@ if triton is not None:
             logits = tl.load(alpha + address, a < states, other=-float('inf'))
             if pos < run_length - 1:
                 column = tl.full((state_block,), 0., tl.float32)
-                if kind == 0 or kind == 2:
+                if (kind == 0 or kind == 2) or kind == 3:
                     r = tl.arange(0, rank_block)
                     x = tl.load(left + ((row * original_length + start + pos) * states
                                         + a[:, None]) * rank + r[None, :],
@@ -216,6 +224,12 @@ if triton is not None:
                     bi = tl.load(ids + (row * original_length + start + pos + 1) * states + selected)
                     column += _count_scores(ai, bi, keys, values, left_bg, right_bg,
                                            vocab, capacity)
+                if kind == 3:
+                    ai = tl.load(ids + (row * original_length + start + pos) * states + a,
+                                 a < states, other=-1).to(tl.int64)
+                    bi = tl.load(ids + (row * original_length + start + pos + 1) * states + selected).to(tl.int64)
+                    valid = (ai >= 0) & (ai < vocab) & (bi >= 0) & (bi < vocab)
+                    column += tl.load(values + ai * vocab + bi, valid, other=0.)
                 logits += column
             maximum = tl.max(logits, axis=0)
             bad = bad | (maximum == -float('inf')) | (tl.sum(
@@ -253,7 +267,7 @@ class PairFactors:
     def boundary(self, rows, positions, states, *, left_boundary):
         """Add count and learned factors at both visible endpoints."""
         learned = 0.
-        if self.kind == 0 or self.kind == 2:
+        if (self.kind == 0 or self.kind == 2) or self.kind == 3:
             if left_boundary:
                 learned = (self.left[rows, positions, states, None, :] *
                            self.right[rows, positions + 1]).sum(-1)
@@ -266,8 +280,13 @@ class PairFactors:
             a, b = self.ids[rows, positions, states, None], self.ids[rows, positions + 1]
         else:
             a, b = self.ids[rows, positions], self.ids[rows, positions + 1, states, None]
-        count = _lookup_count_pairs(a, b, self.keys, self.values,
-                                    self.left_bg, self.right_bg, self.vocab)
+        if self.kind == 3:
+            valid = (a >= 0) & (a < self.vocab) & (b >= 0) & (b < self.vocab)
+            count = self.values[a.clamp(0, self.vocab-1), b.clamp(0, self.vocab-1)]
+            count = torch.where(valid, count, 0.)
+        else:
+            count = _lookup_count_pairs(a, b, self.keys, self.values,
+                                        self.left_bg, self.right_bg, self.vocab)
         return count + learned
 
 

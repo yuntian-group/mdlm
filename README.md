@@ -1,3 +1,12 @@
+# Additive-chain research in this fork
+
+The [additive-chain package](additive_chain/README.md) contains count, global,
+and contextual token-chain models and their inference/training tests. Its
+[released-backbone adapter](additive_chain/BACKBONE.md) uses the newer
+`mdlm-owt-noeos` checkpoint. The original MDLM instructions below remain for
+the upstream project; their checkpoint, environment, preprocessing, and
+`main.py` commands are **not** the additive-chain experiment protocol.
+
 # [Simple and Effective Masked Diffusion Language Models](http://arxiv.org/abs/2406.07524) (NeurIPS 2024)
 By [Subham Sekhar Sahoo](https://s-sahoo.github.io), [Marianne Arriola](https://mariannearriola.github.io), [Yair Schiff](https://yair-schiff.github.io), [Aaron Gokaslan](https://skylion007.github.io), [Edgar Marroquin](https://emarro.github.io),
 [Justin T Chiu](https://justinchiu.netlify.app), [Alexander Rush](https://rush-nlp.com), [Volodymyr Kuleshov](https://www.cs.cornell.edu/~kuleshov/)

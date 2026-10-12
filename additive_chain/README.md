@@ -1,8 +1,13 @@
 # Additive token chains
 
 This package supplies a PyTorch reference implementation of a linear-chain
-distribution over output token candidates. It is independent of model loading,
-datasets, experiment scheduling, and checkpoint storage.
+distribution over output token candidates. Its mathematical core is independent
+of model loading, datasets, experiment scheduling, and checkpoint storage.
+The optional [released-backbone adapter](BACKBONE.md) supplies the native MDLM
+log probabilities and masked-input features used by the experiment pipeline.
+The [saved-generation evaluator](EVALUATION.md) reports external-model PPL,
+rejection-aware generation time, and raw-token diagnostics without regenerating
+or filtering the saved outputs.
 
 For a fixed partially masked input `c`, the score is
 
@@ -49,6 +54,12 @@ fused kernels without materializing that tensor. Its documentation covers
 candidate preparation, supported devices, provenance, and separate validation
 requirements. No optional fused kernel or candidate-selection helper is enabled
 implicitly.
+
+For frozen count/global scores, the optional [static backend](STATIC_BACKEND.md)
+caches their full-vocabulary table before generation. The
+[cached contextual backend](STATIC_CONTEXTUAL_BACKEND.md) adds fresh local
+factors to that same fixed table at each step. These are explicit alternatives,
+not changes to the reference model's probability law.
 
 ## Initialization and training
 
