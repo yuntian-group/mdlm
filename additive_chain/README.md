@@ -15,10 +15,11 @@ durable command-line runner are separate from this API.
 The [local-assets generation command](CLI.md) supplies strict count/head
 imports and executable baseline/count/global/contextual wiring. It saves a
 finite run, but does not provide durable resume or claim CUDA reproduction.
-The [count-building command](COUNT_DATA.md) constructs compatible sparse
-statistics from authenticated, already packed training windows.
-The [adaptation-step API](ADAPTATION.md) connects masked-input features and
-additive residuals to the selected-block training loss, without a job runner.
+The [data-preparation and count-building commands](COUNT_DATA.md) reconstruct
+the recorded adaptation split and construct compatible sparse statistics.
+The [adaptation API and training command](ADAPTATION.md) connect masked-input
+features and additive residuals to the selected-block loss, with an optimizer,
+development-checkpoint selection, and durable continuation of one training run.
 
 The decoding API has passed a bounded actual-model CUDA shadow check: one
 fixed 32-step raw trajectory for each of baseline/count/global/contextual,

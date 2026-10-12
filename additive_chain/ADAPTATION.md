@@ -1,9 +1,11 @@
-# One adaptation step
+# Adaptation API and executable training
 
 `adaptation_step` connects the frozen model, candidate support, additive head,
 and revealed-block objective. It does not load a dataset, run an optimizer,
-save checkpoints, or select strengths. This is a tested scientific building
-block, not a claim to reproduce full-model training or its runtime.
+save checkpoints, or select strengths. The separate `train_cli` below supplies
+the optimizer, checkpointing, development selection and continuation. These
+are tested portable scientific implementations, not a claim to reproduce
+full-model training numerics, quality, or runtime.
 
 For each clean packed row, it draws a step `j` uniformly from `1..T`, masks each
 position with probability `j/T`, then selects masked positions for reveal with
@@ -100,5 +102,140 @@ full-model CUDA bitwise parity, training throughput, or final quality.
 The dense `[B,L-1,K,K]` pair tensor and its gradients require quadratic memory
 in K. `edge_chunk` only bounds lookup temporaries; it is not a bound on total
 training memory. This API does not prune unrevealed latent components or alter
-the objective to reduce that cost. The caller owns packed-data provenance,
-training order, validation, optimizer settings, stopping, and resume state.
+the objective to reduce that cost. Packed-data provenance remains the caller's
+responsibility. The CLI below provides an explicit training order, validation
+population, optimizer, stopping policy, and durable resume state.
+
+## Local-assets training command
+
+Run `python -m additive_chain.train_cli --help` in a fresh Python process.
+Nothing is downloaded. Supply the three local directories described in
+[BACKBONE.md](BACKBONE.md), a SHA-bound count artifact from
+`python -m additive_chain.prepare_counts`, and separate packed train/dev
+manifests. `--output` and a finite `--seconds-limit` are required; there is no
+default checkpoint destination. Use an output filesystem with enough space
+for optimizer state and immutable best-head snapshots. The command does not
+copy the frozen pretrained checkpoint into the output directory.
+
+```sh
+python -m additive_chain.train_cli \
+  --upstream /data/bd3-lm --checkpoint /data/mdlm-owt-noeos \
+  --tokenizer /data/gpt2 \
+  --train-manifest /data/packed/train-manifest.json \
+  --train-manifest-sha256 TRAIN_MANIFEST_SHA256 \
+  --dev-manifest /data/packed/dev-manifest.json \
+  --dev-manifest-sha256 DEV_MANIFEST_SHA256 \
+  --count-file /data/counts/counts.pt --count-sha256 COUNT_SHA256 \
+  --kind global --count-strength .1 --rank 64 --top-k 500 \
+  --output /data/runs/global --seconds-limit 36000
+```
+
+The paths and uppercase hashes above are placeholders, not release assets.
+The defaults reproduce the declared training protocol:
+
+- One row per update, signed FP32 rank-64 head, coefficient one during training.
+- Conditional count smoothing `.1`, explicit count strength, top-p `.9`, cap
+  `500`, and the 32-step corruption/reveal schedule described above.
+- AdamW at learning rate `.001`, zero weight decay, gradient-norm clipping at
+  `1`, no learning-rate schedule, no gradient accumulation.
+- A fixed CPU permutation of training rows, reused cyclically without a new
+  epoch shuffle. Fixed initialization/order/corruption/dev RNG streams are
+  recorded; they are reproducibility state, not repeated-seed experiments.
+- Evaluate the **first 32 declared dev rows**, using the same corruption draws
+  at every evaluation. Pool block NLL and divide by the total selected tokens.
+  Never read a test split or exponentiate this surrogate as data PPL.
+- Record initial development loss at step zero. Evaluate every 250 optimizer
+  updates and at the maximum, select a new trained best only for improvement
+  greater than `1e-5`, and stop after four non-improving evaluations once at
+  least 1,000 updates have run, or at 5,000 updates. Step-zero loss is a
+  diagnostic, not a trained best-head candidate. Generation strength zero is
+  the separate, exact predecessor option during subsequent calibration.
+
+All these settings are recorded in the training identity. CLI overrides are
+explicitly different configurations, not silent reproductions. There is no
+seed-sweep option. The public loader/initialization and dense FP32 operation
+order are not asserted bitwise equal to the optimized experimental trainer.
+
+### Packed inputs
+
+Each manifest has schema `packed_chain_adaptation_v1`, split `train` or `dev`,
+and these fields (use different files/data for the two splits):
+
+```json
+{
+  "schema": "packed_chain_adaptation_v1",
+  "split": "train",
+  "vocab_size": 50258,
+  "window_length": 1024,
+  "mask_id": 50257,
+  "eos_id": 50256,
+  "tokenizer": {
+    "id": "gpt2",
+    "revision": "607a30d783dfa663caf39e06633721c8d4cfcd7e"
+  },
+  "document_eos_retained": true,
+  "window_bos_eos_added": false,
+  "shards": [{"path": "train.npy", "sha256": "SHA256_OF_NPY_FILE", "rows": 9765}]
+}
+```
+
+Shards are memory-mapped integer `[rows,1024]` `.npy` arrays, relative to the
+manifest directory or explicitly absolute. All bytes, shapes, token ranges,
+packing declarations, and tokenizer revision are checked. Train/dev cannot
+share a resolved shard path or identical shard bytes. **This does not prove
+document-disjointness or absence of partial overlap:** audit corpus identities
+and document splits during preprocessing. Article EOS tokens and the first
+window token are retained in training, and no window wrappers are inserted.
+The original experiment used 9,765 training windows and evaluated the first
+32 rows of a separate 2,130-row development population. Different input
+manifests produce a new experiment, even when optimization settings match.
+
+### Frozen predecessor and exports
+
+For the contextual stage, use `--kind contextual --global-head HEAD.pt
+--global-sha256 HEAD_SHA256 --global-strength .25`, with an explicitly chosen
+global checkpoint and coefficient. The head must be an authenticated global
+export with the same count SHA, count strength, candidate rule and schedule.
+Exports from this trainer include that count binding. Older head formats that
+lack it can still be consumed by the lower-level asset API, but this training
+entry point rejects them rather than inventing their count provenance.
+The global head is evaluation-only and gradient-disabled. The frozen token
+embedding table and hidden states from the same masked-input pass supply the
+new contextual head; no gold-conditioned encoder pass is made. Contextual
+training also uses new-head coefficient one, with the inherited global
+coefficient fixed throughout.
+
+`last.pt` is the authoritative resume checkpoint: parameters, AdamW state,
+training cursor, corruption and process RNG states, complete development
+history, stopping state, and byte-bound input/source identity. The command
+also writes `identity.json`, `progress.json`, and, on a normal bounded stop,
+`training-history.json`. Each selected improvement creates an immutable
+`head-stepNNNNNN.pt` and updates `best-head.pt`. Both trained head exports use
+the existing `additive_ladder_head_v1` format, so they can be passed directly
+to `generate_cli` with their SHA256. The initial optimizer checkpoint is
+written before any development pass or preflight, even if that pass fails.
+
+Repeat the exact command with `--resume` to continue the same run. Resume
+rejects changed scientific configuration, data/count/head/source bytes, or
+runtime identity. `--max-new-updates 4` bounds a genuine four-update slice;
+removing it while retaining `--resume` continues the same optimizer/RNG state.
+`--phase preflight` performs one zero-step forward/backward gradient check,
+without an optimizer update or advancing the saved training RNG. Resume a
+successful preflight with `--phase train --resume`.
+
+Checkpoints are atomically replaced and output has an exclusive process lock.
+Before scheduled evaluation the current optimizer checkpoint is durable;
+selection history is committed only after the best snapshot is durable.
+An interrupted evaluation/export is replayed at the current saved step before
+another update, including at the maximum step. Older missing evaluation events
+are rejected because their historical weights cannot be reconstructed. A hard
+kill or unexpected training failure resumes from the last complete checkpoint
+(up to 25 updates may be recomputed with the same saved state); a graceful
+SIGTERM/SIGINT or budget stop saves at a row boundary. The time budget is checked
+between operations, not an operating-system deadline interrupting a kernel.
+
+**Selection scope:** this command selects a training checkpoint by candidate-set
+development NLL. It does not run the separate generation-PPL coefficient grid,
+choose its coefficient, produce held-out data PPL, or assert improvement.
+Evaluate the chosen head and coefficient zero alongside a declared coefficient
+grid using a separate development-generation population before final testing.
