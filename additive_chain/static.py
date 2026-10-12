@@ -8,6 +8,8 @@ not a default, a training objective, a candidate filter or a new model. A
 context-dependent residual is not supported here. Preparation/compilation must
 be reported separately from steady-state decoding time. See STATIC_BACKEND.md.
 """
+from __future__ import annotations
+
 from contextlib import contextmanager
 from dataclasses import dataclass
 import math

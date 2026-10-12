@@ -15,6 +15,10 @@ from additive_chain.chain import marginals
 from additive_chain import static
 
 
+def test_union_annotations_are_postponed_for_python39_imports():
+    assert static.StaticGlobalCache.__annotations__['table'] == 'dense.DenseCountTable | None'
+
+
 def fixture(vocab=7, rank=3, device='cpu'):
     left = torch.linspace(.6, .9, vocab, device=device, dtype=torch.float64)
     right = torch.linspace(.7, .4, vocab, device=device, dtype=torch.float64)

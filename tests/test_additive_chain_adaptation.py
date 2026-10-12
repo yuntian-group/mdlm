@@ -10,6 +10,12 @@ from additive_chain.heads import ContextualAdditiveHead, GlobalAdditiveHead
 from additive_chain.training import block_reveal_nll
 
 
+def test_union_annotations_are_postponed_for_python39_imports():
+    from additive_chain.adaptation import AdaptationStep
+    assert AdaptationStep.__annotations__['objective'] == 'BlockRevealLoss | None'
+    assert AdaptationStep.__annotations__['pair_scores'] == 'torch.Tensor | None'
+
+
 class TinyFrozen:
     mask_id = 4
 

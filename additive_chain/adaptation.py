@@ -4,6 +4,8 @@ The learned residual has coefficient one during training. A supplied count
 potential already contains its count strength. A contextual stage may inherit
 an explicitly frozen global head at an explicitly supplied coefficient.
 """
+from __future__ import annotations
+
 from dataclasses import dataclass
 import math
 
