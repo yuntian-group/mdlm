@@ -15,6 +15,8 @@ durable command-line runner are separate from this API.
 The [local-assets generation command](CLI.md) supplies strict count/head
 imports and executable baseline/count/global/contextual wiring. It saves a
 finite run, but does not provide durable resume or claim CUDA reproduction.
+The [count-building command](COUNT_DATA.md) constructs compatible sparse
+statistics from authenticated, already packed training windows.
 
 For a fixed partially masked input `c`, the score is
 
