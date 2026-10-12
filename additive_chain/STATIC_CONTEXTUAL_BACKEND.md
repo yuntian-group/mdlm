@@ -92,9 +92,15 @@ CPU tests compare scores and complete tiny joint distributions with the
 ordinary concatenated-factor model, including visible boundaries, padding,
 changing masked hidden states and zero-term dispatch. Optional CUDA tests
 cover messages, same-noise draws, marginals and zero-term RNG parity. CUDA
-skips must be reported explicitly. **This public contextual port has not yet
-been validated on CUDA or through a full pretrained-model trajectory.** No
-generation-quality or speed result is attributed to it by these tests.
+skips must be reported explicitly.
+
+The cached contextual path also passed an actual pretrained-MDLM A100 shadow
+trajectory at K500, length 1,024 and 32 steps, with count/global/contextual
+strengths 0.1/0.25/0.25. Its fixed table, fresh factors, candidate supports,
+unaries, tokens and proposal RNG matched the frozen research implementation
+bitwise. This is one fixed raw attempt, not a quality or speed evaluation, and
+does not replace the other width/marginal/zero-term tests. See the precise
+[four-method validation scope](GENERATION.md#tests-and-current-validation-scope).
 
 The message/sampling kernels retain Nina Zhang's Apache-2.0 attribution from
 [`chain_crf/fused_pairs.py`](https://github.com/yuntian-group/mdlm/blob/18175679c93d7792936e1497b7c5be72a765f2de/chain_crf/fused_pairs.py),

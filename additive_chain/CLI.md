@@ -167,8 +167,12 @@ a stream development/final; that experimental decision remains the caller's.
 
 CPU tests cover schemas, the composed baseline command and error cleanup.
 This CLI has not yet received a real-checkpoint CUDA trajectory proof or a
-quality/speed reproduction. Successful execution does not substitute for the
-backend law tests, paired raw-attempt comparison, or fresh same-device timing.
+quality/speed reproduction. The separate
+[actual-model decoder shadow check](GENERATION.md#tests-and-current-validation-scope)
+tested the decoding API with an already loaded native model, not this command's
+startup, scheduler, attempt runner or scorer. Successful execution does not
+substitute for backend law tests, paired raw-attempt comparison, or fresh
+same-device timing.
 It never writes a fabricated proof or claims existing experiment receipts
 apply to its new wrapper/runtime.
 

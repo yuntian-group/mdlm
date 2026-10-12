@@ -20,6 +20,12 @@ statistics from authenticated, already packed training windows.
 The [adaptation-step API](ADAPTATION.md) connects masked-input features and
 additive residuals to the selected-block training loss, without a job runner.
 
+The decoding API has passed a bounded actual-model CUDA shadow check: one
+fixed 32-step raw trajectory for each of baseline/count/global/contextual,
+with matching tokens and proposal RNG. This is not an end-to-end CLI,
+quality, timing or training reproduction; see the
+[validation scope](GENERATION.md#tests-and-current-validation-scope).
+
 For a fixed partially masked input `c`, the score is
 
 \[

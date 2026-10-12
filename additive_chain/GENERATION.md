@@ -41,8 +41,8 @@ namespace explicitly; matching a historical stream requires its exact string:
 
 Do not reuse a development prefix as a claimed new final population. Equal
 seeds do not promise identical CPU/CUDA draws, changed-backend draws, or draws
-across library versions. Exact trajectory parity still needs a test on the
-actual runtime/checkpoint.
+across library versions. Exact trajectory parity must be checked on the
+actual runtime/checkpoint; the bounded validation below covers one such setup.
 
 ## Proposals and three stages
 
@@ -199,6 +199,28 @@ zero coefficients, frozen visible context, one-forward feature composition,
 selected-only own-marginal draws, static/dynamic preparation separation, raw
 attempt numbering, warmup and retry accounting. Active CUDA adapters are mocked
 in those CPU integration tests, while tiny reference marginals check the law.
-These tests do **not** establish real-checkpoint CUDA trajectory parity or
-generation quality/latency for this new entrypoint. Those checks must precede
-reproduction or speed claims.
+Those CPU tests alone do not establish real-checkpoint CUDA parity.
+
+A separate A100 diagnostic at source revision `f5b1575` compared the public
+`ChainDecoder.reveal` API with the frozen research implementation using the
+released MDLM checkpoint. It checked exactly one fixed raw attempt (index 0)
+for each of baseline, count, global and contextual decoding: length 1,024,
+32 steps, top-p 0.9 and K500, with joint sampling and the static backend for
+active pair models. Count strength was 0.1; active global and contextual
+strengths were 0.25. The contextual value
+was a diagnostic setting, not a selected quality result.
+
+All four trajectories passed bitwise checks for candidate IDs, FP64 unaries,
+active head factors, sampled tokens and proposal-generator state at every
+step (128 step records). The fixed count/global tables also matched bitwise.
+Two separate initial diagnostic forwards matched the native and public
+feature wrappers; each sampled step then shared one frozen masked-input
+forward between the two decoders.
+
+The **native scheduler** drove these shadows. This does not validate the
+public standalone scheduler/attempt runner, checkpoint-loader startup, CLI,
+external scorer or training pipeline on a full model. It adds no quality
+population and measures no generation speed. The diagnostic held both
+implementations' caches simultaneously, so its memory use is not a deployment
+benchmark. Rejection, warmup, serialization and end-to-end timing still need
+their own composed reproduction checks.

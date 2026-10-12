@@ -106,10 +106,17 @@ addresses. CUDA tests include caps500/1000/2000, long small-cap chains and
 same-noise draws. CUDA skips must be reported explicitly. This portable static
 module's two static test modules passed **21 tests, including 8 CUDA tests, with
 no skips on an NVIDIA A100**. These are unit-scale numerical and sampling
-checks. They did not allocate the real `50,258 x 50,258` table, run a full-model
-private-versus-public trajectory comparison, or measure generation quality or
-speed. An actual same-token model-trajectory check and end-to-end measurement
-are still required before attributing a benchmark result to this package.
+checks; those unit tests did not allocate the real `50,258 x 50,258` table.
+
+A separate actual-MDLM A100 diagnostic did construct the full tables and
+matched the public and frozen research implementations bitwise for count,
+count-plus-global and cached-contextual decoding. Each method used one fixed
+raw attempt at length 1,024, 32 steps and K500. Candidate supports, unaries,
+active factors, sampled tokens and proposal RNG also matched at every step.
+See [GENERATION.md](GENERATION.md#tests-and-current-validation-scope) for the
+exact coefficients and scope. This was not a quality or timing evaluation;
+fresh end-to-end measurement is still required before attributing a benchmark
+speed to this package.
 
 ## Attribution
 

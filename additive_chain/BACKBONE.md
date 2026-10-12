@@ -64,5 +64,10 @@ upstream initial boundary token; it is not an extra training-window wrapper.
 This adapter alone is **not** a full generation/training command. Candidate
 construction, chain inference, reveal scheduling, rejection accounting and
 scoring are separate. CPU tests verify the one-forward/hook contract with a
-small native model; they do not establish full-checkpoint GPU parity or a
-generation-speed result for this public adapter.
+small native model. An actual-MDLM A100 diagnostic also matched the public
+`FrozenMDLM` feature wrapper against the native wrapper using the **same
+already loaded model**: log probabilities and masked-input hidden features
+were bitwise equal. The subsequent four decoder shadows are described in
+[GENERATION.md](GENERATION.md#tests-and-current-validation-scope).
+This does not exercise `load_bd3lm` startup on a real checkpoint, establish an
+independent model-loading reproduction, or measure generation speed.
