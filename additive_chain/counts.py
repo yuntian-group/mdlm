@@ -112,7 +112,7 @@ class SparseCountPotential:
         n=float(lc.sum())
         eps=float(smoothing) if n else 1.
         b_l,b_r=(lc+1.)/(n+vocab),(rc+1.)/(n+vocab)
-        empirical_scale=(1.-eps)/max(n,1.)
+        empirical_scale=(1.-eps)/(n if n else 1.)
         m_l,m_r=empirical_scale*lc+eps*b_l,empirical_scale*rc+eps*b_r
         log_left=strength*(math.log(eps)+b_l.log()-m_l.log())
         log_right=strength*b_r.log()
