@@ -17,6 +17,8 @@ imports and executable baseline/count/global/contextual wiring. It saves a
 finite run, but does not provide durable resume or claim CUDA reproduction.
 The [count-building command](COUNT_DATA.md) constructs compatible sparse
 statistics from authenticated, already packed training windows.
+The [adaptation-step API](ADAPTATION.md) connects masked-input features and
+additive residuals to the selected-block training loss, without a job runner.
 
 For a fixed partially masked input `c`, the score is
 
