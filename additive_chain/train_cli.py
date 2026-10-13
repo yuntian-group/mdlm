@@ -512,11 +512,9 @@ def main(argv=None):
     else:
         asset = assets.load_head_asset(args.global_head, args.global_sha256,
                                       kind='global', device=args.device, vocab_size=frozen.mask_id + 1)
-        require(all(asset.training[k] == v for k, v in {'count_strength': config.count_strength,
-            'cap': config.top_k, 'top_p': config.top_p, 'schedule_steps': config.schedule_steps}.items()),
-            'Frozen global predecessor was trained with a different count/support/schedule anchor')
-        require(asset.training.get('counts', {}).get('sha256') == counts.identity['sha256'],
-                'Contextual training requires a predecessor bound to these exact count-asset bytes')
+        assets.validate_training_predecessor(asset, count_strength=config.count_strength,
+            cap=config.top_k, top_p=config.top_p, steps=config.schedule_steps,
+            counts_sha256=counts.identity['sha256'])
         global_head = asset.head
         inherited = dict(path=asset.identity['path'], sha256=asset.identity['sha256'], step=asset.identity['training_step'])
         table = frozen.model.backbone.backbone.vocab_embed.embedding.detach()

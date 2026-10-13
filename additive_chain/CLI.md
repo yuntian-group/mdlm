@@ -180,6 +180,23 @@ inherited global `sha256`, `step`, and training global coefficient. Additional
 training metadata is read but is not copied wholesale into the saved sample
 file. The SHA of the imported export binds that original metadata.
 
+The same head interchange also accepts `supported_training_continuation_v1`.
+That identity is preserved, not relabeled as gold-augmented training. Its
+`pilot_protocol` must declare unchanged generation support, no gold insertion,
+missing targets left latent, and `-log q_C(gold_I)/|R|`, with empty supervision
+skipping the optimizer entirely. The importer checks its head configuration,
+model revision, fixed selection cases/policy, and exact tensor keys/shapes.
+Generation reads its nested support/count/schedule anchors; a contextual head
+must retain its exact inherited global export SHA. The saved asset summary
+records which training schema was imported.
+
+This import support does not change `train_cli`'s gold-augmented recipe or
+reproduce the continuation's 128-case selection procedure. Using an imported
+head as a *training* predecessor additionally requires an explicit direct
+count-asset SHA. An older export lacking that field may be used for generation
+but is rejected as a training predecessor; data/manifest hashes are not
+silently substituted for the missing count-file hash.
+
 The importer preserves the CPU RNG state while constructing/loading heads,
 and returns frozen eval-mode modules. Generation uses the two explicit stream
 generators documented in [GENERATION.md](GENERATION.md), so loading a head
@@ -210,14 +227,17 @@ each deliberate run; do not label an interrupted run's surviving fragments as
 a completed population. It does not select a strength or automatically label
 a stream development/final; that experimental decision remains the caller's.
 
-CPU tests cover schemas, the composed baseline command and error cleanup.
-This CLI has not yet received a real-checkpoint CUDA trajectory proof or a
-quality/speed reproduction. The separate
-[actual-model decoder shadow check](GENERATION.md#tests-and-current-validation-scope)
-tested the decoding API with an already loaded native model, not this command's
-startup, scheduler, attempt runner or scorer. Successful execution does not
-substitute for backend law tests, paired raw-attempt comparison, or fresh
-same-device timing.
+CPU tests cover schemas, composed command routing and error cleanup. An actual
+checkpoint/CUDA smoke check ran the unmodified generation command and separate
+evaluation command for baseline and count strength 0.1: four fixed raw attempts
+per arm, length 1,024, T=32, top-p=0.9, K=500, static backend. All eight final
+token arrays exactly matched their saved reference outputs, and each separate
+scoring output bound the generated input bytes. This is software execution and
+saved-output replay evidence, not a quality estimate, timing benchmark,
+training check, or learned-head CLI validation. The
+[earlier decoder shadow check](GENERATION.md#tests-and-current-validation-scope)
+has its own, separate scope. Successful execution does not substitute for
+backend law tests or fresh same-device timing.
 It never writes a fabricated proof or claims existing experiment receipts
 apply to its new wrapper/runtime.
 
