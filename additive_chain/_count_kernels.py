@@ -122,6 +122,12 @@ if triton is not None:
         start = tl.load(starts + run).to(tl.int64)
         if backward:
             if pos < run_length - 1:
+                # One center over ALL states, shared by every output tile.
+                # Local reduction shifts alone do not stop O(length) offsets.
+                previous = tl.load(messages + (run * width + pos + 1) * states + all_states,
+                                   all_states < states, other=-float('inf'))
+                center = tl.max(previous, axis=0)
+                center = tl.where(center == -float('inf'), 0., center)
                 running_max = tl.full((tile,), -float('inf'), tl.float32)
                 running_sum = tl.full((tile,), 0., tl.float32)
                 for chunk in range((states + 127) // 128):
@@ -132,6 +138,7 @@ if triton is not None:
                                         vocab, capacity)
                     nxt = (run * width + pos + 1) * states + reduction_states
                     incoming = tl.load(messages + nxt, reduction_states < states, other=-float('inf'))
+                    incoming = incoming - center
                     incoming += tl.load(unary + nxt, reduction_states < states, other=-float('inf'))
                     scores += incoming[None, :]
                     scores = tl.where(reduction_states[None, :] < states, scores, -float('inf'))
@@ -146,6 +153,10 @@ if triton is not None:
                 result = tl.full((tile,), 0., tl.float32)
         else:
             if pos < run_length:
+                previous = tl.load(messages + (run * width + pos - 1) * states + all_states,
+                                   all_states < states, other=-float('inf'))
+                center = tl.max(previous, axis=0)
+                center = tl.where(center == -float('inf'), 0., center)
                 running_max = tl.full((tile,), -float('inf'), tl.float32)
                 running_sum = tl.full((tile,), 0., tl.float32)
                 for chunk in range((states + 127) // 128):
@@ -156,7 +167,7 @@ if triton is not None:
                                         vocab, capacity)
                     incoming = tl.load(messages + (run * width + pos - 1) * states + reduction_states,
                                        reduction_states < states, other=-float('inf'))
-                    scores += incoming[:, None]
+                    scores += (incoming - center)[:, None]
                     scores = tl.where(reduction_states[:, None] < states, scores, -float('inf'))
                     block_max = tl.max(scores, axis=0)
                     next_max = tl.maximum(running_max, block_max)

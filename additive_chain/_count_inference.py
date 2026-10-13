@@ -153,7 +153,8 @@ def infer_nina_count(candidates, potential, generator=None, *, segment_batch_siz
             values = nf._sample_with_noise(alpha, factors, rows, starts, lengths, noise)
         else:
             beta = nf._messages(unary, factors, rows, starts, lengths, backward=True)
-            values = alpha + beta - torch.logsumexp(alpha[:, -1], -1)[:, None, None]
+            # Messages have arbitrary position-wise centers, not raw logZ.
+            values = torch.log_softmax(alpha + beta, -1)
         batches = rows[:, None].expand_as(positions)
         result[batches[valid], positions[valid]] = values[valid]
     return result

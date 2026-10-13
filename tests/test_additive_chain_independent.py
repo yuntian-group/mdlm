@@ -75,7 +75,7 @@ def test_no_pair_scores_means_factorized_distribution():
     h = torch.randn(1,4,4)
     unary = add_independent_residual(torch.randn(1,4,3),ids,h,head)
     pair = torch.zeros(1,3,3,3)
-    torch.testing.assert_close(log_partition(unary,pair),unary.logsumexp(-1).sum(-1))
+    torch.testing.assert_close(log_partition(unary,pair),unary.double().logsumexp(-1).sum(-1))
     # Increasing head capacity cannot introduce pair dependence by itself.
     probabilities = marginals(unary,pair,return_edges=False).node
     torch.testing.assert_close(probabilities,unary.softmax(-1))

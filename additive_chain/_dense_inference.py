@@ -206,6 +206,12 @@ if triton is not None:
         start = tl.load(starts + run).to(tl.int64)
         if backward:
             if pos < run_length - 1:
+                # One center over ALL states, shared by every output tile.
+                # Local reduction shifts alone do not stop O(length) offsets.
+                previous = tl.load(messages + (run * width + pos + 1) * states + all_states,
+                                   all_states < states, other=-float('inf'))
+                center = tl.max(previous, axis=0)
+                center = tl.where(center == -float('inf'), 0., center)
                 running_max = tl.full((tile,), -float('inf'), tl.float32)
                 running_sum = tl.full((tile,), 0., tl.float32)
                 for chunk in range((states + 127) // 128):
@@ -214,6 +220,7 @@ if triton is not None:
                                         original_length, states, vocab)
                     nxt = (run * width + pos + 1) * states + reduction
                     incoming = tl.load(messages + nxt, reduction < states, other=-float('inf'))
+                    incoming = incoming - center
                     incoming += tl.load(unary + nxt, reduction < states, other=-float('inf'))
                     scores += incoming[None, :]
                     scores = tl.where(reduction[None, :] < states, scores, -float('inf'))
@@ -228,6 +235,10 @@ if triton is not None:
                 result = tl.full((tile,), 0., tl.float32)
         else:
             if pos < run_length:
+                previous = tl.load(messages + (run * width + pos - 1) * states + all_states,
+                                   all_states < states, other=-float('inf'))
+                center = tl.max(previous, axis=0)
+                center = tl.where(center == -float('inf'), 0., center)
                 running_max = tl.full((tile,), -float('inf'), tl.float32)
                 running_sum = tl.full((tile,), 0., tl.float32)
                 for chunk in range((states + 127) // 128):
@@ -236,7 +247,7 @@ if triton is not None:
                                         original_length, states, vocab)
                     incoming = tl.load(messages + (run * width + pos - 1) * states + reduction,
                                        reduction < states, other=-float('inf'))
-                    scores += incoming[:, None]
+                    scores += (incoming - center)[:, None]
                     scores = tl.where(reduction[:, None] < states, scores, -float('inf'))
                     block_max = tl.max(scores, axis=0)
                     next_max = tl.maximum(running_max, block_max)
@@ -349,7 +360,8 @@ def infer_dense_count(candidates, potential, generator=None, *, table=None,
             values = dense_sample_with_noise(alpha, factors, rows, starts, lengths, noise)
         else:
             beta = dense_messages(unary, factors, rows, starts, lengths, backward=True)
-            values = alpha + beta - torch.logsumexp(alpha[:, -1], -1)[:, None, None]
+            # Messages have arbitrary position-wise centers, not raw logZ.
+            values = torch.log_softmax(alpha + beta, -1)
         batches = rows[:, None].expand_as(positions)
         result[batches[valid], positions[valid]] = values[valid]
     return result

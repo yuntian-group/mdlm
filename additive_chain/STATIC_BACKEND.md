@@ -48,8 +48,9 @@ cache.close()
 `static_count_marginals` and `static_global_marginals` return normalized
 single-site probabilities under those same chains. Sampling their sites
 independently would be a different decoding control, not joint sampling.
-The public count-marginal wrapper normalizes locally; the joint sampler's
-noise and recurrence are unaffected.
+Both raw and public marginal helpers normalize locally. Forward and backward
+recurrences center their incoming messages over all candidate states; this is
+also required for joint sampling, not just for marginal mass normalization.
 
 Global weights must be frozen FP32, vocabulary-matched, and rank at most128,
 matching the on-demand backend's current factor interface. Construction uses
@@ -96,6 +97,13 @@ does not establish bitwise trajectory parity on a new GPU. Integer address
 arithmetic promotes to int64 **before** multiplying by vocabulary size:
 `50,258**2` exceeds signed int32.
 
+The centered recurrence removes one common maximum before each message is
+used. It runs inside the existing kernel launch and never centers output tiles
+separately. The returned messages have position-dependent offsets and must not
+be used as raw partition values. The numerical-stability tests compare long
+chains and cross-tile candidate supports against an independent FP64 oracle,
+including fixed-noise samples and the low-level marginal APIs.
+
 ```bash
 python -m pytest -q tests/test_additive_chain_*.py
 ```
@@ -104,11 +112,12 @@ Tests cover score composition, normalization, enumeration, visible boundaries,
 padding, exact zero dispatch, memory budgets, mutation guards and large token
 addresses. CUDA tests include caps500/1000/2000, long small-cap chains and
 same-noise draws. CUDA skips must be reported explicitly. This portable static
-module's two static test modules passed **21 tests, including 8 CUDA tests, with
+module's two static test modules, before the centered-message revision, passed
+**21 tests, including 8 CUDA tests, with
 no skips on an NVIDIA A100**. These are unit-scale numerical and sampling
 checks; those unit tests did not allocate the real `50,258 x 50,258` table.
 
-A separate actual-MDLM A100 diagnostic did construct the full tables and
+A separate historical actual-MDLM A100 diagnostic did construct the full tables and
 matched the public and frozen research implementations bitwise for count,
 count-plus-global and cached-contextual decoding. Each method used one fixed
 raw attempt at length 1,024, 32 steps and K500. Candidate supports, unaries,
@@ -116,7 +125,9 @@ active factors, sampled tokens and proposal RNG also matched at every step.
 See [GENERATION.md](GENERATION.md#tests-and-current-validation-scope) for the
 exact coefficients and scope. This was not a quality or timing evaluation;
 fresh end-to-end measurement is still required before attributing a benchmark
-speed to this package.
+speed to this package. Those historical checks compared implementations that
+shared the old recurrence; they do not certify the centered-message revision
+or replace the independent long-chain FP64 tests.
 
 ## Attribution
 

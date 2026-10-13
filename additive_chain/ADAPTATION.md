@@ -127,6 +127,11 @@ masked. `draw_corruption` is also available independently for schedule checks.
 The corruption draw order, fast support extraction, selected-only augmentation,
 FP32 pair/unary DP inputs, coefficient-one residual, and per-selected-token
 normalization follow the adaptation formulation used in the experiments.
+Messages are normalized at every position. Local normalization offsets and
+path-score sums accumulate in FP64 **before** subtracting partition totals;
+loss scalars are FP64 while model gradients retain the score dtype. This avoids
+cancellation from accumulating long-chain offsets in FP32. It does not make
+the underlying FP32 local message computations identical to FP64 inference.
 The count lookup here uses portable chunked `searchsorted`, not a Triton hash
 lookup; the DP uses the public exact dense reference, not an optimized training
 backend. Low-rank pair products use the public composition function. These

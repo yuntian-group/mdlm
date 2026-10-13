@@ -60,6 +60,12 @@ There is no additional softmax, positivity transform or implicit rank scaling.
   Learned factors must be finite FP32 tensors. Sampling perturbations are
   FP64. The law is exact on the retained support up to numerical arithmetic;
   different reduction/chunking orders can change draws from a fixed seed.
+- Each recurrence subtracts the incoming message's maximum across **all**
+  candidate states, shared by every output tile. This prevents common offsets
+  from growing with span length. Marginals use a separate local log-softmax;
+  normalizing only the final output does not repair precision lost earlier.
+  Messages are centered scores, not raw log-partition values. The sampler
+  retains the same shape/order of FP64 random draws.
 - Zero-initialized/zero-coefficient learned factors route through the count
   recurrence. This preserves count-only nesting. A uniform count potential
   is law-equivalent to independent unaries, but FFBS need not consume the same

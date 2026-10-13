@@ -13,6 +13,11 @@ lengths and O(BLK) forward messages; pair gradients still require O(BLK^2).
 This is a correctness/training reference, NOT a fused high-speed GPU backend.
 Use memory_efficient=False for higher-order derivatives. marginals() uses
 ordinary autograd and is itself differentiable (including marginal losses).
+
+Messages and input gradients retain the score dtype. Partition offsets and path
+score reductions are accumulated in float64, including for float32 inputs:
+casting an already rounded full-chain total afterwards cannot recover a small
+revealed-block likelihood obtained by subtracting two large partitions.
 """
 from __future__ import annotations
 
@@ -69,7 +74,7 @@ def _normalize(value):
 
 def _forward(unary, pair, lengths):
     alpha, scale = _normalize(unary[:, 0])
-    messages, logz = [alpha], scale
+    messages, logz = [alpha], scale.to(torch.float64)
     for pos in range(1, unary.shape[1]):
         active = lengths > pos
         edge = torch.where(active[:, None, None], pair[:, pos-1], 0.)
@@ -77,7 +82,7 @@ def _forward(unary, pair, lengths):
         proposal = emission + _safe_logsumexp(alpha[:, :, None] + edge, -2)
         proposal, scale = _normalize(proposal)
         alpha = torch.where(active[:, None], proposal, alpha)
-        logz = logz + torch.where(active, scale, 0.)
+        logz = logz + torch.where(active, scale, 0.).to(torch.float64)
         messages.append(alpha)
     if not bool(torch.isfinite(logz).all()):
         raise ValueError('Every active chain must have at least one finite complete path')
@@ -130,6 +135,9 @@ class _MemoryEfficientLogPartition(torch.autograd.Function):
     @once_differentiable
     def backward(ctx, grad_logz):
         unary, pair, lengths, alpha = ctx.saved_tensors
+        # Preserve the first-order score-gradient interface. Higher precision
+        # scalar bookkeeping must not promote the dense pair-gradient work.
+        grad_logz = grad_logz.to(unary.dtype)
         beta = _backward(unary, pair, lengths)
         grad_unary, grad_pair = None, None
         if ctx.needs_input_grad[0]:
@@ -146,7 +154,7 @@ class _MemoryEfficientLogPartition(torch.autograd.Function):
 
 
 def log_partition(unary, pair, lengths=None, *, memory_efficient=True):
-    """Return logZ[B]; default backward is exact first-order marginals."""
+    """Return float64 logZ[B]; messages/score gradients keep the input dtype."""
     lengths = _validate(unary, pair, lengths)
     if memory_efficient:
         return _MemoryEfficientLogPartition.apply(unary, pair, lengths)
@@ -174,11 +182,12 @@ def path_score(unary, pair, states, lengths=None):
     if bool((((states < 0) | (states >= unary.shape[-1])) & active).any()):
         raise ValueError('Active path slots must be in 0..K-1')
     safe = states.clamp(0, unary.shape[-1]-1)
-    score = torch.where(active, unary.gather(-1, safe[..., None]).squeeze(-1), 0.).sum(-1)
+    score = torch.where(active, unary.gather(-1, safe[..., None]).squeeze(-1), 0.).sum(
+        -1, dtype=torch.float64)
     if pair.shape[1]:
         offsets = safe[:, :-1] * unary.shape[-1] + safe[:, 1:]
         selected = pair.flatten(-2).gather(-1, offsets[..., None]).squeeze(-1)
-        score = score + torch.where(active[:, 1:], selected, 0.).sum(-1)
+        score = score + torch.where(active[:, 1:], selected, 0.).sum(-1, dtype=torch.float64)
     return score
 
 

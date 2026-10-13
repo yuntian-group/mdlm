@@ -158,6 +158,11 @@ def block_reveal_nll(unary, pair, gold_slots, reveal_mask, lengths=None, *, memo
     numerator's selected R unaries are clamped. No hidden gold is conditioned
     on. Two custom logZ backpropagations safely sum gradients on shared scores.
     A selected target absent from support is an error, never silently dropped.
+
+    Both logZ calls accumulate each local normalizer in float64 before this
+    subtraction. The loss scalars are float64; normalized messages and score
+    gradients still use the input dtype. This does not upgrade input scores or
+    claim that float32 message arithmetic is identical to a float64 oracle.
     """
     _mask(reveal_mask, unary.shape[:2], unary.device, 'reveal_mask')
     if (gold_slots.shape != unary.shape[:2] or gold_slots.dtype != torch.long
@@ -176,7 +181,7 @@ def block_reveal_nll(unary, pair, gold_slots, reveal_mask, lengths=None, *, memo
     original_logz = log_partition(unary, pair, lengths, memory_efficient=memory_efficient)
     selected_logz = log_partition(clamped, pair, lengths, memory_efficient=memory_efficient)
     per_sequence = original_logz - selected_logz
-    total = per_sequence.sum()
+    total = per_sequence.sum(dtype=torch.float64)
     tokens = reveal_mask.sum()
     return BlockRevealLoss(per_sequence, total, total / tokens.clamp_min(1), tokens,
                            original_logz, selected_logz)

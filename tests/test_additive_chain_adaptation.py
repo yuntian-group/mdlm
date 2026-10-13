@@ -84,7 +84,7 @@ def test_one_masked_forward_selected_only_augmentation_and_unrevealed_bridge():
     assert result.support.candidate_ids[0, 1].tolist() == [2, 5, 5]
     assert result.support.candidate_ids[0, 2].tolist() == [0, 1, 5]
     assert result.support.gold_slots.tolist() == [[2, -1, -1, 2]]
-    expected = enumerate_loss(result.support.log_unary[0].float(), result.pair_scores[0],
+    expected = enumerate_loss(result.support.log_unary[0].double(), result.pair_scores[0].double(),
                               result.support.gold_slots[0], reveal[0])
     torch.testing.assert_close(result.loss, expected / 2, atol=2e-6, rtol=2e-6)
     other = clean.clone(); other[0, 2] = 3
@@ -127,7 +127,7 @@ def test_common_count_log_scale_is_omitted_and_zero_strength_recovers_independen
     assert torch.equal(offset, result.pair_scores)
     selected = result.support.log_unary.float().gather(-1,
         result.support.gold_slots.clamp_min(0)[..., None]).squeeze(-1)
-    expected = -selected[reveal].sum() / reveal.sum()
+    expected = -selected[reveal].sum(dtype=torch.float64) / reveal.sum()
     torch.testing.assert_close(result.loss, expected, atol=2e-6, rtol=2e-6)
 
 
