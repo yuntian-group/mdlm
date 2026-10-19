@@ -6,7 +6,7 @@ tokens, training, or external quality scorer is involved. See GENERATION.md.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 import math
 import time
@@ -34,6 +34,14 @@ def _coefficient(value):
 def synchronize(device):
     if torch.device(device).type == "cuda":
         torch.cuda.synchronize(device)
+
+
+def generator_device(generator):
+    """Resolve PyTorch versions that report current-device generators as 'cuda'."""
+    device = generator.device
+    if device.type == "cuda" and device.index is None:
+        return torch.device("cuda", torch.cuda.current_device())
+    return device
 
 
 def stream_seed(namespace, attempt_id, stream, *, window_id=0):
@@ -96,7 +104,7 @@ class ChainDecoder:
                  contextual_strength=0., sampling="joint", backend="fused",
                  top_k=500, nucleus_p=.9, fast_candidates=False,
                  prune_irrelevant=True, segment_batch_size=32,
-                 strict_unary_validation=False, independent_control=None):
+                 strict_unary_validation=False, independent_control=None, temperature=1.):
         _require(type(mask_id) is int and mask_id > 0, "Mask must be the last vocabulary ID")
         _require(sampling in ("joint", "own-marginal"), "Unknown sampling selector")
         _require(backend in ("fused", "static"), "Choose fused or explicit static backend")
@@ -108,12 +116,16 @@ class ChainDecoder:
         _require(type(segment_batch_size) is int and segment_batch_size > 0,
                  "segment_batch_size must be positive")
         _require(type(strict_unary_validation) is bool, "strict_unary_validation must be bool")
+        _require(type(temperature) in (int, float) and math.isfinite(temperature)
+                 and temperature > 0, "Temperature must be finite and positive")
+        self.temperature = float(temperature)
         self.mask_id = mask_id
         self.device = torch.empty(0, device=device).device
-        self.count_strength = _coefficient(count_strength)
+        # Temper the complete chain energy, after ORIGINAL candidate selection.
+        self.count_strength = _coefficient(count_strength) / self.temperature
         self.count_mode, self.smoothing = count_mode, float(smoothing)
-        self.global_strength = _coefficient(global_strength)
-        self.contextual_strength = _coefficient(contextual_strength)
+        self.global_strength = _coefficient(global_strength) / self.temperature
+        self.contextual_strength = _coefficient(contextual_strength) / self.temperature
         self.global_head, self.contextual_head = global_head, contextual_head
         self.sampling, self.backend = sampling, backend
         self.top_k, self.nucleus_p = top_k, float(nucleus_p)
@@ -126,6 +138,8 @@ class ChainDecoder:
             _require(isinstance(independent_control, IndependentControl),
                      "Expected an IndependentControl or None")
             independent_control.validate_for(vocab_size=mask_id + 1, device=self.device)
+            _require(not (self.temperature != 1. and independent_control.active),
+                     "Do not combine two temperature/control interfaces")
             _require(not (self.active and independent_control.active),
                      "Independent controls require zero pair strengths; they do not modify a chain")
         self.independent_control = independent_control
@@ -193,8 +207,12 @@ class ChainDecoder:
         extract = extract_compact_candidates
         if self.fast_candidates:
             from .fast_candidates import extract_compact_candidates as extract
-        return extract(log_probs, tokens, mask_id=self.mask_id,
-                       nucleus_p=self.nucleus_p, top_k=self.top_k)
+        candidates = extract(log_probs, tokens, mask_id=self.mask_id,
+                             nucleus_p=self.nucleus_p, top_k=self.top_k)
+        if self.temperature != 1.:
+            unary = candidates.log_unary / self.temperature
+            candidates = replace(candidates, log_unary=unary - unary.logsumexp(-1, keepdim=True))
+        return candidates
 
     @torch.no_grad()
     def reveal(self, output, tokens, reveal_mask, generator):
@@ -284,7 +302,8 @@ def sample_window(tokens, forward, decoder, *, steps, reveal_generator, proposal
     _require(isinstance(reveal_generator, torch.Generator)
              and isinstance(proposal_generator, torch.Generator)
              and reveal_generator is not proposal_generator, "Two distinct explicit generators required")
-    _require(reveal_generator.device == tokens.device and proposal_generator.device == tokens.device,
+    _require(generator_device(reveal_generator) == tokens.device
+             and generator_device(proposal_generator) == tokens.device,
              "Generators and tokens must share a device")
     current, counts, schedule, nfes = tokens.clone(), [], [], 0
     for index in range(steps):
