@@ -70,6 +70,19 @@ edges. Intermediate unrevealed target positions remain part of the chain.
 Outputs include every generated translation, corpus SacreBLEU and chrF,
 actual forward counts, predicted lengths and elapsed time. Pilot timings
 include first-call warmup and are explicitly not final speed measurements.
-COMET, controlled batch-size timing, learned-head comparisons and the
-same-input masked-span analysis are subsequent evaluations, not results
-established by running this pilot.
+`iwslt_readout` compares corpus BLEU and chrF with paired sentence-bootstrap
+intervals. It rejects mixed checkpoint identities or mismatched sentences.
+These development-set intervals describe the pilot, not a final test claim.
+
+`iwslt_spans` measures the separate fixed-input comparison: choose development
+sentences and a 2-, 4-, or 8-token target span before model scoring, then mask
+that span while leaving the German source and other English words visible.
+For identical candidate sets and CRF scores, it compares the gold span's
+joint probability with the product of its exact token marginals, and saves
+draws from both distributions. Immediate visible target neighbors are clamped;
+there is no source-to-target CRF edge. Excluded gold tokens have probability
+zero under both methods and are not removed from the population. This is a
+reconstruction diagnostic with reference context, not free translation.
+
+COMET, controlled batch-size timing and learned-head comparisons are subsequent
+evaluations, not results established by running this pilot.
