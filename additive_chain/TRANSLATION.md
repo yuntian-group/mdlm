@@ -86,3 +86,27 @@ reconstruction diagnostic with reference context, not free translation.
 
 COMET, controlled batch-size timing and learned-head comparisons are subsequent
 evaluations, not results established by running this pilot.
+
+## Full-development confirmation and frozen test comparison
+
+`iwslt_confirm decode --split dev --steps 8` (and `--steps 32`) evaluates
+all 7,283 development examples, using the same checkpoint and decoding code
+as the pilot. The shortlist contains baseline temperatures .85 and 1, and
+CRF strengths .1 and .2 at temperature 1, each with joint and own-marginal
+sampling. Development uses decoding seed 101.
+
+After both step counts finish, `iwslt_confirm freeze` checks every output,
+recomputes development BLEU and writes `selection.json`. At each step count,
+it selects the baseline temperature by BLEU and a common CRF strength by the
+mean BLEU of the two samplers. Ties favor lower temperature or weaker strength.
+The selection includes checkpoint, data, code and development-output hashes.
+An existing selection cannot be replaced by a different one.
+
+`iwslt_confirm decode --split test --selection /results/frozen/selection.json`
+then evaluates all 6,750 test examples with the frozen settings and decoding
+seeds 101, 202 and 303. The baseline, joint CRF and own-marginal CRF share the
+same model, length predictor and inputs. Joint and own-marginal runs differ
+only in their sampling law. Test results cannot change the selected settings.
+Each completed cell has a checksum; resuming preserves completed outputs and
+rejects changed inputs or incomplete receipts. Development and test outputs
+are separate from the original pilot.
