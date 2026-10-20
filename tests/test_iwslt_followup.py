@@ -128,3 +128,59 @@ def test_receipt_checks_output_hash_and_rows(tmp_path):
     path.write_text(path.read_text() + " ")
     with pytest.raises(ValueError, match="hash"):
         verify_output(path, identity)
+
+
+def test_freeze_reuses_checked_development_and_preserves_old_selection(tmp_path, monkeypatch):
+    import json
+    from sacrebleu.metrics import BLEU
+    from additive_chain import iwslt_confirm as old, iwslt_followup as new
+    monkeypatch.setitem(old.COUNTS, "dev", 2)
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / "dev.jsonl").write_text('\n'.join(json.dumps(dict(id=str(i))) for i in range(2)) + '\n')
+    atomic_json(data / "manifest.json", dict(splits=dict(dev=dict(sha256=file_sha256(data / "dev.jsonl")))))
+    trained = tmp_path / "model.pt"
+    trained.write_bytes(b"test-only")
+    old_root, new_root = tmp_path / "old", tmp_path / "new"
+    ids = [r["id"] for r in old.ordered_rows(data, "dev")]
+    refs = ["this is the correct translation of this sentence"] * 2
+    model_sha, data_sha = file_sha256(trained), file_sha256(data / "manifest.json")
+    for steps in (8, 32):
+        for is_old, root, cells in ((True, old_root, old.dev_cells(steps)),
+                                    (False, new_root, new.calibration_cells(steps))):
+            folder = root / f"step-{steps}"
+            folder.mkdir(parents=True)
+            for cell in cells:
+                hyp = refs[0] if not is_old else "different words"
+                payload = dict(summary=dict(examples=2, bleu=BLEU(lowercase=True, tokenize="13a").corpus_score(
+                    [hyp]*2, [refs]).score),
+                    predictions=[dict(id=i, reference=ref, hypothesis=hyp) for i, ref in zip(ids, refs)])
+                if is_old:
+                    name = old.cell_name(cell)
+                    identity = dict(cell, split="dev", ids=ids, model_sha256=model_sha,
+                        data_sha256=data_sha, source_sha256=old.source_hashes(), selection_sha256=None)
+                else:
+                    name = new.output_name(cell)
+                    identity = dict(cell=cell, stage="calibration", split="dev", ids=ids,
+                        model_sha256=model_sha, data_sha256=data_sha,
+                        source_sha256=new.source_hashes(), selection_sha256=None)
+                path = folder / (name+".json")
+                atomic_json(path, payload)
+                atomic_json(folder / (name+"-identity.json"),
+                            dict(identity=identity, output_sha256=file_sha256(path)))
+            atomic_json(folder / "summary.json", dict(completed=len(cells), expected=len(cells)))
+    old.freeze(SimpleNamespace(data=data, trained=trained, development=old_root, output=tmp_path / "old-frozen"))
+    prior = tmp_path / "old-frozen/selection.json"
+    prior_sha = file_sha256(prior)
+    args = SimpleNamespace(data=data, trained=trained, previous_selection=prior,
+        previous_development=old_root, development=new_root, output=tmp_path / "new-frozen")
+    new.freeze(args)
+    new.freeze(args)
+    assert file_sha256(prior) == prior_sha
+    selection = old.read(args.output / "selection.json")
+    assert len(selection["cells"]) == 20
+    assert selection["selected"]["8"]["crf_temperature"] == .85
+    damaged = next((old_root / "step-8").glob("*-identity.json"))
+    damaged.write_text(damaged.read_text() + " ")
+    with pytest.raises(ValueError, match="receipt"):
+        new.freeze(args)
