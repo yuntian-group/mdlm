@@ -28,7 +28,9 @@ def source_hashes():
     from .iwslt_residual_assets import residual_source_hashes
     result = residual_source_hashes()
     for name in ("iwslt_residual_eval.py", "iwslt_followup.py", "generation.py",
-                 "iwslt_controls_readout.py", "iwslt_full_dev.py", "iwslt_length_refit.py"):
+                 "iwslt_controls_readout.py", "iwslt_full_dev.py", "iwslt_length_refit.py",
+                 "cuda.py", "_additive_kernels.py", "_count_inference.py",
+                 "_count_kernels.py"):
         result[name] = file_sha256(Path(__file__).parent / name)
     return result
 

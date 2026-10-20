@@ -83,10 +83,10 @@ if triton is not None:
         tl.store(output + index, score, index < size)
 
 
-    @triton.jit
+    @triton.jit(do_not_specialize=['original_length'])
     def _pair_tile(left, right, ids, keys, values, left_bg, right_bg,
                    original_row, edge_pos, a, b,
-                   original_length: tl.constexpr, states: tl.constexpr,
+                   original_length, states: tl.constexpr,
                    rank: tl.constexpr, rank_block: tl.constexpr,
                    kind: tl.constexpr, vocab: tl.constexpr,
                    capacity: tl.constexpr):
@@ -118,10 +118,10 @@ if triton is not None:
         return score
 
 
-    @triton.jit
+    @triton.jit(do_not_specialize=['original_length', 'pos', 'width'])
     def _message_kernel(unary, messages, left, right, ids, keys, values, left_bg, right_bg,
                         rows, starts, lengths, pos, width,
-                        original_length: tl.constexpr, states: tl.constexpr,
+                        original_length, states: tl.constexpr,
                         rank: tl.constexpr, rank_block: tl.constexpr, kind: tl.constexpr,
                         vocab: tl.constexpr, capacity: tl.constexpr,
                         state_block: tl.constexpr, tile: tl.constexpr, backward: tl.constexpr):
@@ -200,10 +200,10 @@ if triton is not None:
         tl.store(messages + (run * width + pos) * states + selected, result, selected < states)
 
 
-    @triton.jit
+    @triton.jit(do_not_specialize=['original_length', 'width'])
     def _sample_kernel(alpha, noise, output, invalid, left, right, ids, keys, values,
                        left_bg, right_bg, rows, starts, lengths, width,
-                       original_length: tl.constexpr, states: tl.constexpr,
+                       original_length, states: tl.constexpr,
                        rank: tl.constexpr, rank_block: tl.constexpr, kind: tl.constexpr,
                        vocab: tl.constexpr, capacity: tl.constexpr,
                        state_block: tl.constexpr):
