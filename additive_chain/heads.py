@@ -143,9 +143,13 @@ class ContextualAdditiveHead(nn.Module):
             # tables and B-by-L-by-K-by-R factors instead, with exact gradients.
             left_table = self.left_token(self.token_embeddings)
             right_table = self.right_token(self.token_embeddings)
-            left = (left_table[safe] * (1. + self.left_gate(context)[..., None, :])
+            # Embedding backward groups repeated candidate IDs, avoiding
+            # contended atomic additions from the many padded candidate slots.
+            left = (torch.nn.functional.embedding(safe, left_table)
+                    * (1. + self.left_gate(context)[..., None, :])
                     + self.left_shift(context)[..., None, :])
-            right = (right_table[safe] * (1. + self.right_gate(context)[..., None, :])
+            right = (torch.nn.functional.embedding(safe, right_table)
+                     * (1. + self.right_gate(context)[..., None, :])
                      + self.right_shift(context)[..., None, :])
         return (left * valid).contiguous(), (right * valid).contiguous()
 
