@@ -1,5 +1,6 @@
 import json
 import math
+from types import SimpleNamespace
 
 import pytest
 
@@ -67,3 +68,43 @@ def test_output_check_rejects_missing_rows_and_modified_bytes(tmp_path):
     atomic_json(receipt, dict(identity=identity, output_sha256=file_sha256(output)))
     with pytest.raises(ValueError, match='Incomplete'):
         check_output(tmp_path, cell, identity)
+
+
+def test_freeze_validates_full_dev_and_does_not_require_test_data(tmp_path, monkeypatch):
+    metric_class = pytest.importorskip('sacrebleu.metrics').BLEU
+    from additive_chain import iwslt_confirm as confirm
+    monkeypatch.setitem(confirm.COUNTS, 'dev', 2)
+    data = tmp_path / 'data'
+    data.mkdir()
+    (data / 'dev.jsonl').write_text('\n'.join(json.dumps(dict(id=str(i))) for i in range(2)) + '\n')
+    atomic_json(data / 'manifest.json', dict(splits=dict(dev=dict(sha256=file_sha256(data / 'dev.jsonl')))))
+    trained = tmp_path / 'model.pt'
+    trained.write_bytes(b'fixture model identity only')
+    development_root = tmp_path / 'dev'
+    ids = [r['id'] for r in confirm.ordered_rows(data, 'dev')]
+    for steps in (8, 32):
+        root = development_root / f'step-{steps}'
+        root.mkdir(parents=True)
+        for cell in dev_cells(steps):
+            reference = 'this is the correct translation of a sentence'
+            hyp = reference if cell['strength'] == .2 or cell['temperature'] == .85 else 'wrong'
+            rows = [dict(id=i, reference=reference, hypothesis=hyp) for i in ids]
+            bleu = metric_class(lowercase=True, tokenize='13a').corpus_score([hyp]*2, [[reference]*2]).score
+            identity = dict(cell, split='dev', ids=ids, model_sha256=file_sha256(trained),
+                            data_sha256=file_sha256(data / 'manifest.json'),
+                            source_sha256=confirm.source_hashes(), selection_sha256=None)
+            path = root / (cell_name(cell) + '.json')
+            atomic_json(path, dict(predictions=rows, summary=dict(examples=2, bleu=bleu)))
+            atomic_json(root / (cell_name(cell) + '-identity.json'),
+                        dict(identity=identity, output_sha256=file_sha256(path)))
+        atomic_json(root / 'summary.json', dict(completed=6, expected=6))
+    args = SimpleNamespace(data=data, trained=trained, development=development_root, output=tmp_path / 'frozen')
+    confirm.freeze(args)
+    selection = confirm.read(args.output / 'selection.json')
+    assert selection['selected']['8']['strength'] == .2
+    assert selection['selected']['32']['baseline_temperature'] == .85
+    assert len(selection['development_artifacts']) == 24
+    confirm.freeze(args)
+    atomic_json(args.output / 'selection.json', dict(selection, selected={}))
+    with pytest.raises(ValueError, match='Refusing to change'):
+        confirm.freeze(args)

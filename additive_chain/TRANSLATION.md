@@ -110,3 +110,10 @@ only in their sampling law. Test results cannot change the selected settings.
 Each completed cell has a checksum; resuming preserves completed outputs and
 rejects changed inputs or incomplete receipts. Development and test outputs
 are separate from the original pilot.
+
+`iwslt_test_readout` validates all 18 test outputs against the frozen settings
+and recomputes BLEU and chrF. It reports each decoding seed and their mean.
+Paired bootstrap intervals use the same resampled sentence indices for every
+method and seed; decoding the same sentence three times does not create three
+independent test examples. The intervals describe sentence uncertainty for
+this trained model, not variation across independently trained models.
