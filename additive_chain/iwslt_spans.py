@@ -76,14 +76,16 @@ def run(args):
         raise ValueError("Training counts changed")
     counts = torch.load(args.data / "counts.pt", weights_only=True)
     decoder = ChainDecoder(mask_id=MASK_ID, device="cuda", count_statistics=counts,
-                           count_strength=args.strength, temperature=args.temperature)
+                           count_strength=args.strength, temperature=args.temperature,
+                           top_k=args.top_k, nucleus_p=args.top_p)
     for length in args.span_lengths:
         selected, eligible = span_population(rows, length, args.limit, args.seed)
         identity = dict(model_sha256=model_sha, data_sha256=file_sha256(args.data / "manifest.json"),
             length=length, eligible=eligible, selected=[dict(id=r["id"], start=s) for r, s in selected],
             strength=args.strength, temperature=args.temperature, seed=args.seed,
+            top_k=args.top_k, top_p=args.top_p,
             source_sha256={p: file_sha256(Path(__file__).parent / p) for p in
-                ("iwslt_spans.py", "translation.py", "generation.py", "chain.py")},
+                ("iwslt_spans.py", "translation.py", "generation.py", "chain.py", "counts.py", "candidates.py")},
             protocol="Same masked target span, visible gold context; unchanged model-derived candidates; unsupported gold has zero probability")
         path = args.output / f"span-{length}.json"
         if path.exists():
@@ -104,8 +106,13 @@ def run(args):
             indices = slice(target_start + lo, target_start + hi)
             candidates = decoder._candidates(output.log_probs[:, indices], tokens[:, indices])
             result = compare_span(candidates, decoder.potential, batch.tokens[:, indices], seed=args.seed + i)
+            gold = batch.tokens[:, target_start + start:target_start + start + length]
+            full = output.log_probs[:, target_start + start:target_start + start + length, :MASK_ID]
+            gold_logp = full.gather(-1, gold[..., None])
+            ranks = (full > gold_logp).sum(-1) + 1
             records.append(dict(id=row["id"], start=start, span_length=length,
-                                left_boundary=start - lo, **result))
+                                left_boundary=start - lo, gold_full_vocab_ranks=ranks[0].tolist(),
+                                gold_full_vocab_log_probabilities=gold_logp[0, :, 0].tolist(), **result))
             if (i + 1) % 50 == 0:
                 log("span_progress", length=length, completed=i + 1, total=len(selected))
         if file_sha256(args.trained) != model_sha:
@@ -129,6 +136,8 @@ def main():
     p.add_argument("--strength", type=float, required=True)
     p.add_argument("--temperature", type=float, default=1.)
     p.add_argument("--seed", type=int, default=101)
+    p.add_argument("--top-k", type=int, default=500)
+    p.add_argument("--top-p", type=float, default=.9)
     args = p.parse_args()
     if args.limit < 1 or any(x < 1 for x in args.span_lengths):
         p.error("Positive population size and span lengths required")

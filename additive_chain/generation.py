@@ -287,7 +287,7 @@ class ChainDecoder:
 
 
 @torch.no_grad()
-def sample_window(tokens, forward, decoder, *, steps, reveal_generator, proposal_generator):
+def sample_window(tokens, forward, decoder, *, steps, reveal_generator, proposal_generator, observer=None):
     """The original finite linear-mask schedule, with no extra cleanup pass.
 
     FP64 reveal uniforms are drawn for ALL positions at EVERY scheduled step.
@@ -316,6 +316,8 @@ def sample_window(tokens, forward, decoder, *, steps, reveal_generator, proposal
         if number:
             output = forward(current, t)
             nfes += 1
+            if observer is not None:
+                observer(current, output, reveal)
             current = decoder.reveal(output, current, reveal, proposal_generator)
         counts.append(number)
         schedule.append({"step": index + 1, "t": t, "s": s, "revealed": number,

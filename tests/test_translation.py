@@ -98,6 +98,28 @@ def test_context_overflow_not_silently_truncated():
         collate_pairs([dict(source_ids=[1] * 1020, target_ids=[2, 3])])
 
 
+def test_reference_length_requires_explicit_override_and_is_labeled():
+    model = tiny().eval()
+    head = lambda features: torch.tensor([[0., 0., 0., 10., 0.]])
+    decoder = ChainDecoder(mask_id=MASK_ID, top_k=2, nucleus_p=1.)
+    decoder.prepare()
+    row = dict(source_ids=[4, 5], target_ids=[6] * 20)
+    try:
+        _, ordinary = translate_one(model, row, head, decoder, steps=2, seed=1, example_id=0)
+        _, oracle = translate_one(model, row, head, decoder, steps=2, seed=1,
+                                  example_id=0, length_override=5)
+        assert ordinary["predicted_length"] == 3
+        assert "length_mode" not in ordinary
+        assert oracle["predicted_length"] == oracle["requested_reference_length"] == 5
+        assert oracle["source_predicted_length"] == 3
+        assert oracle["length_mode"] == "reference-diagnostic"
+        with pytest.raises(ValueError, match="context"):
+            translate_one(model, row, head, decoder, steps=2, seed=1,
+                          example_id=0, length_override=1024)
+    finally:
+        decoder.close()
+
+
 def test_fairseq_text_filters():
     assert unix_lines("one\x85sentence\nnext\n") == ["one\x85sentence", "next"]
     assert filter_training(["<url>x</url>", "<talkid>1</talkid>", "<title>hello</title>", "text"]) == ["hello", "text"]

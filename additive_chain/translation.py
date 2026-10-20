@@ -150,13 +150,19 @@ class LengthPredictor(nn.Module):
 
 
 @torch.no_grad()
-def translate_one(model, row, length_head, decoder, *, steps, seed, example_id):
+def translate_one(model, row, length_head, decoder, *, steps, seed, example_id,
+                  length_override=None, observer=None):
     """Only source IDs enter generation. Gold target IDs are deliberately ignored."""
     device = next(model.parameters()).device
     source = {"source_ids": row["source_ids"]}
     features = model.source_features([source], device)
-    length = int(length_head(features).argmax(-1).item())
+    predicted_length = int(length_head(features).argmax(-1).item())
+    if length_override is not None and (type(length_override) is not int or length_override < 1):
+        raise ValueError("An explicit diagnostic length must be a positive integer")
+    length = predicted_length if length_override is None else length_override
     prefix = [EOS_ID] + list(source["source_ids"]) + [EOS_ID]
+    if length_override is not None and length_override > CONTEXT_LENGTH - len(prefix):
+        raise ValueError("Diagnostic reference length exceeds context")
     length = max(1, min(length, CONTEXT_LENGTH - len(prefix)))
     prefix = torch.tensor([prefix], device=device)
     target = torch.full((1, length), MASK_ID, dtype=torch.long, device=device)
@@ -170,8 +176,13 @@ def translate_one(model, row, length_head, decoder, *, steps, seed, example_id):
     generators = {k: torch.Generator(device=device).manual_seed(
         stream_seed(f"iwslt-{seed}", example_id, k)) for k in ("reveal", "proposal")}
     result = sample_window(target, forward, decoder, steps=steps,
-        reveal_generator=generators["reveal"], proposal_generator=generators["proposal"])
+        reveal_generator=generators["reveal"], proposal_generator=generators["proposal"],
+        observer=observer)
     ids = result.tokens[0].tolist()
     if EOS_ID in ids:
         ids = ids[:ids.index(EOS_ID)]
-    return ids, dict(result.stats, predicted_length=length, length_prediction_forwards=1)
+    stats = dict(result.stats, predicted_length=length, length_prediction_forwards=1)
+    if length_override is not None:
+        stats.update(length_mode="reference-diagnostic", source_predicted_length=predicted_length,
+                     requested_reference_length=length_override)
+    return ids, stats
