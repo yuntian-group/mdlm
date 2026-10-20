@@ -102,6 +102,75 @@ def test_cuda_zero_residual_exact_count_draws_and_messages(width, length):
 
 
 @cuda
+@pytest.mark.parametrize('width,length', [(3, 7), (500, 7)])
+@torch.no_grad()
+def test_cuda_zero_context_preserves_nonzero_global_messages_draws_and_rng(width, length):
+    """Appending zero context factors must preserve the rank64 parent exactly."""
+    old.clear_count_cache()
+    candidates, potential = fixture(width, length, 'cuda')
+    generator = torch.Generator(device='cuda').manual_seed(337)
+    global_head = GlobalAdditiveHead(candidates.vocab_size, rank=64).cuda()
+    for parameter in global_head.parameters():
+        parameter.copy_(torch.randn(parameter.shape, device='cuda', generator=generator) * .05)
+    local_head = ContextualAdditiveHead(
+        torch.randn(candidates.vocab_size, 6, device='cuda', generator=generator),
+        hidden_size=4, rank=64, context_size=8)
+    global_head.eval().requires_grad_(False)
+    local_head.eval().requires_grad_(False)
+    global_pair = global_head.node_factors(candidates.candidate_ids)
+    local_pair = local_head.node_factors(candidates.candidate_ids,
+        torch.randn(2, length, 4, device='cuda', generator=generator))
+    assert torch.count_nonzero(global_pair[1]) > 0
+    assert torch.count_nonzero(local_pair[1]) == 0
+    parent = concatenate_scaled_factors([(.7, global_pair)])
+    child = concatenate_scaled_factors([(.7, global_pair), (.3, local_pair)])
+    packet = old.prepare_packet(candidates)
+    f64 = prepare_additive_factors(packet, potential, *parent)
+    f128 = prepare_additive_factors(packet, potential, *child)
+    assert (f64.kind, f64.rank) == (2, 64)
+    assert (f128.kind, f128.rank) == (2, 128)
+    # The fixture includes an unclamped chain and visible endpoint/middle
+    # separators, so packed unaries also test both boundary dot reductions.
+    parent_chunks = list(old._chunks(packet, f64, 3))
+    child_chunks = list(old._chunks(packet, f128, 3))
+    assert len(parent_chunks) == len(child_chunks) > 0
+    for raw, nested in zip(parent_chunks, child_chunks):
+        assert all(torch.equal(a, b) for a, b in zip(raw, nested))
+        unary, rows, starts, lengths, _, _ = raw
+        alpha64 = af._messages(unary, f64, rows, starts, lengths)
+        alpha128 = af._messages(unary, f128, rows, starts, lengths)
+        beta64 = af._messages(unary, f64, rows, starts, lengths, backward=True)
+        beta128 = af._messages(unary, f128, rows, starts, lengths, backward=True)
+        assert torch.equal(alpha64, alpha128)
+        assert torch.equal(beta64, beta128)
+        noise = torch.empty_like(alpha64, dtype=torch.float64).exponential_(
+            generator=generator).log_()
+        sample64 = af._sample_with_noise(alpha64, f64, rows, starts, lengths, noise)
+        sample128 = af._sample_with_noise(alpha128, f128, rows, starts, lengths, noise)
+        assert torch.equal(sample64, sample128)
+    p64 = additive_count_marginals(candidates, potential, *parent, segment_batch_size=3)
+    p128 = additive_count_marginals(candidates, potential, *child, segment_batch_size=3)
+    assert torch.equal(p64, p128)
+    state = generator.get_state()
+    g64, g128 = torch.Generator(device='cuda'), torch.Generator(device='cuda')
+    g64.set_state(state)
+    g128.set_state(state)
+    sample64 = sample_additive_count(candidates, potential, *parent, g64, segment_batch_size=3)
+    sample128 = sample_additive_count(candidates, potential, *child, g128, segment_batch_size=3)
+    assert torch.equal(sample64, sample128)
+    assert torch.equal(g64.get_state(), g128.get_state())
+    # Own-marginal decoding samples only the latent sites from that same law.
+    latent = torch.isfinite(candidates.log_unary).sum(-1) > 1
+    g64.set_state(state)
+    g128.set_state(state)
+    slots64 = torch.multinomial(p64[latent], 1, generator=g64)
+    slots128 = torch.multinomial(p128[latent], 1, generator=g128)
+    assert torch.equal(slots64, slots128)
+    assert torch.equal(g64.get_state(), g128.get_state())
+    old.clear_count_cache()
+
+
+@cuda
 @pytest.mark.parametrize('width,length', [(3, 7), (500, 4), (16, 1024)])
 def test_cuda_additive_scores_clamps_marginals_and_sampling(width, length):
     old.clear_count_cache()
