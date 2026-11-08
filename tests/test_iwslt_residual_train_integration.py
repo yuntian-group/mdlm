@@ -311,6 +311,46 @@ def test_initial_validation_interruption_resumes_from_saved_initialization(harne
     _same_training_result(expected, _verify_completed(args.output))
 
 
+@pytest.mark.parametrize("kind", ["global", "contextual"])
+def test_intermediate_validation_failure_retries_before_next_optimizer_update(
+        harness, monkeypatch, kind):
+    parent = harness.inherited_checkpoint() if kind == "contextual" else None
+    baseline = harness.args("reference", kind=kind, global_head=parent)
+    trainer.run(baseline)
+    expected = _verify_completed(baseline.output)
+    expected_calls = list(harness.calls)
+    harness.calls.clear()
+    args = harness.args("interrupted", kind=kind, global_head=parent)
+    original_objective = trainer.residual_objective
+    interrupted = []
+
+    def fail_intermediate_validation(batch, **kwargs):
+        value = original_objective(batch, **kwargs)
+        if (not kwargs["head"].training and _training_calls(harness.calls)
+                and not interrupted):
+            interrupted.append(True)
+            raise RuntimeError("Injected intermediate validation failure")
+        return value
+
+    monkeypatch.setattr(trainer, "residual_objective", fail_intermediate_validation)
+    with pytest.raises(RuntimeError, match="intermediate validation failure"):
+        trainer.run(args)
+    saved = _load(args.output)
+    assert saved["state"]["update"] == saved["state"]["next_group"] == 1
+    assert saved["state"]["last_dev_group"] == 0
+    assert [row["update"] for row in saved["state"]["history"]] == [0]
+    assert saved["optimizer"]["state"]
+    before_resume_calls = list(harness.calls)
+    harness.calls.clear()
+    monkeypatch.setattr(trainer, "residual_objective", original_objective)
+    trainer.run(args)
+    # Recovery must evaluate the committed update before advancing its data
+    # cursor or optimizer, and reproduce the full uninterrupted history.
+    assert harness.calls[0]["training"] is False
+    assert _training_calls(before_resume_calls + harness.calls) == _training_calls(expected_calls)
+    _same_training_result(expected, _verify_completed(args.output))
+
+
 @pytest.mark.parametrize("missing_receipt", ["candidates.json", "summary.json"])
 def test_complete_checkpoint_reconstructs_missing_receipts_without_training(
         harness, monkeypatch, missing_receipt):

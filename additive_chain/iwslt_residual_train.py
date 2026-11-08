@@ -264,6 +264,15 @@ def run(args):
             epoch = state["epoch"]
             groups = epoch_groups(train, epoch, config)
             validate_every = max(1, math.ceil(len(groups) / 4))
+            # A checkpoint written before an intermediate validation already
+            # advances next_group. Finish that validation before another update
+            # when its result was not committed before interruption.
+            if (0 < state["next_group"] < len(groups)
+                    and state["next_group"] % validate_every == 0
+                    and state["last_dev_group"] != state["next_group"]):
+                validate(epoch)
+                state["last_dev_group"] = state["next_group"]
+                persist()
             for index in range(state["next_group"], len(groups)):
                 head.train()
                 optimizer.zero_grad(set_to_none=True)
